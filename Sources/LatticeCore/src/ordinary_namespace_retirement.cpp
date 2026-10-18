@@ -1,5 +1,6 @@
 #include "ordinary_namespace_retirement.hpp"
 #include "ordinary_historical_generation.hpp"
+#include "ordinary_historical_wal_checkpoint.hpp"
 #include "vendor/picosha2/picosha2.h"
 #include <algorithm>
 #include <array>
@@ -1044,7 +1045,8 @@ retained_historical_generation engram_namespace_retirement::retain_preserved_gen
     auto owner = impl_;
     auto verify_retirement = custody.verify_;
     auto state = std::make_shared<retained_historical_generation::implementation>();
-    state->verify = [owner, verify_retirement, binding](deadline check_end) {
+    state->verify = [owner, verify_retirement, binding, original_end = end](deadline check_end) {
+        if (check_end != original_end) fail(code::invalid);
         verify_retirement(check_end);
         owner->reconcile(check_end);
         if (!owner->recorded("preserved.unadopted", check_end)) fail(code::incomplete);
@@ -1093,12 +1095,45 @@ retained_historical_generation engram_namespace_retirement::retain_preserved_gen
     };
     // Revalidation occurs both before and after duplicating the actual held
     // generation. The duplicate is used only by the fixed managed launcher.
-    state->duplicate_generation = [owner, verify = state->verify](deadline check_end) {
+    auto attempt = std::make_shared<retained_historical_generation::implementation::drain_attempt>();
+    state->drain_state = attempt;
+    state->duplicate_generation = [owner, verify = state->verify, attempt](deadline check_end) {
         (void)verify(check_end);
+        bound(check_end);
+        if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+        if (!attempt->entered || !attempt->terminal_success) fail(code::incomplete);
         auto copy = duplicate(owner->generation.n);
         if (identity(held(copy.n)) != owner->generation_id) fail(code::changed);
         (void)verify(check_end);
+        bound(check_end);
+        if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+        if (!attempt->entered || !attempt->terminal_success) fail(code::incomplete);
         return std::exchange(copy.n, -1);
+    };
+    // This private operation follows actual old-role/namespace retirement. The
+    // generic filesystem transition above still never opens SQLite. Exact old
+    // names, sidecar identities and permanent refusals remain verifier inputs.
+    state->drain = [owner, verify = state->verify, attempt, original_end = end](deadline until) {
+        if (until != original_end) fail(code::invalid);
+        const auto observed = verify(until); // Actual creator/currentness before mutable attempt facts.
+        if (attempt->entered) {
+            if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+            fail(code::incomplete); // A successful first call never reissues an attempt.
+        }
+        attempt->entered = true; // Before any checkpoint/native-close effect.
+        try {
+            const std::function<void(deadline)> reverify = [verify, original_end](deadline check_end) {
+                if (check_end != original_end) fail(code::invalid);
+                (void)verify(check_end);
+            };
+            historical_wal_checkpoint::drain(owner->generation.n, observed, until, reverify);
+            (void)verify(until); // No expired, changed or unproved ending becomes success.
+            bound(until);
+            attempt->terminal_success = true;
+        } catch (...) {
+            attempt->first_failure = std::current_exception();
+            throw;
+        }
     };
     (void)state->verify(end);
     return retained_historical_generation(std::move(state));
@@ -1110,11 +1145,21 @@ retained_historical_generation engram_namespace_retirement::retain_preserved_gen
 
 retained_historical_generation::observation retained_historical_generation::before_launch(deadline end) const {
     if (!impl_ || !impl_->verify) fail(code::incomplete);
-    return impl_->verify(end);
+    auto observed = impl_->verify(end);
+    bound(end);
+    const auto& attempt = impl_->drain_state;
+    if (!attempt) fail(code::incomplete);
+    if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+    if (!attempt->entered || !attempt->terminal_success) fail(code::incomplete);
+    return observed;
 }
 int retained_historical_generation::duplicate_before_launch(deadline end) const {
     if (!impl_ || !impl_->duplicate_generation) fail(code::incomplete);
     return impl_->duplicate_generation(end);
+}
+void retained_historical_generation::drain_oversized_wals(deadline end) const {
+    if (!impl_ || !impl_->drain) fail(code::incomplete);
+    impl_->drain(end);
 }
 
 void engram_namespace_retirement::preserve_created_namespace_after_join(const created_launch_cohort::store_namespace& custody, deadline end) {

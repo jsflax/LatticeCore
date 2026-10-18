@@ -107,6 +107,7 @@ struct database_projection_capture {
     void prepare_read(const std::string& sql);
     bool denied() const noexcept { return denied_; }
 private:
+    detail::store_physical_native_scope physical_call_;
     friend class projection_capture_policy;
     projection_capture_policy* policy_ = nullptr;
     static int authorize(void*, int, const char*, const char*, const char*, const char*) noexcept;

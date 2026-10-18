@@ -1,4 +1,5 @@
 #pragma once
+#include <lattice/store_physical_api.hpp>
 
 #include "log.hpp"
 #include "types.hpp"
@@ -6,10 +7,16 @@
 #include "ordinary_context.hpp"
 #include "ordinary_pointer_publication.hpp"
 #include "native_retirement_storage.hpp"
+#include "detail/core_model_registry_storage.hpp"
+#include "core_transaction_receipt.hpp"
+#include "detail/observer_delivery_write.hpp"
+#include "detail/observer_delivery_startup.hpp"
 #if defined(LATTICE_SYNC_COMMIT_PROBE)
 #include "sync_commit_probe.hpp"
 #endif
 #include "projection.hpp"
+#include "store_resource_context.hpp"
+#include "owned_catalog.hpp"
 #include "schema.hpp"
 #include "ordinary_schema_recipe.hpp"
 #include "recovery_schema.hpp"
@@ -40,6 +47,7 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <initializer_list>
 #include <thread>
 #include <stdio.h>
 #include <iostream>
@@ -80,8 +88,18 @@ struct configuration;
 namespace detail { struct recovery_writer_access; class canonical_writer_adapter; class recovery_local_producer_adapter;
 class recovery_continuous_producer;
 struct recovery_continuous_admission;
-std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&); struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
-namespace detail { struct sync_policy_reservation; }
+std::shared_ptr<observer_delivery_startup> select_continuous_startup(const configuration&,const recovery_owner_schema&,const std::shared_ptr<recovery_continuous_admission>&);
+std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&,const std::shared_ptr<observer_delivery_startup>&,const recovery_owner_schema&); struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
+namespace detail { struct sync_policy_reservation;
+class observer_delivery_connection;
+class observer_delivery_write;
+class observer_delivery_begin;
+// Empty for legacy delivery. An admitted original prepares DATA-only wrapper
+// custody before opaque enqueue-time callback copies, then moves that exact
+// vector into the creator-fenced tail without copying callbacks again.
+std::function<std::function<void()>(std::vector<std::function<void()>>&&)>
+prepare_observer_delivery_batch();
+}
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -115,6 +133,9 @@ struct has_geo_bounds_lists<T, std::void_t<decltype(std::declval<T>().collect_ge
 /// alive flag even after the lattice_db is destroyed.
 struct instance_guard {
     std::atomic<bool> alive{true};
+    // Sticky DATA for this exact original, set only under the authenticated
+    // maintenance leaf at real registration. It is never physical authority.
+    std::atomic<bool> authenticated_maintenance_registered{false};
     /// Number of in-flight notify_change() calls on this instance.
     /// The destructor spins until this reaches 0 before proceeding.
     std::atomic<int> notify_refcount{0};
@@ -138,6 +159,14 @@ struct instance_guard {
         return it == m.end() ? 0 : it->second;
     }
 };
+
+namespace detail {
+// Retires only the authenticated READY maintenance worker's captures of this
+// exact original guard. It grants no SQLite/VFS, other-caller or unlink fact.
+// An ordinary close never starts the service merely to request retirement.
+lattice_close_result retire_authenticated_ready_maintenance(const std::shared_ptr<instance_guard>&,
+    std::chrono::steady_clock::time_point) noexcept;
+}
 
 class instance_registry {
 public:
@@ -205,14 +234,22 @@ public:
             auto* g = e.guard.get();
             struct hold_release {
                 instance_guard* g;
+                bool depth_tracked = false;
                 ~hold_release() {
-                    auto& depths = instance_guard::tls_depths();
-                    if (--depths[g] == 0) depths.erase(g);
+                    if (depth_tracked) {
+                        auto& depths = instance_guard::tls_depths();
+                        const auto found = depths.find(g);
+                        if (found != depths.end() && --found->second == 0) depths.erase(found);
+                    }
                     g->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
                 }
-            };
+            } release{g}; // Custody BEFORE potentially allocating TLS insertion.
+            if (test_fail_next_depth_publication_) {
+                test_fail_next_depth_publication_ = false;
+                throw std::bad_alloc(); // Inert private exception-unwind mechanism.
+            }
             ++instance_guard::tls_depths()[g];
-            hold_release release{g};
+            release.depth_tracked = true;
             fn(e.ptr);
         }
     }
@@ -230,10 +267,15 @@ public:
             if(!e.guard->alive.load(std::memory_order_seq_cst)) {e.guard->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);continue;}
             auto* g=e.guard.get();
             struct hold_release {
-                instance_guard* g;pid_t creator;
-                ~hold_release(){if(creator!=::getpid())return;auto& depths=instance_guard::tls_depths();if(--depths[g]==0)depths.erase(g);g->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);}
-            };
-            ++instance_guard::tls_depths()[g];hold_release release{g,native_creator};
+                instance_guard* g;pid_t creator;bool depth_tracked=false;
+                ~hold_release(){
+                    if(creator!=::getpid())return;
+                    if(depth_tracked){auto& depths=instance_guard::tls_depths();const auto found=depths.find(g);if(found!=depths.end()&&--found->second==0)depths.erase(found);}
+                    g->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);
+                }
+            } release{g,native_creator};
+            if(test_fail_next_depth_publication_){test_fail_next_depth_publication_=false;throw std::bad_alloc();}
+            ++instance_guard::tls_depths()[g];release.depth_tracked=true;
             fn(e.ptr);if(native_creator!=::getpid())return;
         }
     }
@@ -292,6 +334,10 @@ public:
     }
 
 private:
+    friend struct detail::recovery_refresh_access;
+    // Only the private real-registry exception-unwind fixture arms this TLS
+    // point. It grants nothing and never resets an outstanding original hold.
+    static inline thread_local bool test_fail_next_depth_publication_ = false;
     const pid_t creator_pid_=::getpid();
     void require_creator_process() const {
         if (creator_pid_ != ::getpid()) throw std::runtime_error("inherited instance_registry belongs to another process");
@@ -673,6 +719,13 @@ struct configuration {
     };
     std::vector<ipc_target> ipc_targets;
 
+    /// Explicit requested WAL-file extent admission, in bytes. Unset preserves
+    /// legacy opens; no quota is guessed from journal_size_limit. This first
+    /// route supports a canonical native MAIN path, with no ATTACH/URI/VFS
+    /// override. All writers must enroll the same policy before a store-wide
+    /// bound is claimed. MAIN, SHM and physical allocation are not included.
+    std::optional<sqlite3_int64> wal_extent_limit_bytes;
+
     /// Returns true if WSS sync is configured (websocket_url is not empty)
     bool is_sync_enabled() const {
         return !websocket_url.empty() && !authorization_token.empty();
@@ -701,6 +754,24 @@ struct configuration {
     /// Returns true if this is an in-memory database (either :memory: or shared cache URI)
     bool is_in_memory() const { return path_is_memory(path); }
 };
+
+namespace detail {
+inline configuration ordinary_resource_configuration(configuration config) {
+    if(!config.is_in_memory()){
+        const auto original_end=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+        config.path=store_resource_factory_path(config.path,original_end);
+    }
+    return config;
+}
+inline configuration ordinary_wal_configuration(configuration config) {
+    // The owner must retain the actual policy its writer receives, even when
+    // a native caller bypasses the Swift cache. Memory/readonly gain no route.
+    if(!config.read_only&&!config.is_in_memory())
+        config.wal_extent_limit_bytes=ordinary_select_wal_extent_limit(config.path,
+            config.ordinary_context,config.wal_extent_limit_bytes);
+    return config;
+}
+}
 
 // Backwards compatibility alias
 using db_config = configuration;
@@ -920,6 +991,7 @@ private:
 // the native creator PID is captured before allocation and cannot be supplied.
 namespace detail {
 template<typename T> class process_bound_resource_owner {
+    friend class ::lattice::lattice_db;
     struct native_deleter {
         pid_t creator_pid;
         void operator()(T* value) const noexcept {
@@ -938,6 +1010,9 @@ template<typename T> class process_bound_resource_owner {
         }
     };
     std::unique_ptr<T,native_deleter> value_;
+    struct prepared_data_allocation final {};
+    process_bound_resource_owner(T* value,pid_t creator,prepared_data_allocation)noexcept
+        :value_(value,native_deleter{creator}){}
 public:
     template<typename... Args> explicit process_bound_resource_owner(Args&&... args)
         : value_(nullptr,native_deleter{::getpid()}) {
@@ -955,7 +1030,24 @@ public:
 }
 
 class lattice_db {
+    friend class swift_lattice_ref;
+    friend class detail::observer_delivery_identity;
+    friend class detail::observer_delivery_assignment;
+    friend struct core_transaction_receipt_test_access;
+    friend struct observer_delivery_custody_test_access;
+    friend class detail::observer_delivery_connection;
+    friend class detail::observer_delivery_startup;
+    friend class detail::observer_delivery_open_startup;
+    friend class detail::observer_delivery_write;
+    friend class detail::observer_delivery_update;
+    friend class detail::observer_delivery_begin;
+    struct managed_writer_publication_hold;
     struct owned_resources;
+    static detail::process_bound_resource_owner<owned_resources> prepare_owner_resources_(
+        const configuration&,detail::recovery_owner_schema,
+        std::shared_ptr<detail::recovery_continuous_admission>,
+        std::shared_ptr<detail::database_open_ledger>,detail::store_resource_initialization_original*);
+    static void observe_prepared_owner_data_(const owned_resources&);
     detail::process_bound_resource_owner<owned_resources> process_resources_;
     struct recovery_commit_batch;
     friend class detail::authenticated_relay_setup;
@@ -1017,12 +1109,241 @@ class lattice_db {
         setup_cross_process_notifier();
     }
     void setup_administrative_transaction_hooks();
+    enum class schema_startup_transaction {deferred,immediate,exclusive};
+    bool schema_initializing_(const database& actual)const noexcept {
+        if(!owns_creator_process())return true;
+        if(!delivery_startup_)return false;
+        if(delivery_startup_->requires_initialization_(*this))return true;
+        return !actual.delivery_startup_||actual.delivery_startup_->public_sql_pending_for_(actual);
+    }
+    void populate_pending_core_model_registries_();
+    void replace_core_model_registry_data_(const detail::recovery_owner_schema&,const detail::observer_delivery_open_startup* pending=nullptr);
+    bool initialize_current_model_catalog_if_pending_(bool swift_builder=false) {
+        require_creator_process();
+        if(!schema_initializing_(*db_))return false;
+        auto* open=db_->delivery_startup_.get();
+        if(!open)throw db_error("current schema builder lacks its actual pending Open");
+        open->initialize_captured_model_catalog_(*this,*db_,swift_builder);
+        return true;
+    }
+    // DATA only. The caller retains actual pending/Open/Native admission.
+    static bool pending_registry_name_matches_(std::string_view actual,
+        std::initializer_list<std::string_view> fragments)noexcept {
+        for(const auto fragment:fragments) {
+            if(actual.size()<fragment.size()||actual.substr(0,fragment.size())!=fragment)return false;
+            actual.remove_prefix(fragment.size());
+        }
+        return actual.empty();
+    }
+    void require_pending_core_model_registries_(const detail::recovery_owner_schema& catalog)const {
+        require_creator_process();
+        if(&catalog!=&recovery_schemas_||!catalog.valid()||closed_.load(std::memory_order_acquire))
+            throw db_error("model registry validation requires its same live owner catalog");
+        constexpr auto limit=detail::recovery_owner_schema::max_properties;
+        if(catalog.models.size()>detail::recovery_owner_schema::max_models||
+           !link_tables_unknown_target_.empty()||link_tables_by_rhs_target_.size()>limit||
+           virtual_link_tables_.size()>limit||list_tables_by_parent_.size()>limit)
+            throw db_error("model registry census differs from complete declared setup");
+        const auto kind=[](const property_descriptor& property)noexcept {
+            if(property.kind==property_kind::virtual_list||property.kind==property_kind::virtual_link)return 1;
+            if(property.kind==property_kind::list&&property.is_geo_bounds)return 2;
+            if((property.kind==property_kind::list||property.kind==property_kind::link)&&!property.target_table.empty())return 3;
+            return 0;
+        };
+        const auto named=[&](std::string_view name,const model_schema& model,const property_descriptor& property,int family)noexcept {
+            return family==3?pending_registry_name_matches_(name,{"_",model.table_name,"_",property.target_table,"_",property.name}):
+                pending_registry_name_matches_(name,{"_",model.table_name,"_",property.name});
+        };
+        const auto declared=[&](std::string_view name,std::string_view target,std::string_view parent,int family) {
+            for(const auto& [model_name,model]:catalog.models) {
+                if(model_name!=model.table_name)throw db_error("model registry catalog table identity differs");
+                for(const auto& property:model.properties)if(kind(property)==family&&
+                    (family!=3||target==property.target_table)&&(family!=2||parent==model.table_name)&&named(name,model,property,family))return true;
+            }
+            return false;
+        };
+        std::size_t known=0,lists=0;
+        for(const auto& [target,tables]:link_tables_by_rhs_target_) {
+            if(target.empty()||tables.empty()||tables.size()>limit-known)
+                throw db_error("model known-link registry corpus differs");
+            known+=tables.size();
+            for(const auto& name:tables)if(!declared(name,target,{},3))
+                throw db_error("model known-link registry has an undeclared identity");
+        }
+        for(const auto& name:virtual_link_tables_)if(!declared(name,{},{},1))
+            throw db_error("model virtual-link registry has an undeclared identity");
+        for(const auto& [parent,tables]:list_tables_by_parent_) {
+            if(parent.empty()||tables.empty()||tables.size()>limit-lists)
+                throw db_error("model geographic-list registry corpus differs");
+            lists+=tables.size();
+            for(std::size_t index=0;index<tables.size();++index) {
+                for(std::size_t prior=0;prior<index;++prior)if(tables[prior]==tables[index])
+                    throw db_error("model geographic-list registry duplicates a declared identity");
+                if(!declared(tables[index],{},parent,2))
+                    throw db_error("model geographic-list registry has an undeclared identity");
+            }
+        }
+        std::size_t properties=0;
+        for(const auto& [model_name,model]:catalog.models) {
+            if(model_name!=model.table_name||model.properties.size()>limit-properties)
+                throw db_error("model registry catalog corpus differs");
+            properties+=model.properties.size();
+            for(const auto& property:model.properties) {
+                const auto family=kind(property);if(!family)continue;bool present=false;
+                if(family==1)for(const auto& name:virtual_link_tables_)if(named(name,model,property,family))present=true;
+                if(family==2)for(const auto& [parent,tables]:list_tables_by_parent_)if(parent==model.table_name)
+                    for(const auto& name:tables)if(named(name,model,property,family))present=true;
+                if(family==3)for(const auto& [target,tables]:link_tables_by_rhs_target_)if(target==property.target_table)
+                    for(const auto& name:tables)if(named(name,model,property,family))present=true;
+                if(!present)throw db_error("model registry is missing a declared cascade identity");
+            }
+        }
+        require_creator_process();
+    }
+    void require_pending_model_registries_(const detail::recovery_owner_schema& catalog)const {
+        require_pending_core_model_registries_(catalog);
+        const auto& binding=process_resources_.get().pending_model_registry_checker_;
+        if(binding.check) {
+            if(binding.creator!=detail::database_native_process()||binding.owner!=this||binding.catalog!=&catalog)
+                throw db_error("derived model registry checker lost its actual owner catalog");
+            binding.check(*this,catalog);require_creator_process();
+        }else if(binding.creator||binding.owner||binding.catalog||!catalog.swift_models.empty()||
+            !catalog.swift_order.empty()||!catalog.swift_constraints.empty()||!catalog.swift_digest.empty()||
+            !catalog.swift_fingerprint.empty()||!catalog.swift_snapshot.empty())
+            throw db_error("Swift model registries require their actual derived checker");
+    }
+    void execute_model_schema_(const std::string& text) {
+        if(!schema_initializing_(*db_)){db_->execute(text);return;}
+        auto* open=db_->delivery_startup_.get();
+        if(!open)throw db_error("model schema producer lacks actual pending open");
+        open->initialize_model_recipe_(*this,*db_,text);
+    }
+    void store_model_metadata_(std::string_view key,std::string_view value) {
+        auto* open=db_->delivery_startup_.get();
+        if(!schema_initializing_(*db_)||!open)throw db_error("private model metadata requires actual pending open");
+        open->initialize_model_metadata_(*this,*db_,key,value);
+    }
+    bool schema_table_exists_(const std::string& name) {
+        if(!schema_initializing_(*db_))return db_->table_exists(name);
+        auto* open=db_->delivery_startup_.get();
+        if(!open)throw db_error("model inventory lacks actual pending open");
+        return open->model_table_present_(*this,*db_,name);
+    }
+    std::unordered_map<std::string,std::string> schema_table_info_(const std::string& name) {
+        if(schema_initializing_(*db_))
+            throw db_error("pending schema diff requires its real typed migration producer");
+        return db_->get_table_info(name);
+    }
+    const model_schema* schema_for_operation_(std::string_view name,
+                                              schema_handle_v2& retained)const {
+        require_creator_process();
+        // These three legacy consumers always consult the live registry.
+        // This lease changes lifetime/coherence only, never table authority.
+        retained=detail::schema_read_scope_v2::lookup(name);
+        return retained.get();
+    }
+    const model_schema* schema_for_observation_(std::string_view name,schema_handle_v2& retained)const {
+        require_creator_process();
+        detail::schema_read_scope_v2 view(database::mutation_wait_context_free_());
+        return schema_for_operation_(name,retained);
+    }
+    std::vector<const model_schema*> schema_declarations_() {
+        require_creator_process();
+        if(!schema_initializing_(*db_)) {
+            // The constructor's immutable native declarations also drive its
+            // fingerprint. Preserve the ordinary global fallback when that
+            // bounded capture was unavailable, rather than using a partial one.
+            if(!recovery_schemas_.valid()) {
+                std::vector<const model_schema*> fallback;
+                const auto& lease=recovery_schemas_.native_fallback_lease_();
+                fallback.reserve(lease.size());
+                for(const auto* schema:lease)fallback.push_back(schema);
+                return fallback;
+            }
+            std::vector<const model_schema*> result;
+            result.reserve(recovery_schemas_.models.size());
+            for(const auto& [name,schema]:recovery_schemas_.models)
+                if(!recovery_schemas_.swift_models.count(name))result.push_back(&schema);
+            require_creator_process();return result;
+        }
+        auto* open=db_->delivery_startup_.get();
+        if(!open)throw db_error("model declarations lack actual pending open");
+        open->require_model_owner_(*this,*db_);
+        const auto& catalog=open->initialization_catalog_(*db_);
+        if(catalog.models.size()>detail::recovery_owner_schema::max_models)throw db_error("immutable native model count bound");
+        open->claim_workspace_(*db_,catalog.models.size()*sizeof(const model_schema*));
+        std::vector<const model_schema*> result;result.reserve(catalog.models.size());
+        require_creator_process();
+        if(result.capacity()>detail::recovery_owner_schema::max_models)throw db_error("native model pointer capacity bound");
+        for(const auto& [name,schema]:catalog.models)if(!catalog.swift_models.count(name))result.push_back(&schema);
+        require_creator_process();return result;
+    }
+    auto begin_schema_initialization_(database& actual,schema_startup_transaction mode)const {
+        require_creator_process();
+        auto* open=actual.delivery_startup_.get();
+        if(!delivery_startup_||!open||open->catalog_generation_()!=delivery_startup_->state_)
+            throw db_error("schema initialization requires its SAME actual pending context/open");
+        open->require_work_current_(actual);
+        using sql=detail::observer_delivery_initialization_sql;
+        using recipe=sql::recipe;
+        const auto begin_id=mode==schema_startup_transaction::deferred?recipe::schema_transaction_deferred_begin:
+            mode==schema_startup_transaction::exclusive?recipe::schema_transaction_exclusive_begin:recipe::schema_transaction_begin;
+        // All fixed entries and BOTH endings exist/are reserved before the
+        // actual raw schema BEGIN. This is not a Core managed original and
+        // neither a caller SQL body nor an ambient initializer purpose.
+        auto begin=sql::fixed_(*open,actual,begin_id);
+        auto commit=sql::fixed_(*open,actual,recipe::schema_transaction_commit);
+        auto rollback=sql::fixed_(*open,actual,recipe::schema_transaction_rollback);
+        return actual.begin_initialization_(begin,commit,rollback);
+    }
+    void bind_observer_delivery_pending_owner_() {
+        require_creator_process();
+        if(delivery_startup_) {
+            delivery_startup_->bind_pending_owner_(*this);
+            populate_pending_core_model_registries_();
+        }
+    }
+    // Only the real unpublished constructor/derived constructor calls this.
+    // Normal service publication is a separate step after the complete Core
+    // AND Swift schema has been verified on all actual open originals.
+    void finish_observer_delivery_startup_() {
+        require_creator_process();
+        if(delivery_startup_)delivery_startup_->finish_owner_(*this);
+    }
+    void publish_observer_delivery_facilities_(bool publish_sync=true) {
+        require_creator_process();
+        if(!delivery_startup_)return;
+        if(delivery_facilities_published_)
+            throw db_error("delivery startup facilities already published");
+        delivery_startup_->require_finished_(*this);
+        // The exact context is sealed before any hook can publish callbacks
+        // or a service can enter another thread. A failed publication still
+        // runs ordinary destructor cleanup; it never grants a second startup.
+        delivery_facilities_published_=true;
+        if(!config_.read_only) {
+            setup_change_hook();
+            if(publish_sync) {
+                setup_sync_if_configured();
+                setup_ipc_if_configured();
+            }
+        }
+        instance_registry::instance().register_instance(config_.path,this,guard_);
+        adopt_path_wal_eviction_threshold();
+        setup_cross_process_notifier();
+        start_audit_maintenance();
+    }
 public:
     // Construct with path (uses default scheduler, no sync)
     explicit lattice_db(const std::string& path)
         : process_resources_(path) {
+        bind_observer_delivery_pending_owner_();
         setup_store_write_gate();
         ensure_tables();
+        if(delivery_startup_) {
+            finish_observer_delivery_startup_();
+            publish_observer_delivery_facilities_();
+            return;
+        }
         setup_change_hook();
         instance_registry::instance().register_instance(config_.path, this, guard_);
         adopt_path_wal_eviction_threshold();
@@ -1032,8 +1353,14 @@ public:
     // Construct in-memory (uses default scheduler, no sync)
     lattice_db()
         : process_resources_() {
+        bind_observer_delivery_pending_owner_();
         setup_store_write_gate();
         ensure_tables();
+        if(delivery_startup_) {
+            finish_observer_delivery_startup_();
+            publish_observer_delivery_facilities_();
+            return;
+        }
         setup_change_hook();
         instance_registry::instance().register_instance(config_.path, this, guard_);
         adopt_path_wal_eviction_threshold();
@@ -1072,11 +1399,13 @@ protected:
     }
     // Swift supplies complete immutable declarations before base-constructor
     // bootstrap. A virtual getter here would see only the base subobject.
-    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas, std::shared_ptr<detail::recovery_continuous_admission> continuous = {}, std::shared_ptr<detail::database_open_ledger> connection_ledger = {})
-        : process_resources_(config,std::move(recovery_schemas),std::move(continuous),std::move(connection_ledger)) {
+    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas, std::shared_ptr<detail::recovery_continuous_admission> continuous = {}, std::shared_ptr<detail::database_open_ledger> connection_ledger = {}, bool defer_delivery_publication = false,
+        detail::store_resource_initialization_original* normal_creation = nullptr)
+        : process_resources_(prepare_owner_resources_(config,std::move(recovery_schemas),std::move(continuous),std::move(connection_ledger),normal_creation)) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
-        config_.path = resolve_path(config);
+        config_.path = resolve_path(config_);
+        bind_observer_delivery_pending_owner_();
         setup_store_write_gate();
         auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
         LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
@@ -1087,6 +1416,13 @@ protected:
             LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
             if (!recovery_continuous_) heal_collapsed_sync_state();
+            if(delivery_startup_) {
+                if(!defer_delivery_publication && !recovery_continuous_) {
+                    finish_observer_delivery_startup_();
+                    publish_observer_delivery_facilities_(!defer_sync);
+                }
+                return;
+            }
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
             if (!defer_sync && !recovery_continuous_) {
@@ -1095,6 +1431,13 @@ protected:
                 LOG_DEBUG("lattice_db", "setup_ipc_if_configured");
                 setup_ipc_if_configured();
             }
+        }
+        if(delivery_startup_) {
+            if(!defer_delivery_publication && !recovery_continuous_) {
+                finish_observer_delivery_startup_();
+                publish_observer_delivery_facilities_(!defer_sync);
+            }
+            return;
         }
         if (recovery_continuous_) return; // Retained factory publishes only after exact owned enrollment.
         LOG_DEBUG("lattice_db", "register_instance");
@@ -1166,12 +1509,142 @@ public:
     // ========================================================================
     // MARK: Add
 
+private:
+    // Bind-time DATA identity, never a row/path lookup. Actual weak originals
+    // are captured before any later setter conversion and keep no Native
+    // resource alive. Closed INSERT calls this before effects with id0; real
+    // hydration supplies its actual returned rowid/globalId before binding.
+    void prepare_observer_delivery_identity_(model_base& model,std::string_view table,std::string_view gid) {
+        if(!detail::observer_delivery_enabled(*this)||gid.empty())return;
+        require_creator_process();
+        detail::native_retirement_storage<std::shared_ptr<database>,
+            std::shared_ptr<const detail::observer_delivery_connection>> held;
+        require_creator_process();
+        held.get<1>()=std::atomic_load(&observer_delivery_connection_);
+        require_creator_process();
+        if(!held.get<1>())throw db_error("delivery binding profile disappeared");
+        {
+            std::lock_guard lock(connection_ownership_mutex_);
+            if(closed_.load(std::memory_order_acquire)||!db_)
+                throw db_error("delivery binding owner is closed");
+            held.get<0>()=db_;
+            if(model.attachment_token_==0&&model.db_!=held.get<0>().get())
+                throw db_error("delivery binding writer differs from its actual owner");
+        }
+        model.observer_delivery_identity_=detail::observer_delivery_identity::prepare(
+            *this,held.get<0>(),guard_,held.get<1>(),table,gid,model.attachment_token_);
+        require_creator_process();
+        if(model.id_>0)model.observer_delivery_identity_.publish(model.id_);
+    }
+    static void publish_observer_delivery_identity_(model_base& model,int64_t rowid)noexcept {
+        model.observer_delivery_identity_.publish(rowid);
+    }
+    // Closed generated typed INSERT only. Manual/opaque collector types refuse
+    // BEFORE managed construction, collection, schema/JSON/bind allocation.
+    // Further operation kinds and the original explicit-BEGIN envelope remain
+    // mandatory production-profile integration work, not a legacy fallback.
+    template<typename U>
+    std::vector<managed<U>> add_observer_delivery_typed(std::span<const U> source) {
+        using values=detail::observer_delivery_values;
+        if constexpr(!detail::observer_delivery_generated_schema<U>::value) {
+            throw db_error("delivery typed output requires its actual generated schema wrapper");
+        } else if constexpr(requires{
+            managed<U>::observer_delivery_members;
+            managed<U>::observer_delivery_outputs;
+        }) {
+            using output_metadata=std::remove_cvref_t<decltype(managed<U>::observer_delivery_outputs)>;
+            if constexpr(!detail::observer_delivery_value_detail::is_outputs<output_metadata>::value) {
+                throw db_error("delivery typed output metadata is not closed DATA");
+            } else {
+            static_assert(std::is_const_v<std::remove_reference_t<decltype((managed<U>::observer_delivery_outputs))>>,
+                "delivery output metadata must be immutable DATA");
+            require_creator_process();
+            auto cursor=values::cursor::typed<U>(source);
+            auto write=detail::observer_delivery_write::prepare(*this,cursor);
+            require_creator_process();
+            using outputs=std::vector<managed<U>>;
+            using storage=detail::native_retirement_storage<outputs>;
+            uint64_t structured=storage::allocation_bytes();
+            detail::observer_delivery_value_detail::add_structured_product(structured,write.row_count(),sizeof(managed<U>));
+            values::field_buffer scratch;
+            for(size_t row=0;row<write.row_count();++row){
+                const auto image=write.row(row,scratch);
+                detail::observer_delivery_value_detail::add_structured_bytes(structured,image.table.size()+1);
+                detail::observer_delivery_value_detail::add_structured_bytes(structured,write.global_id(row).size()+1);
+                detail::observer_delivery_value_detail::add_structured_bytes(structured,
+                    detail::observer_delivery_identity::allocation_bytes()+image.table.size()+1+write.global_id(row).size()+1);
+                for(const auto& field:image.fields){
+                    // One builtin value copy; property binding names/table are
+                    // known structural strings. Expanded geo fields overcount
+                    // their one wrapper; finite transient sidecar names are
+                    // included explicitly, never sizeof an opaque capture.
+                    detail::observer_delivery_value_detail::add_structured_bytes(structured,image.table.size()+1);
+                    detail::observer_delivery_value_detail::add_structured_bytes(structured,field.name.size()+1);
+                    detail::observer_delivery_value_detail::add_structured_product(structured,8,image.table.size()+field.name.size()+32);
+                    if(const auto text=std::get_if<std::string_view>(&field.contents))
+                        detail::observer_delivery_value_detail::add_structured_bytes(structured,text->size()+1);
+                    else if(const auto blob=std::get_if<std::span<const uint8_t>>(&field.contents))
+                        detail::observer_delivery_value_detail::add_structured_bytes(structured,blob->size());
+                }
+            }
+            // Same admitted original, monotonic structured payload/count
+            // accounting. This is not a portable allocator/RSS byte claim.
+            write.reserve_output_workspace(structured);
+            storage retained; // Allocation only AFTER output workspace admission.
+            if(!retained.in_creator_process())throw db_error("delivery typed output changed process");
+            require_creator_process();
+            auto& result=retained.template get<0>();result.reserve(write.row_count());
+            for(size_t row=0;row<write.row_count();++row){
+                require_creator_process();if(!retained.in_creator_process())throw db_error("delivery typed output changed process");
+                const auto image=write.row(row,scratch);
+                detail::observer_delivery_value_detail::emplace_generated_output<U>(result);
+                auto& object=result.back();
+                std::apply([&](const auto&... member){
+                    (detail::observer_delivery_value_detail::materialize_output(object,image,member),...);
+                },managed<U>::observer_delivery_outputs);
+                require_creator_process();
+                object.db_=db_.get();object.lattice_=this;object.table_name_.assign(image.table);
+                object.global_id_.assign(write.global_id(row));
+                prepare_observer_delivery_identity_(object,image.table,write.global_id(row));
+                std::apply([&](const auto&... member){
+                    (detail::observer_delivery_value_detail::bind_output(object,member),...);
+                },managed<U>::observer_delivery_outputs);
+                require_creator_process();
+            }
+            struct adoption {outputs* result;pid_t creator;} context{&result,::getpid()};
+            write.execute(*this,{&context,[](void* raw,bool committed,
+                std::span<const detail::observer_delivery_write::inserted_row> rows)noexcept{
+                auto& actual=*static_cast<adoption*>(raw);
+                if(actual.creator!=::getpid()||!committed)return;
+                // Write's closed runtime validates exact receipt count/rowid
+                // before settlement; no allocation/fallible work is deferred
+                // until after COMMIT. Only integer binding publication remains.
+                for(size_t at=0;at<actual.result->size();++at){
+                    auto& object=(*actual.result)[at];object.id_=rows[at].rowid;
+                    publish_observer_delivery_identity_(object,rows[at].rowid);
+                    std::apply([&](const auto&... member){
+                        (detail::observer_delivery_value_detail::adopt_output(object,rows[at].rowid,member),...);
+                    },managed<U>::observer_delivery_outputs);
+                }
+            }});
+            require_creator_process();if(!retained.in_creator_process())throw db_error("delivery typed output changed process");
+            return std::move(result);
+            }
+        } else {
+            throw db_error("delivery typed producer has no closed generated value/output metadata");
+        }
+    }
+public:
     /// Add an unmanaged object to the database
     /// Returns a managed object bound to this database
     /// Usage: auto trip = db.add(Trip{"Costa Rica", 10});
     template<typename T>
     managed<std::decay_t<T>> add(T&& obj) {
         using U = std::decay_t<T>;
+        if(detail::observer_delivery_enabled(*this)){
+            auto result=add_observer_delivery_typed<U>(std::span<const U>(&obj,1));
+            return std::move(result.front());
+        }
         managed<U> m(std::forward<T>(obj));
         store_write_gate_hold gate(*this);  // §4.1: writes vs. captures never overlap
         bind_managed(m, managed<U>::schema());
@@ -1184,6 +1657,8 @@ public:
                                   const std::vector<std::string>& conflict_columns = {},
                                   const std::string& preserved_global_id = "") {
         using U = std::decay_t<T>;
+        if(detail::observer_delivery_enabled(*this))
+            throw db_error("delivery explicit-schema producer requires its closed adapter");
         managed<U> m(std::forward<T>(obj));
         store_write_gate_hold gate(*this);  // §4.1: writes vs. captures never overlap
         bind_managed(m, schema, conflict_columns, preserved_global_id);
@@ -1196,6 +1671,10 @@ public:
     template<typename T>
     std::vector<managed<std::decay_t<T>>> add_bulk(std::vector<T>&& objects) {
         using U = std::decay_t<T>;
+        if(detail::observer_delivery_enabled(*this)){
+            if(objects.empty())return {};
+            return add_observer_delivery_typed<U>(std::span<const U>(objects.data(),objects.size()));
+        }
         const auto& schema = managed<U>::schema();
         return add_bulk_with_schema(std::move(objects), schema);
     }
@@ -1211,17 +1690,29 @@ public:
             return {};
         }
 
-        // §4.1 per-store write gate: the whole bulk transaction (including
-        // the DDL probes below) is one writer scope vs. sibling captures.
-        store_write_gate_hold gate(*this);
+        if(detail::observer_delivery_enabled(*this))
+            throw db_error("delivery explicit-schema bulk requires its closed adapter");
 
+        // Consume the rvalue input into private result staging PRE effects.
+        // No managed object/caller capture is finally destroyed beneath the
+        // operation's Native/store leaves, including a late INSERT failure.
+        std::vector<managed<U>> results;
+        std::vector<std::vector<std::pair<std::string, column_value_t>>> staged_values;
+        results.reserve(objects.size()); staged_values.reserve(objects.size());
+        for (auto&& object : objects) {
+            results.emplace_back(std::forward<T>(object));
+            staged_values.push_back(results.back().collect_values());
+        }
+        // Include table/vec0 DDL and every INSERT in ONE real owned unit,
+        // or one savepoint in the exact retained caller Core transaction.
+        with_mutation_operation([&](database& writer) {
         // Ensure table exists
         std::vector<column_def> columns;
         columns.reserve(schema.properties.size());
         for (const auto& prop : schema.properties) {
             columns.push_back({prop.name, prop.type, prop.nullable, false, false});
         }
-        db_->ensure_table({schema.table_name, columns});
+        writer.ensure_table({schema.table_name, columns});
 
         // Ensure vec0 tables exist for any vector columns (with triggers)
         // This must happen BEFORE the inserts so triggers can fire
@@ -1229,14 +1720,12 @@ public:
         for (const auto& prop : schema.properties) {
             if (prop.is_vector && prop.type == column_type::blob) {
                 // Find vector data in first object to infer dimensions
-                managed<U> temp(objects[0]);
-                auto values = temp.collect_values();
-                for (const auto& [name, value] : values) {
+                for (const auto& [name, value] : staged_values.front()) {
                     if (name == prop.name && std::holds_alternative<std::vector<uint8_t>>(value)) {
                         const auto& vec_data = std::get<std::vector<uint8_t>>(value);
                         if (!vec_data.empty()) {
                             int dimensions = static_cast<int>(vec_data.size() / sizeof(float));
-                            ensure_vec0_table(schema.table_name, prop.name, dimensions);
+                            ensure_vec0_table_on(writer, schema.table_name, prop.name, dimensions);
                         }
                         break;
                     }
@@ -1306,17 +1795,24 @@ public:
             } else {
                 sql << " DO UPDATE SET " << set_clause.str();
             }
+            // A conflict UPDATE does not change last_insert_rowid(). Copy this
+            // statement's actual affected identity instead of the offered UUID.
+            sql << " RETURNING rowid, globalId";
         }
 
-        // Prepare once
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_->internal_handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-            LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(db_->internal_handle()));
-            throw std::runtime_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
+        int failed_step_rc = SQLITE_OK;
+        bool step_error_retained = false;
+        const auto require_bind = [&](int rc) {
+            if (rc != SQLITE_OK) throw db_error("bulk parameter binding failed");
+        };
+        try {
+        // Prepare once. Even a failed prepare's actual statement is consumed
+        // by the one finalization path BEFORE rollback/savepoint release.
+        if (::lattice::detail::store_physical_prepare_v2(writer.internal_handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(writer.internal_handle()));
+            throw db_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(writer.internal_handle())));
         }
-
-        std::vector<managed<U>> results;
-        results.reserve(objects.size());
 
         // For a bulk upsert, any row that collides resolves to an UPDATE of an existing row
         // a live @Model instance may be backing. Signal flush_changes (which runs on this
@@ -1326,27 +1822,21 @@ public:
             tls_notify_local_object_observers_ = true;
         }
 
-        // Use a transaction for efficiency
-        bool was_in_transaction = false;
-        try {
-            if (!db_->is_in_transaction()) {
-                db_->begin_transaction();
-            } else {
-                was_in_transaction = true;
-            }
-
-            for (auto&& obj : objects) {
-                managed<U> m(std::forward<T>(obj));
+            for (size_t row = 0; row != results.size(); ++row) {
+                // A bind/reset/identity failure must not borrow a prior evaluation.
+                failed_step_rc = SQLITE_OK;
+                step_error_retained = false;
+                auto& m = results[row];
 
                 // Generate globalId
                 auto gid = generate_global_id();
 
                 // Bind parameters
                 int idx = 1;
-                sqlite3_bind_text(stmt, idx++, gid.c_str(), -1, SQLITE_TRANSIENT);
+                require_bind(sqlite3_bind_text(stmt, idx++, gid.c_str(), -1, SQLITE_TRANSIENT));
 
                 // Collect and bind primitive values
-                auto values = m.collect_values();
+                const auto& values = staged_values[row];
                 for (const auto& prop : schema.properties) {
                     if (prop.kind == property_kind::primitive) {
                         if (prop.is_geo_bounds) {
@@ -1357,13 +1847,13 @@ public:
                                 bool found = false;
                                 for (const auto& [name, val] : values) {
                                     if (name == col_name) {
-                                        db_->bind_value(stmt, idx++, val);
+                                        require_bind(writer.bind_value_checked_(stmt, idx++, val));
                                         found = true;
                                         break;
                                     }
                                 }
                                 if (!found) {
-                                    sqlite3_bind_null(stmt, idx++);
+                                    require_bind(sqlite3_bind_null(stmt, idx++));
                                 }
                             }
                         } else {
@@ -1371,83 +1861,111 @@ public:
                             bool found = false;
                             for (const auto& [name, val] : values) {
                                 if (name == prop.name) {
-                                    db_->bind_value(stmt, idx++, val);
+                                    require_bind(writer.bind_value_checked_(stmt, idx++, val));
                                     found = true;
                                     break;
                                 }
                             }
                             if (!found) {
-                                sqlite3_bind_null(stmt, idx++);
+                                require_bind(sqlite3_bind_null(stmt, idx++));
                             }
                         }
                     }
                 }
 
-                // Execute
-                if (db_->step_statement_(stmt) != SQLITE_DONE) {
-                    LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(db_->internal_handle()));
-                    throw std::runtime_error("Failed to insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
-                }
-
-                // Get the new ID (or existing ID for upsert)
-                auto id = sqlite3_last_insert_rowid(db_->internal_handle());
-                primary_key_t actual_id = id;
+                primary_key_t actual_id = 0;
                 global_id_t actual_gid = gid;
+                bool returned_identity = false;
+                int step_rc = writer.step_statement_(stmt);
+                if (!conflict_columns.empty() && step_rc == SQLITE_ROW) {
+                    if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER ||
+                        sqlite3_column_type(stmt, 1) != SQLITE_TEXT)
+                        throw db_error("bulk upsert returned an invalid row identity");
+                    actual_id = sqlite3_column_int64(stmt, 0);
+                    const auto* text = sqlite3_column_text(stmt, 1);
+                    if (!text) throw db_error("bulk upsert returned an unavailable globalId");
+                    actual_gid.assign(reinterpret_cast<const char*>(text),
+                                      static_cast<size_t>(sqlite3_column_bytes(stmt, 1)));
+                    returned_identity = true;
+                    step_rc = writer.step_statement_(stmt); // Finish RETURNING before any further SQL.
+                }
+                if (step_rc != SQLITE_DONE) {
+                    failed_step_rc = step_rc;
+                    LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(writer.internal_handle()));
+                    try { throw db_error("Failed to insert: " + std::string(sqlite3_errmsg(writer.internal_handle()))); }
+                    catch (const db_error&) { step_error_retained = true; throw; }
+                }
+                if (conflict_columns.empty())
+                    actual_id = sqlite3_last_insert_rowid(writer.internal_handle());
+                // End this exact owned VM before identity lookup or bind_to_db.
+                // Keep the existing first-error/finalize owner around every step.
+                require_bind(::lattice::detail::store_physical_reset(stmt));
+                require_bind(::lattice::detail::store_physical_clear_bindings(stmt));
 
-                // For upsert, last_insert_rowid returns 0 if only update happened
-                if (!conflict_columns.empty() && id == 0) {
-                    // Query back to get actual id/globalId
+                if (!conflict_columns.empty() && !returned_identity) {
+                    // DO NOTHING returns no row. Every conflict value must be
+                    // present, and only one actual stored identity may be bound.
                     std::ostringstream where;
                     std::vector<column_value_t> params;
                     bool first = true;
                     for (const auto& col : conflict_columns) {
-                        for (const auto& [name, val] : values) {
-                            if (name == col) {
-                                if (!first) where << " AND ";
-                                where << col << " = ?";
-                                params.push_back(val);
-                                first = false;
-                                break;
-                            }
-                        }
+                        const auto found = std::find_if(values.begin(), values.end(),
+                            [&](const auto& value) { return value.first == col; });
+                        if (found == values.end())
+                            throw db_error("bulk DO NOTHING identity is missing a conflict property");
+                        if (!first) where << " AND ";
+                        where << col << " = ?";
+                        params.push_back(found->second);
+                        first = false;
                     }
-                    auto rows = query_read("SELECT id, globalId FROM " + schema.table_name +
-                                                " WHERE " + where.str(), params);
-                    if (!rows.empty()) {
-                        actual_id = std::get<int64_t>(rows[0].at("id"));
-                        actual_gid = std::get<std::string>(rows[0].at("globalId"));
-                    }
+                    const auto rows = writer.query("SELECT id, globalId FROM " + schema.table_name +
+                                                   " WHERE " + where.str() + " LIMIT 2", params);
+                    if (rows.size() != 1)
+                        throw db_error("bulk DO NOTHING has no unique stored row identity");
+                    const auto* stored_id = std::get_if<int64_t>(&rows[0].at("id"));
+                    const auto* stored_gid = std::get_if<std::string>(&rows[0].at("globalId"));
+                    if (!stored_id || !stored_gid)
+                        throw db_error("bulk DO NOTHING stored row identity has invalid types");
+                    actual_id = *stored_id;
+                    actual_gid = *stored_gid;
                 }
 
                 // Bind the managed object
-                m.db_ = db_.get();
+                m.db_ = &writer;
                 m.lattice_ = this;
                 m.table_name_ = schema.table_name;
                 m.id_ = actual_id;
                 m.global_id_ = actual_gid;
                 m.bind_to_db();
-
-                results.push_back(std::move(m));
-
-                // Reset for next iteration
-                sqlite3_reset(stmt);
-                sqlite3_clear_bindings(stmt);
             }
 
-            if (!was_in_transaction) {
-                db_->commit();
-            }
         } catch (...) {
-            if (db_->is_in_transaction()) {
-                db_->rollback();
+            const auto first = std::current_exception();
+            // Reuse only this VM's retained failed-evaluation primary. The
+            // wrapper can refuse with ABORT before stepping; MISUSE does not
+            // establish a valid evaluation/ending. Neither is an echo grant.
+            if (step_error_retained && failed_step_rc != SQLITE_OK &&
+                failed_step_rc != SQLITE_ROW && failed_step_rc != SQLITE_DONE &&
+                failed_step_rc != SQLITE_ABORT && failed_step_rc != SQLITE_MISUSE) {
+                auto* failed = std::exchange(stmt, nullptr);
+                writer.finalize_failed_mutation_statement_(failed, failed_step_rc, first);
+                std::rethrow_exception(first);
             }
-            auto msg = sqlite3_errmsg(db_->internal_handle());
-            sqlite3_finalize(stmt);
-            throw;
+            // Finalize BEFORE savepoint/transaction settlement. sqlite3_finalize
+            // consumes this statement even when it echoes the failed step code.
+            const int rc = ::lattice::detail::store_physical_finalize(stmt); stmt = nullptr;
+            if (rc != SQLITE_OK) {
+                std::exception_ptr finalization;
+                try { throw db_error("bulk statement finalized with its retained SQLite failure"); }
+                catch (...) { finalization = std::current_exception(); }
+                throw mutation_operation_error(first, {}, {}, {}, finalization);
+            }
+            std::rethrow_exception(first);
         }
-
-        sqlite3_finalize(stmt);
-        return results;
+        const int final_rc = ::lattice::detail::store_physical_finalize(stmt); stmt = nullptr;
+        if (final_rc != SQLITE_OK) throw db_error("bulk statement finalization failed");
+        });
+        return results; // all operation/delivery leaves have ended
     }
 
     // MARK: Bind Managed
@@ -1459,6 +1977,8 @@ public:
     void bind_managed(managed<T>& obj, const model_schema& schema,
                       const std::vector<std::string>& conflict_columns = {},
                       const std::string& preserved_global_id = "") {
+        if(detail::observer_delivery_enabled(*this))
+            throw db_error("delivery binding requires its admitted closed producer");
         // Convert property_descriptors to column_defs for table creation
         std::vector<column_def> columns;
         columns.reserve(schema.properties.size());
@@ -1640,6 +2160,12 @@ public:
     std::shared_ptr<scheduler> get_scheduler() const { return scheduler_; }
 
     // Get the configuration
+    detail::store_resource_name_observation capture_store_name_observation() const {
+        require_creator_process();
+        if(is_closed()||!db_)throw db_error("closed lattice has no MAIN name observation");
+        return db_->capture_resource_name_();
+    }
+
     const configuration& config() const { return config_; }
 
     /// Flag indicating if this connection is the sync coordinator
@@ -1669,12 +2195,13 @@ public:
         change_buffer_.emplace_back(table, op, row_id, global_id, main_schema);
     }
 
-    /// Discard buffered-but-undelivered changes (rollback path — wired as the
-    /// rolled-back txn hook in setup_change_hook). Wholesale clear is correct:
-    /// the buffer only ever holds the currently-open transaction's rows —
-    /// every commit flushes it via the WAL hook or the post-statement drain.
+    /// Explicit discard cannot destroy a protected operation's live prefix.
+    /// The actual Native rollback hook uses its separate nonthrowing path.
     void discard_change_buffer() {
         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        if (mutation_delivery_depth_ != 0 || change_buffer_delivery_credit_)
+            throw db_error("cannot discard a protected mutation prefix");
+        advance_change_buffer_custody_locked_();
         change_buffer_.clear();
     }
 
@@ -1714,13 +2241,25 @@ public:
 
 private:
     std::function<void()> capture_topology_settlement(database& writer) {
+        std::shared_ptr<const detail::observer_delivery_original> expected_credit;
+        if (const auto* context = writer.lattice_update_hook_context_.get())
+            if (context->mutation_original) expected_credit = context->mutation_original->observer_delivery;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if (change_buffer_delivery_credit_ &&
+                (change_buffer_delivery_credit_ != expected_credit ||
+                 change_buffer_delivery_credit_.owner_before(expected_credit) ||
+                 expected_credit.owner_before(change_buffer_delivery_credit_)))
+                throw db_error("ordinary capture requires its exact credited buffer original");
             // Match the ordinary empty-buffer tail without stealing a flush or
             // an owned recovery/delivery reservation that is still in progress.
             if (change_buffer_.empty() && !is_flushing_ &&
-                !recovery_change_buffer_reserved_ && topology_delivery_depth_ == 0)
-                return [] {};
+                !recovery_change_buffer_reserved_ && topology_delivery_depth_ == 0) {
+                // The database already preallocated its exact capture carrier;
+                // it and the real Core context keep this a nonfinal DATA drop.
+                change_buffer_delivery_credit_.reset();
+                return [this] { fire_invalidation_hooks({}, invalidation_reason::commit); };
+            }
         }
         auto batch = std::make_shared<recovery_commit_batch>();
         std::function<void()> delivery = [this, batch] { deliver_topology_settlement(*batch); };
@@ -1781,6 +2320,15 @@ private:
     bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch,
                                  bool ordinary_capture = false) {
         const bool recovery_capture = batch && !ordinary_capture;
+        std::shared_ptr<database> generic_writer;
+        if (!ordinary_capture && !recovery_capture) {
+            {
+                std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+                generic_writer = db_;
+            }
+            if (generic_writer && generic_writer->core_native_tail_owned_.load(std::memory_order_acquire))
+                return false; // live successor / ended-but-uncaptured exact tail
+        }
         if(administrative_owner_) {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             if(!change_buffer_.empty()||is_flushing_)
@@ -1788,24 +2336,37 @@ private:
             return false;
         }
         LOG_DEBUG("flush_changes", "Called");
+        std::shared_ptr<const detail::observer_delivery_original> changes_credit;
         std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> changes;
         decltype(changes) original_changes;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
+            // Recheck under the same leaf used by the pre-BEGIN checkpoint.
+            // A drain which saw idle before waiting may now face a new ticket.
+            if (generic_writer && generic_writer->core_native_tail_owned_.load(std::memory_order_acquire)) return false;
             // An owned transaction may not turn an active delivery into an
             // empty captured batch and then commit. Actual admission refuses
             // this state first; retain refusal at the final capture boundary.
             if (recovery_capture && topology_delivery_depth_ != 0)
                 throw db_error("owned notification capture during topology delivery");
+            if (mutation_delivery_depth_ != 0 &&
+                !(ordinary_capture && recovery_writer &&
+                  database::core_settlement_scope::active_for(recovery_writer))) return false;
             if (change_buffer_.empty() || is_flushing_ || topology_delivery_depth_ != 0 ||
                 (recovery_change_buffer_reserved_ && !recovery_capture)) return false;
+            // Credited ordinary payload cannot be stolen by a generic/recovery
+            // flush after close_write_db or a lost/unknown ordinary capture.
+            if (change_buffer_delivery_credit_ && !ordinary_capture) return false;
+            changes_credit = change_buffer_delivery_credit_;
+            if (batch) batch->delivery_credit = changes_credit;
             if (ordinary_capture) {
                 // Build the detached ordinary batch before consuming its live
                 // records. Allocation/query failures keep the original pending.
                 changes = change_buffer_;
                 original_changes = changes;
             } else {
+                advance_change_buffer_custody_locked_();
                 changes = std::move(change_buffer_);
                 change_buffer_.clear();
             }
@@ -1845,13 +2406,29 @@ private:
             if (ordinary_capture) {
                 if (auto* operation = database::attachment_sql_scope::operation_for(recovery_writer))
                     operation->check();
-                if (recovery_writer->is_closed()) throw db_error("topology settlement writer closed");
+                if (recovery_writer->is_closed() &&
+                    !database::mutation_sql_scope::active_for(recovery_writer) &&
+                    !database::core_settlement_scope::active_for(recovery_writer))
+                    throw db_error("topology settlement writer closed");
                 auto rows = recovery_writer->query(sql, params);
-                if (recovery_writer->is_closed()) throw db_error("topology settlement writer closed");
+                if (recovery_writer->is_closed() &&
+                    !database::mutation_sql_scope::active_for(recovery_writer) &&
+                    !database::core_settlement_scope::active_for(recovery_writer))
+                    throw db_error("topology settlement writer closed");
                 return rows;
             }
             return recovery_writer ? recovery_writer->query(sql, params) : query_read(sql, params);
         };
+
+        // Only the actual ordinary FILE writer's installed Core producer
+        // supplies new MAIN insert custody. Resolve those exact rows on that
+        // retained writer: an independent reader may still pin an older WAL
+        // snapshot. Memory/Core/recovery retain the original read path below.
+        const auto* ordinary_audit_hook = generic_writer
+            ? generic_writer->lattice_update_hook_context_.get() : nullptr;
+        const bool ordinary_main_audits_buffered = !config_.is_in_memory() && ordinary_audit_hook &&
+            ordinary_audit_hook->owner == this &&
+            ordinary_audit_hook->connection == generic_writer->db_;
 
         // Backfill globalId for AuditLog INSERTs buffered by the update hook.
         // The memory/Emscripten hook buffers them with an empty globalId — the
@@ -1867,8 +2444,9 @@ private:
             }
             if (!audit_id_list.empty()) {
                 std::unordered_map<int64_t, std::string> gid_by_id;
-                auto rows = batch_query(
-                    "SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
+                auto rows = ordinary_main_audits_buffered
+                    ? generic_writer->query("SELECT id, globalId FROM main.AuditLog WHERE id IN (" + audit_id_list + ")")
+                    : batch_query("SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
                 for (const auto& row : rows) {
                     auto id_it = row.find("id");
                     auto gid_it = row.find("globalId");
@@ -1920,8 +2498,10 @@ private:
         // BEFORE notifying observers. This prevents any instance's
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
-        if (recovery_capture) {
-            // Recovery buffers the actual inserted audit rows, including file
+        const auto* core_tail = recovery_writer ? recovery_writer->lattice_update_hook_context_.get() : nullptr;
+        const bool actual_core_tail = ordinary_capture && core_tail && core_tail->mutation_tail_pending;
+        if (recovery_capture || actual_core_tail) {
+            // Recovery/ordinary Core tails buffer actual inserted audit rows, including file
             // stores. A suppressed model edit has no new audit frontier and
             // must not adopt an unrelated historical MAX(id).
             for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
@@ -2101,22 +2681,25 @@ private:
 
         // Pass 2: AuditLog INSERT events for each non-internal model change.
         // Skip derivation whenever the update hook buffers AuditLog INSERTs
-        // directly (pass 1): native memory stores and every Emscripten store.
-        // Emscripten persistent paths also use DELETE journal + deferred drain;
-        // classifying only by path would deliver each audit row twice.
-        // Native file stores derive entries after their WAL commit as before.
+        // directly (pass 1): recovery captures, exact ordinary Core tails,
+        // native memory stores and every Emscripten store. The ordinary Core
+        // hook also buffers actual AuditLog INSERTs on file stores; deriving
+        // model or internal-table entries again would duplicate those rows.
+        // Ordinary file MAIN rows also use actual inserted identities when
+        // the retained writer above has the exact Core hook context. Unknown
+        // producer/non-MAIN file rows retain their original derivation.
         // Internal table AuditLog entries are skipped — handled in pass 3.
 #ifdef __EMSCRIPTEN__
         constexpr bool audit_inserts_buffered_directly = true;
 #else
-        const bool audit_inserts_buffered_directly = recovery_capture || config_.is_in_memory();
+        const bool audit_inserts_buffered_directly = recovery_capture || actual_core_tail || config_.is_in_memory();
 #endif
         bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
             if (table == "AuditLog") continue;
             // Direct entries have already been included by pass 1.
-            if (audit_inserts_buffered_directly) continue;
+            if (audit_inserts_buffered_directly || (ordinary_main_audits_buffered && main_schema)) continue;
             // Internal tables — AuditLog entries handled in pass 3 below
             if (internal_table_parents.count(table)) continue;
             // Sync bookkeeping tables (_lattice_sync_state, _SyncControl,
@@ -2165,7 +2748,8 @@ private:
         // tableName+operation only, not by rowId.
         if (had_internal_changes && !audit_inserts_buffered_directly) {
             for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
-                if (!internal_table_parents.count(table)) continue;
+                if (!internal_table_parents.count(table) ||
+                    (ordinary_main_audits_buffered && main_schema)) continue;
 
                 auto audit_rows = batch_query(
                     "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND operation = ? ORDER BY id DESC LIMIT 1",
@@ -2284,7 +2868,10 @@ private:
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             if (change_buffer_ != original_changes)
                 throw db_error("topology settlement buffer changed during capture");
+            advance_change_buffer_custody_locked_();
             change_buffer_.clear();
+            // Both the real batch and local displaced rows still own DATA.
+            change_buffer_delivery_credit_.reset();
         }
         // is_flushing_ cleared by reset_guard on scope exit (also on unwind).
         LOG_DEBUG("flush_changes", "Done");
@@ -2384,6 +2971,12 @@ public:
     observer_id add_recovery_refresh_observer(std::function<void()> callback);
     void remove_recovery_refresh_observer(observer_id token);
     void request_recovery_refresh() noexcept;
+
+    // Enroll this ready file original in the existing process worker. No
+    // observer or sync role is required. Memory/read-only originals return
+    // false; closed owners and registration/startup failures throw. Repeated
+    // successful enrollment is idempotent. Close uses the same owner drain.
+    bool enable_automatic_read_pool_maintenance();
 
     // One row's worth of change metadata, batched into the observer
     // callback's vector. Same fields the per-row signature exposed
@@ -2525,6 +3118,7 @@ private:
     // carry an explicit selection, so an attached row cannot alias a main row.
     void notify_changes_batched_impl(const std::vector<change_event>& changes,
                                     const std::vector<size_t>* typed_indices) {
+        auto delivery = detail::prepare_observer_delivery_batch();
         // Group by table (preserves intra-table order from input vector).
         std::unordered_map<std::string, std::vector<change_event>> by_table;
         by_table.reserve(changes.size());
@@ -2541,8 +3135,15 @@ private:
             for (auto& [table, batch] : by_table) {
                 auto it = table_observers_.find(table);
                 if (it == table_observers_.end()) continue;
+                std::shared_ptr<const std::vector<change_event>> shared_batch;
                 for (const auto& [id, cb] : it->second) {
-                    all_callbacks.push_back([cb, batch] { cb(batch); });
+                    // Keep the original opaque copy at enqueue, before the
+                    // structured-data owner allocation. Mutable callback value
+                    // state and user copy/throw timing stay per invocation.
+                    auto callback = cb;
+                    if (!shared_batch)
+                        shared_batch = std::make_shared<const std::vector<change_event>>(std::move(batch));
+                    all_callbacks.push_back([cb = std::move(callback), shared_batch] { cb(*shared_batch); });
                 }
             }
         }
@@ -2560,22 +3161,30 @@ private:
             for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
                 auto table_it = object_observers_.find(table);
                 if (table_it == object_observers_.end()) continue;
+                // One immutable owning string for this input event, allocated
+                // only if an actual target matches. The original input loop
+                // still determines per-object order, including broadcasts.
+                std::shared_ptr<const std::string> shared_fields;
+                const auto append = [&](const auto& original) {
+                    auto callback = original; // Original enqueue-time opaque copy.
+                    if (!shared_fields)
+                        shared_fields = std::make_shared<const std::string>(changed_fields);
+                    all_callbacks.push_back([callback = std::move(callback), shared_fields] {
+                        callback(*shared_fields);
+                    });
+                };
 
                 if (row_id == 0 && !changed_fields.empty()) {
                     for (const auto& [rid, observer_map] : table_it->second) {
                         for (const auto& [id, callback] : observer_map) {
-                            all_callbacks.push_back([callback, changed_fields] {
-                                callback(changed_fields);
-                            });
+                            append(callback);
                         }
                     }
                 } else {
                     auto row_it = table_it->second.find(row_id);
                     if (row_it == table_it->second.end()) continue;
                     for (const auto& [id, callback] : row_it->second) {
-                        all_callbacks.push_back([callback, changed_fields] {
-                            callback(changed_fields);
-                        });
+                        append(callback);
                     }
                 }
             }
@@ -2591,6 +3200,10 @@ private:
             for (const auto& event : changes) append_typed(event);
         }
         if (all_callbacks.empty()) return;
+        if (delivery) {
+            scheduler_->invoke(delivery(std::move(all_callbacks)));
+            return;
+        }
         scheduler_->invoke([callbacks = std::move(all_callbacks)]() mutable {
             for (auto& cb : callbacks) {
                 cb();
@@ -3224,6 +3837,514 @@ public:
     };
 
 private:
+    using mutation_change = std::tuple<std::string, std::string, int64_t, std::string, bool>;
+    struct mutation_registry_checkpoint {
+        detail::core_model_registry_map<detail::core_model_registry_set> links_by_target;
+        detail::core_model_registry_set links_unknown, virtual_links;
+        detail::core_model_registry_map<detail::core_model_registry_list> lists_by_parent;
+    };
+    mutation_registry_checkpoint capture_mutation_registry_() const {
+        return {link_tables_by_rhs_target_, link_tables_unknown_target_, virtual_link_tables_, list_tables_by_parent_};
+    }
+    void restore_mutation_registry_(mutation_registry_checkpoint& original) noexcept {
+        link_tables_by_rhs_target_.swap(original.links_by_target);
+        link_tables_unknown_target_.swap(original.links_unknown);
+        virtual_link_tables_.swap(original.virtual_links);
+        list_tables_by_parent_.swap(original.lists_by_parent);
+    }
+    struct mutation_transaction_checkpoint {
+        // Retires after all displaced prefix/registry payload, outside Native.
+        std::shared_ptr<const detail::observer_delivery_original> delivery_credit;
+        std::vector<mutation_change> committed_prefix;
+        mutation_registry_checkpoint registry;
+        bool notify_local_objects = false;
+        bool dirty = false;
+    };
+
+    // Logical prefix custody, not vector allocation identity: append and a
+    // proved nested suffix rollback preserve every ancestor's original prefix.
+    // Whole-buffer clear/move/replacement advances this saturating epoch. Once
+    // exhausted, protected operations refuse instead of accepting a wrapped ID.
+    void advance_change_buffer_custody_locked_() noexcept {
+        if (change_buffer_custody_epoch_ != std::numeric_limits<uint64_t>::max())
+            ++change_buffer_custody_epoch_;
+    }
+    void discard_change_buffer_after_native_rollback_() noexcept {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        advance_change_buffer_custody_locked_();
+        change_buffer_.clear();
+    }
+    static void before_mutation_prefix_restore_reserve_();
+    struct mutation_operation_checkpoint {
+        size_t prefix_size = 0;
+        uint64_t prefix_epoch = 0;
+        // Empty on success. Rare failed-savepoint recovery allocates BEFORE
+        // moving anything; displaced DATA retires with the existing off-leaf,
+        // creator-fenced operation payload, never beneath a Native leaf.
+        std::vector<mutation_change> restored, retired;
+        mutation_registry_checkpoint registry;
+        std::shared_ptr<const database::core_transaction_original> original;
+        bool cursor_present = false;
+        int64_t cursor_last = 0;
+        bool notify_local_objects = false, dirty = false, installed = false;
+    };
+
+private:
+    // Exact lexical admitted body only. Borrowed DATA references cannot outlive
+    // its continuously held Native mutex and existing publication counter.
+    struct mutation_body_scope final {
+        const uint64_t creator_;
+        const std::thread::id thread_;
+        lattice_db& owner_;
+        const std::shared_ptr<database>& writer_;
+        const std::shared_ptr<std::recursive_timed_mutex>& gate_;
+        const std::shared_ptr<const detail::observer_delivery_connection>& connection_;
+        database::mutation_sql_scope& sql_;
+        mutation_body_scope* const previous_;
+        static thread_local mutation_body_scope* current_;
+        mutation_body_scope(lattice_db&,const std::shared_ptr<database>&,
+            const std::shared_ptr<std::recursive_timed_mutex>&,
+            const std::shared_ptr<const detail::observer_delivery_connection>&,database::mutation_sql_scope&);
+        ~mutation_body_scope()noexcept;
+        static const mutation_body_scope* enclosing_for_(lattice_db&);
+        void require_current_()const;
+        mutation_body_scope(const mutation_body_scope&)=delete;
+        mutation_body_scope& operator=(const mutation_body_scope&)=delete;
+    };
+    void observe_mutation_publication_wait_();
+    void require_mutation_connection_original_(database&,
+        const std::shared_ptr<const detail::observer_delivery_connection>&,
+        std::shared_ptr<const detail::observer_delivery_connection>&) const;
+protected:
+    // Complete immediate-call SQL/Native unit. This is engine-private
+    // authority, not a public trust flag: admission offers SQL fairness before
+    // the store gate, then retains one physical Native mutex through the body.
+    // A caller-owned Core transaction gets a private savepoint; raw/foreign
+    // transactions cannot issue the exact retained BEGIN original required here.
+    // Successful savepoint RELEASE leaves all delivery and cursor publication
+    // to that SAME outer transaction's eventual real COMMIT/ROLLBACK.
+    template<typename F>
+    auto with_mutation_operation(F&& body) -> std::invoke_result_t<F, database&> {
+        return with_mutation_operation(std::forward<F>(body), [](bool) noexcept {});
+    }
+
+    template<typename F, typename Adopt>
+    auto with_mutation_operation(F&& body, Adopt&& adopt) -> std::invoke_result_t<F, database&> {
+        static_assert(std::is_nothrow_invocable_v<Adopt, bool>, "graph adoption must be nonthrowing");
+        using result_type = std::invoke_result_t<F, database&>;
+        require_creator_process(); // BEFORE any inherited Native/owner leaf
+        const auto admission_entered=std::chrono::steady_clock::now();
+        require_catalog_callback_absent();
+        if(database::mutation_callback_active_())
+            throw db_error("mutation operation refuses actual SQL callback reentry");
+        static_assert(!std::is_reference_v<result_type>, "mutation results must own their value");
+        using stored_type = std::conditional_t<std::is_void_v<result_type>, bool, result_type>;
+        static_assert(std::is_nothrow_move_constructible_v<stored_type>,
+            "mutation results may not throw after SQL settlement");
+        // Declare every payload/capture before the leaves. Displaced tuples,
+        // managed results and final user captures are destroyed only after all
+        // Native/store/entry holds, including every exceptional return path.
+        struct operation_custody {
+            lattice_db& owner;
+            bool active = false;
+            ~operation_custody() noexcept {
+                if (active && owner.owns_creator_process())
+                    owner.active_mutation_operations_.fetch_sub(1, std::memory_order_release);
+            }
+        } custody{*this};
+        struct operation_fields {
+            std::optional<stored_type> value;
+            mutation_operation_checkpoint checkpoint;
+            database::core_settlement_result tail;
+            std::exception_ptr first, rollback_debt, release_debt, capture_debt, delivery_debt, finalize_debt;
+            std::shared_ptr<database> writer;
+            std::shared_ptr<std::recursive_timed_mutex> gate_original;
+            std::shared_ptr<const database::core_transaction_original> caller;
+            bool prepare_native_target_destruction(pid_t creator) noexcept {
+                if (creator != ::getpid()) return false;
+                // Arbitrary result/callback targets remain heap-owned through
+                // each final destruction. A child never reaches later fields.
+                value.reset(); if (creator != ::getpid()) return false;
+                tail.delivery = {}; if (creator != ::getpid()) return false;
+                first = {}; if (creator != ::getpid()) return false;
+                rollback_debt = {}; if (creator != ::getpid()) return false;
+                release_debt = {}; if (creator != ::getpid()) return false;
+                capture_debt = {}; if (creator != ::getpid()) return false;
+                delivery_debt = {}; if (creator != ::getpid()) return false;
+                finalize_debt = {}; if (creator != ::getpid()) return false;
+                tail.first = {}; if (creator != ::getpid()) return false;
+                tail.publication = {}; if (creator != ::getpid()) return false;
+                tail.capture = {}; if (creator != ::getpid()) return false;
+                caller.reset(); if (creator != ::getpid()) return false;
+                checkpoint.original.reset(); if (creator != ::getpid()) return false;
+                gate_original.reset(); if (creator != ::getpid()) return false;
+                writer.reset(); return creator == ::getpid();
+            }
+        };
+        detail::process_bound_resource_owner<operation_fields> payload;
+        auto& fields = payload.get();
+        auto& value = fields.value; auto& checkpoint = fields.checkpoint;
+        auto& tail = fields.tail; auto& first = fields.first;
+        auto& rollback_debt = fields.rollback_debt; auto& release_debt = fields.release_debt;
+        auto& capture_debt = fields.capture_debt; auto& delivery_debt = fields.delivery_debt;
+        auto& finalize_debt = fields.finalize_debt;
+        auto& writer = fields.writer; auto& gate_original = fields.gate_original;
+        // Fixed stack DATA only. Every observed replacement is retained until
+        // all leaves end; creator-fenced destruction cannot retire inherited
+        // connection/client/original DATA under a child Native/store leaf.
+        struct admission_connection_data {
+            const uint64_t creator=detail::database_native_process();
+            std::shared_ptr<const detail::observer_delivery_connection> original,observed;
+            std::shared_ptr<const database::core_transaction_original> caller;
+            ~admission_connection_data() noexcept {
+                if(creator==detail::database_native_process())return;
+                new (&original) std::shared_ptr<const detail::observer_delivery_connection>();
+                new (&observed) std::shared_ptr<const detail::observer_delivery_connection>();
+                new (&caller) std::shared_ptr<const database::core_transaction_original>();
+            }
+        } connection_data;
+        static_assert(sizeof(admission_connection_data)<=64,"fixed admission connection DATA");
+        fields.caller = std::atomic_load(&txn_original_);
+        const auto deny_foreign_caller = [&] {
+            require_creator_process();
+            const auto current = std::atomic_load(&txn_original_);
+            if (current && !current->ended.load(std::memory_order_acquire) &&
+                (current->creator != detail::database_native_process() ||
+                 current->thread != std::this_thread::get_id()))
+                throw db_error("mutation cannot wait behind a foreign caller transaction");
+            if (closed_.load(std::memory_order_acquire))
+                throw db_error("mutation owner closed before actual admission");
+        };
+        // This configuration field has no post-construction setter. It is the
+        // actual owner policy before a writer can be retained, never a new
+        // default budget. The retained writer must prove the same value below.
+        const int configured_timeout=config_.busy_timeout_ms;
+        const int entry_budget=configured_timeout>0?std::min(configured_timeout,2000):0;
+        const auto entry_deadline=admission_entered+std::chrono::milliseconds(entry_budget);
+        const bool fresh_entry=!fields.caller && tls_store_gate_depths().empty() && !active_vec0_maintenance_;
+        const auto check_initial_deadline=[&] {
+            if(std::chrono::steady_clock::now()>=entry_deadline)
+                throw db_error("mutation admission busy budget exhausted");
+        };
+        const auto* enclosing_body=mutation_body_scope::enclosing_for_(*this);
+        if(enclosing_body) {
+            // This is the actual parent body's retained coherent publication,
+            // not a same-thread transaction/flag or a newly selected writer.
+            enclosing_body->require_current_();
+            writer=enclosing_body->writer_;gate_original=enclosing_body->gate_;
+            connection_data.original=enclosing_body->connection_;
+        } else for(;;) {
+            deny_foreign_caller();
+            {
+                std::unique_lock<std::mutex> lock(connection_ownership_mutex_,std::try_to_lock);
+                if(lock.owns_lock()) {
+                    writer=db_;gate_original=store_write_gate_;
+                    connection_data.original=std::atomic_load(&observer_delivery_connection_);
+                    break;
+                }
+            }
+            if(!fresh_entry || !database::mutation_wait_context_free_() || entry_budget==0)
+                throw db_error("mutation publication busy; no eligible wait budget");
+            check_initial_deadline();
+            observe_mutation_publication_wait_(); // failed real try-lock, OFF all leaves
+            deny_foreign_caller();check_initial_deadline();
+            const auto now=std::chrono::steady_clock::now();
+            std::this_thread::sleep_for(std::min(entry_deadline-now,
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(1))));
+            deny_foreign_caller();check_initial_deadline();
+        }
+        if (!writer || !owns_creator_process())
+            throw db_error("mutation operation has no live originating writer");
+        if(writer->busy_timeout_ms_!=configured_timeout)
+            throw db_error("mutation owner and originating writer timeout policies differ");
+        database::mutation_admission_original_ admission(*writer,fresh_entry,admission_entered);
+        const auto require_admission_data=[&](bool native_locked=false) {
+            deny_foreign_caller();admission.require_current_(native_locked);
+            if(writer->busy_timeout_ms_!=configured_timeout)
+                throw db_error("mutation originating writer timeout policy changed");
+            connection_data.caller=std::atomic_load(&txn_original_);
+            if(connection_data.caller.get()!=fields.caller.get() ||
+               connection_data.caller.owner_before(fields.caller) || fields.caller.owner_before(connection_data.caller))
+                throw db_error("mutation caller transaction original changed during admission");
+            require_mutation_connection_original_(*writer,connection_data.original,connection_data.observed);
+        };
+        const auto try_admission_original=[&](bool take_custody=false) {
+            require_admission_data(take_custody);
+            if(enclosing_body) {
+                enclosing_body->require_current_();
+                // The immediate nested call borrows its parent's still-live
+                // counter. It cannot end that lexical body or Native hold;
+                // no new unsynchronized publication-counter increment occurs.
+                return true;
+            }
+            std::unique_lock<std::mutex> lock(connection_ownership_mutex_,std::try_to_lock);
+            if(!lock.owns_lock())return false;
+            // Compare to the retained ORIGINAL; never retarget the writer,
+            // gate, caller, profile, immutable policy/client or runtime.
+            if(db_.get()!=writer.get() || db_.owner_before(writer) || writer.owner_before(db_) ||
+               store_write_gate_.get()!=gate_original.get() ||
+               store_write_gate_.owner_before(gate_original) || gate_original.owner_before(store_write_gate_))
+                throw db_error("mutation writer or store gate changed during admission");
+            require_admission_data(take_custody);
+            if(take_custody) {
+                if(active_mutation_operations_.load(std::memory_order_relaxed)==std::numeric_limits<size_t>::max())
+                    throw db_error("mutation operation custody exhausted");
+                active_mutation_operations_.fetch_add(1,std::memory_order_acq_rel);
+                custody.active=true;
+            }
+            return true;
+        };
+        const auto wait_publication=[&] {
+            require_admission_data();
+            if(!admission.may_wait_)
+                throw db_error("mutation publication busy; no eligible wait budget");
+            admission.check_deadline_();
+            observe_mutation_publication_wait_(); // caller has dropped EVERY leaf
+            admission.wait_(database::mutation_admission_original_::state::publication_busy);
+        };
+        while(!try_admission_original())wait_publication();
+        database::sql_entry_scope entry(*writer, fields.caller,
+            admission.may_wait_?admission.deadline_:admission_entered);
+        admission.entry_=&entry;
+        // The retained shared writer supplies the existing stable-wrapper
+        // lifetime precondition; physical SQL-entry custody is NOT a claim
+        // that Native/physical close is prevented after a destructive move.
+        std::optional<database::mutation_sql_scope> sql_custody;
+        auto& gate = gate_original ? *gate_original : vec0_memory_maintenance_gate_;
+        std::unique_lock<std::recursive_timed_mutex> gate_hold(gate, std::defer_lock);
+        struct child_gate_abandonment {
+            lattice_db& owner;
+            std::unique_lock<std::recursive_timed_mutex>& hold;
+            ~child_gate_abandonment() noexcept {
+                if (!owner.owns_creator_process()) (void)hold.release();
+            }
+        } child_gate{*this, gate_hold};
+        using admission_state=database::mutation_admission_original_::state;
+        for(;;) {
+            if(!try_admission_original()){wait_publication();continue;}
+            admission.check_deadline_();
+            const auto before_gate=admission.probe_(); // ONLY nonblocking Native try
+            if(!try_admission_original()){wait_publication();continue;}
+            if(before_gate!=admission_state::ready) {admission.wait_(before_gate);continue;}
+            if(!gate_hold.try_lock()) {admission.wait_(admission_state::native_busy);continue;}
+            // No publication retry or sleep may inherit this store leaf.
+            if(!try_admission_original()) {
+                gate_hold.unlock();wait_publication();continue;
+            }
+            auto actual=admission_state::ready;
+            sql_custody.emplace(*writer,txn_owner_thread_,&admission,&actual);
+            if(actual!=admission_state::ready) {
+                gate_hold.unlock();
+                sql_custody.reset(); // also ends the actual physical Native scope OFF all leaves
+                admission.wait_(actual);continue;
+            }
+            // Coherent final Native -> publication admission. On contention,
+            // end the UNSTARTED SQL scope and drop Native/store before waiting.
+            if(!try_admission_original(true)) {
+                sql_custody->unlock();gate_hold.unlock();sql_custody.reset(); // physical_scope_ ends here
+                wait_publication();continue;
+            }
+            break;
+        }
+        auto& sql=*sql_custody;
+        auto release_checkpoint = [&] {
+            if (!checkpoint.installed) return;
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            --mutation_delivery_depth_;
+            checkpoint.installed = false;
+        };
+        auto require_prefix_custody = [&] {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if (change_buffer_custody_epoch_ != checkpoint.prefix_epoch ||
+                change_buffer_custody_epoch_ == std::numeric_limits<uint64_t>::max() ||
+                change_buffer_.size() < checkpoint.prefix_size) {
+                writer->mutation_operation_unsettled_.store(true, std::memory_order_release);
+                throw db_error("mutation operation lost its append-only observer prefix");
+            }
+        };
+        auto capture_ended = [&] {
+            if (!sql.transaction_ || !sql.transaction_->ended.load(std::memory_order_acquire)) return;
+            auto* context = writer->lattice_update_hook_context_.get();
+            if (!context || context->mutation_original != sql.transaction_ ||
+                !context->mutation_tail_pending) return;
+            database::core_settlement_scope capture(*writer, sql.transaction_, true);
+            writer->capture_core_tail_locked_(tail);
+        };
+        try {
+            auto* before = writer->lattice_update_hook_context_.get();
+            if (!before || before->owner != this || before->connection != sql.connection_ ||
+                !before->mutation_preparing || !before->mutation_started || !before->mutation_ended ||
+                before->recovery_delivery_deferred || before->entry_cursor_active || before->sync_chunk ||
+                before->mutation_tail_pending)
+                throw db_error("mutation operation requires original ordinary hooks before SQL");
+            // Final coherent admission above retains Native and active custody.
+            // All writer replacements recheck that custody under the SAME Native
+            // mutex; the store gate has constructor-only publication. Atomic
+            // close/caller/profile and actual physical policy are still checked
+            // here. No late publication leaf can introduce a wait under Native.
+            require_admission_data(true);admission.check_deadline_();
+            sql.start(); // cleanup owner is fully constructed BEFORE SQL effects
+            auto* context = writer->lattice_update_hook_context_.get();
+            if (!context || context->owner != this || context->connection != sql.connection_ ||
+                !sql.transaction_ || context->mutation_original != sql.transaction_ ||
+                context->recovery_delivery_deferred || context->entry_cursor_active ||
+                context->sync_chunk)
+                throw db_error("mutation operation requires its exact ordinary Native hooks");
+            {
+                std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                // This stage refuses structural reentry before any model/DDL
+                // body. It does not claim full callback-write/recovery support.
+                if (is_flushing_ || recovery_change_buffer_reserved_ || topology_delivery_depth_ != 0 ||
+                    mutation_delivery_depth_ == std::numeric_limits<size_t>::max() ||
+                    change_buffer_custody_epoch_ == std::numeric_limits<uint64_t>::max() ||
+                    (sql.owns_transaction_ && !change_buffer_.empty()))
+                    throw db_error("mutation operation requires an unsettled-tail-free Native boundary");
+                checkpoint.prefix_size = change_buffer_.size();
+                checkpoint.prefix_epoch = change_buffer_custody_epoch_;
+                checkpoint.registry = capture_mutation_registry_();
+                checkpoint.original = sql.transaction_;
+                checkpoint.cursor_present = context->mutation_cursor_present;
+                checkpoint.cursor_last = context->mutation_cursor_last;
+                checkpoint.notify_local_objects = tls_notify_local_object_observers_;
+                checkpoint.dirty = writer->txn_dirty_.load(std::memory_order_relaxed);
+                ++mutation_delivery_depth_;
+                checkpoint.installed = true;
+            }
+            {
+                mutation_body_scope actual_body(*this,writer,gate_original,connection_data.original,sql);
+            if constexpr (std::is_void_v<result_type>) {
+                std::forward<F>(body)(*writer);
+                require_creator_process(); value.emplace(true);
+            } else {
+                value.emplace(std::forward<F>(body)(*writer));
+                require_creator_process();
+            }
+            }
+            if (sql.finalization_failure_) std::rethrow_exception(sql.finalization_failure_);
+            sql.require_transaction_(); // original Native proof precedes DATA proof
+            require_prefix_custody();
+            sql.commit(); // body, UDFs and binds are never retried
+            if (!sql.owns_transaction_) require_prefix_custody();
+            capture_ended();
+        } catch (...) {
+            if (!owns_creator_process()) {
+                // All payloads are still creator-bound heap originals. Unwind
+                // child stack shells without SQL, rollback, lock release or
+                // inherited target/control-block destruction.
+                (void)gate_hold.release(); entry.release(); throw;
+            }
+            first = std::current_exception(); // BEFORE cleanup/callback reentry
+            const auto cleanup = sql.abort();
+            rollback_debt = cleanup.rollback;
+            release_debt = cleanup.release;
+            // ROLLBACK TO + RELEASE preserves the genuine caller's prefix.
+            // A whole SQLite auto-rollback already restored its pre-BEGIN
+            // checkpoint; restoring this operation prefix would resurrect rows.
+            if (checkpoint.installed && !rollback_debt && !release_debt &&
+                !cleanup.transaction_ended) {
+                try {
+                    // A RELEASE which already succeeded is not a rollback.
+                    // Nor can an ended/changed original authorize rebuilding
+                    // this operation's old prefix in a successor transaction.
+                    if (sql.owns_transaction_ ||
+                        sql.phase_ != database::mutation_sql_scope::phase::rolled_back ||
+                        sql.transaction_ != checkpoint.original || !sql.same_transaction_())
+                        throw db_error("mutation prefix restoration requires its actual savepoint rollback");
+                    auto* context = writer->lattice_update_hook_context_.get();
+                    if (!context || context->mutation_original != checkpoint.original)
+                        throw db_error("mutation checkpoint lost its original Native hook");
+                    require_prefix_custody();
+                    // No element has moved if allocation/fault admission fails.
+                    // This is outside the buffer leaf; a creator recheck also
+                    // precedes reacquiring it after allocator activity.
+                    before_mutation_prefix_restore_reserve_();
+                    checkpoint.restored.reserve(checkpoint.prefix_size);
+                    require_creator_process();
+                    {
+                        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                        if (change_buffer_custody_epoch_ != checkpoint.prefix_epoch ||
+                            change_buffer_custody_epoch_ == std::numeric_limits<uint64_t>::max() ||
+                            change_buffer_.size() < checkpoint.prefix_size)
+                            throw db_error("mutation rollback lost its append-only observer prefix");
+                        static_assert(std::is_nothrow_move_constructible_v<mutation_change>);
+                        for (size_t i = 0; i < checkpoint.prefix_size; ++i)
+                            checkpoint.restored.emplace_back(std::move(change_buffer_[i]));
+                        checkpoint.retired.swap(change_buffer_);
+                        change_buffer_.swap(checkpoint.restored);
+                        // This proved suffix rollback preserves all ancestor
+                        // prefixes, so it does NOT advance their custody epoch.
+                        restore_mutation_registry_(checkpoint.registry);
+                        context->mutation_cursor_present = checkpoint.cursor_present;
+                        context->mutation_cursor_last = checkpoint.cursor_last;
+                        tls_notify_local_object_observers_ = checkpoint.notify_local_objects;
+                        writer->txn_dirty_.store(checkpoint.dirty, std::memory_order_relaxed);
+                    }
+                } catch (...) {
+                    if (!owns_creator_process()) {
+                        (void)gate_hold.release(); entry.release(); throw;
+                    }
+                    writer->mutation_operation_unsettled_.store(true, std::memory_order_release);
+                    capture_debt = std::current_exception();
+                }
+            }
+            try { capture_ended(); }
+            catch (...) { if (!capture_debt) capture_debt = std::current_exception(); }
+        }
+        try { release_checkpoint(); }
+        catch (...) {
+            writer->mutation_operation_unsettled_.store(true, std::memory_order_release);
+            if (!capture_debt) capture_debt = std::current_exception();
+        }
+        finalize_debt = sql.finalization_failure_;
+        sql.unlock();
+        if (sql.transaction_ && sql.transaction_->ended.load(std::memory_order_acquire) &&
+            std::atomic_load(&txn_original_) == sql.transaction_) {
+            // SQLite RAISE(ROLLBACK) may really end the entire caller. Retire
+            // only its old gate/original, before a callback can issue another.
+            release_store_write_gate();
+            if (!tail.capture) {
+                auto expected = sql.transaction_;
+                std::atomic_compare_exchange_strong(&txn_original_, &expected,
+                    std::shared_ptr<const database::core_transaction_original>{});
+            }
+        }
+        gate_hold.unlock();
+        entry.release();
+        // All graph bindings publish together before user delivery. This
+        // private nonallocating adapter conveys no SQL authority and must not
+        // destroy old graph captures; the journal retains those off-leaf.
+        std::forward<Adopt>(adopt)(sql.phase_ == database::mutation_sql_scope::phase::committed);
+        // No Native/store/metadata leaf remains. This original tail cannot
+        // retire a new transaction started reentrantly by its own callbacks.
+        try { if (tail.delivery) tail.delivery(); }
+        catch (...) {
+            if (!owns_creator_process()) throw;
+            delivery_debt = std::current_exception();
+        }
+        require_creator_process();
+        if (!capture_debt) capture_debt = tail.capture;
+        if (!first) first = tail.first ? tail.first : tail.publication;
+        else if (!delivery_debt) delivery_debt = tail.publication;
+        // A checked failed statement may retain the SAME primary as its
+        // finalize result. It remains latched before COMMIT above, but is
+        // not a second independent failure when the first is propagated.
+        if (first && finalize_debt == first) finalize_debt = {};
+        if (first) {
+            if (rollback_debt || release_debt || capture_debt || delivery_debt || finalize_debt ||
+                (tail.publication && first != tail.publication))
+                throw mutation_operation_error(first, rollback_debt, release_debt, delivery_debt,
+                    finalize_debt, capture_debt, tail.publication,
+                    sql.phase_ == database::mutation_sql_scope::phase::committed, tail.committed);
+            std::rethrow_exception(first);
+        }
+        if (capture_debt || delivery_debt || finalize_debt)
+            throw mutation_operation_error(capture_debt ? capture_debt : (delivery_debt ? delivery_debt : finalize_debt), {}, {},
+                capture_debt ? delivery_debt : std::exception_ptr{}, finalize_debt, {}, {},
+                sql.phase_ == database::mutation_sql_scope::phase::committed, tail.committed);
+        if constexpr (!std::is_void_v<result_type>) return std::move(*value);
+    }
+private:
+
     // -- Read-generation pool internals ------------------------------------
 
     struct read_generation {
@@ -3517,7 +4638,8 @@ public:
                 // signals nothing else points at).
                 auto target_it = link_tables_by_rhs_target_.find(table_name);
                 if (target_it != link_tables_by_rhs_target_.end()) {
-                    for (const auto& link_table : target_it->second) {
+                    for (const auto& stored_link_table : target_it->second) {
+                        const auto link_table=detail::core_model_registry_legacy_text_(stored_link_table);
                         if (db_->table_exists(link_table)) {
                             db_->execute(
                                 "DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
@@ -3526,14 +4648,16 @@ public:
                 }
                 // Defensive: link tables registered without a known target
                 // (rare; normally empty after `ensure_link_tables()`).
-                for (const auto& link_table : link_tables_unknown_target_) {
+                for (const auto& stored_link_table : link_tables_unknown_target_) {
+                    const auto link_table=detail::core_model_registry_legacy_text_(stored_link_table);
                     if (db_->table_exists(link_table)) {
                         db_->execute(
                             "DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
                     }
                 }
                 // Virtual link tables — polymorphic rhs, scope by rhs_type.
-                for (const auto& link_table : virtual_link_tables_) {
+                for (const auto& stored_link_table : virtual_link_tables_) {
+                    const auto link_table=detail::core_model_registry_legacy_text_(stored_link_table);
                     if (db_->table_exists(link_table)) {
                         db_->execute(
                             "DELETE FROM " + link_table +
@@ -3543,7 +4667,8 @@ public:
                 }
                 auto list_it = list_tables_by_parent_.find(table_name);
                 if (list_it != list_tables_by_parent_.end()) {
-                    for (const auto& list_table : list_it->second) {
+                    for (const auto& stored_list_table : list_it->second) {
+                        const auto list_table=detail::core_model_registry_legacy_text_(stored_list_table);
                         if (db_->table_exists(list_table)) {
                             db_->execute(
                                 "DELETE FROM " + list_table + " WHERE parent_id = ?",
@@ -3688,7 +4813,8 @@ public:
 
                     auto target_it = link_tables_by_rhs_target_.find(table_name);
                     if (target_it != link_tables_by_rhs_target_.end()) {
-                        for (const auto& link_table : target_it->second) {
+                        for (const auto& stored_link_table : target_it->second) {
+                            const auto link_table=detail::core_model_registry_legacy_text_(stored_link_table);
                             if (db_->table_exists(link_table)) {
                                 db_->execute(
                                     "DELETE FROM " + link_table +
@@ -3696,14 +4822,16 @@ public:
                             }
                         }
                     }
-                    for (const auto& link_table : link_tables_unknown_target_) {
+                    for (const auto& stored_link_table : link_tables_unknown_target_) {
+                        const auto link_table=detail::core_model_registry_legacy_text_(stored_link_table);
                         if (db_->table_exists(link_table)) {
                             db_->execute(
                                 "DELETE FROM " + link_table +
                                 " WHERE rhs IN (" + parent_sub + ")", params);
                         }
                     }
-                    for (const auto& link_table : virtual_link_tables_) {
+                    for (const auto& stored_link_table : virtual_link_tables_) {
+                        const auto link_table=detail::core_model_registry_legacy_text_(stored_link_table);
                         if (db_->table_exists(link_table)) {
                             // `rhs_type = ?` precedes the subquery in the
                             // statement text, so its binding must precede the
@@ -3720,7 +4848,8 @@ public:
                     }
                     auto list_it = list_tables_by_parent_.find(table_name);
                     if (list_it != list_tables_by_parent_.end()) {
-                        for (const auto& list_table : list_it->second) {
+                        for (const auto& stored_list_table : list_it->second) {
+                            const auto list_table=detail::core_model_registry_legacy_text_(stored_list_table);
                             if (db_->table_exists(list_table)) {
                                 db_->execute(
                                     "DELETE FROM " + list_table +
@@ -4891,57 +6020,322 @@ public:
     // cross-connection write transaction (SQLITE_LOCKED in both directions).
     // File and isolated-:memory: stores: the gate calls are no-ops.
     void begin_transaction() {
+        require_catalog_callback_absent();
+        detail::observer_delivery_begin delivery_envelope(*this); // Before Native/store entry.
+        auto writer = db_;
+        database::core_settlement_result cleanup;
+        std::shared_ptr<const database::core_transaction_original> issued;
+        database::sql_entry_scope entry(*writer); // BEFORE store/engine admission
         acquire_store_write_gate();
         try {
-            db_->begin_transaction();
+            writer->begin_transaction_owned_(txn_owner_thread_, &issued);
+            if (!issued || issued->ended.load(std::memory_order_acquire))
+                throw db_error("Core BEGIN did not retain an original transaction");
+            std::atomic_store(&txn_original_, issued);
         } catch (...) {
+            const auto first = std::current_exception();
+            std::exception_ptr ending, delivery;
+            if (issued) {
+                // Preserve live provenance and its original gate even when
+                // later BEGIN preparation/cleanup refuses. Never free a gate
+                // merely because a cleanup attempt returned/raised.
+                std::atomic_store(&txn_original_, issued);
+                try { cleanup = writer->end_transaction_owned_(true, txn_owner_thread_, issued); }
+                catch (...) { ending = std::current_exception(); }
+                if (issued->ended.load(std::memory_order_acquire)) {
+                    release_store_write_gate();
+                    auto expected = issued;
+                    std::atomic_compare_exchange_strong(&txn_original_, &expected,
+                        std::shared_ptr<const database::core_transaction_original>{});
+                }
+            } else release_store_write_gate();
+            entry.release();
+            try { if (cleanup.delivery) cleanup.delivery(); }
+            catch (...) { delivery = std::current_exception(); }
+            if (ending || cleanup.first || cleanup.publication || cleanup.capture || delivery)
+                throw mutation_operation_error(first, ending ? ending : cleanup.first, {}, delivery,
+                    {}, cleanup.capture, cleanup.publication);
+            std::rethrow_exception(first);
+        }
+    }
+private:
+    struct transaction_receipt_fields {
+        const uint64_t creator = detail::database_native_process();
+        lattice_db* const owner;
+        const std::weak_ptr<instance_guard> lifetime;
+        const std::thread::id thread = std::this_thread::get_id();
+        std::shared_ptr<const database::core_thread_lifetime> thread_lifetime;
+        // Allocated with the box BEFORE actual BEGIN. The original receives
+        // this exact cell; non-receipt Core BEGIN keeps its local atomic.
+        const std::shared_ptr<database::core_transaction_ending> ending =
+            std::make_shared<database::core_transaction_ending>();
+        std::weak_ptr<database> writer;
+        std::weak_ptr<const database::core_transaction_original> original;
+        explicit transaction_receipt_fields(lattice_db& actual) : owner(&actual), lifetime(actual.guard_) {}
+    };
+    struct transaction_receipt_box {
+        detail::process_bound_resource_owner<transaction_receipt_fields> fields;
+        explicit transaction_receipt_box(lattice_db& actual) : fields(actual) {}
+    };
+    const transaction_receipt_fields* receipt_fields_(const detail::core_transaction_receipt& receipt) const noexcept {
+        if (!owns_creator_process() || !receipt.valid()) return nullptr;
+        const auto* box = static_cast<const transaction_receipt_box*>(receipt.original_.get());
+        if (!box->fields.in_creator_process()) return nullptr;
+        const auto& fields = box->fields.get();
+        if (fields.creator != detail::database_native_process() || fields.owner != this || !fields.ending ||
+            fields.thread != std::this_thread::get_id() || !fields.thread_lifetime ||
+            !fields.thread_lifetime->alive.load(std::memory_order_acquire)) return nullptr;
+        const auto actual = fields.lifetime.lock(); // instance_guard is DATA, not a Native owner
+        if (!actual || actual.get() != guard_.get() || actual.owner_before(guard_) || guard_.owner_before(actual)) return nullptr;
+        // Known ending is DATA independent of original storage/Native resources.
+        // A false cell plus expired weak provenance never invents an ending.
+        return &fields;
+    }
+    bool transaction_receipt_ended_(const detail::core_transaction_receipt& receipt) const noexcept {
+        const auto* fields = receipt_fields_(receipt);
+        return fields && fields->ending->ended.load(std::memory_order_acquire);
+    }
+    // Metadata-only retirement of exactly this old original. CAS happens before
+    // the thread-affine gate release, and both finish before detached delivery.
+    // An old receipt can never unlock or erase a callback-created successor.
+    bool retire_core_original_(const std::shared_ptr<const database::core_transaction_original>& original) {
+        require_creator_process();
+        if (!original || !original->ended.load(std::memory_order_acquire)) return false;
+        auto expected = original;
+        if (!std::atomic_compare_exchange_strong(&txn_original_, &expected,
+            std::shared_ptr<const database::core_transaction_original>{})) return false;
+        release_store_write_gate();
+        return true;
+    }
+    detail::core_transaction_receipt begin_transaction_receipt_(bool strict_receipt = true) {
+        require_creator_process(); require_catalog_callback_absent();
+        detail::observer_delivery_begin delivery_envelope(*this); // Before receipt/Native/store entry.
+        // Complete fallible receipt/ending custody before actual BEGIN. The
+        // opaque value is not returned/published until the genuine issued
+        // ticket is known live. No allocation is needed to return that value.
+        detail::core_transaction_receipt receipt(std::make_shared<transaction_receipt_box>(*this));
+        auto& receipt_fields = static_cast<const transaction_receipt_box*>(receipt.original_.get())->fields.get();
+        struct begin_fields {
+            std::shared_ptr<database> writer;
+            std::shared_ptr<const database::core_transaction_original> original;
+            database::core_settlement_result tail;
+            std::exception_ptr first, ending, delivery;
+            bool acquired_gate = false, active_admission = false, prepared_gate_slot = false;
+            bool prepare_native_target_destruction(pid_t creator) noexcept {
+                if (creator != ::getpid()) return false;
+                tail.delivery = {}; if (creator != ::getpid()) return false;
+                first = {}; if (creator != ::getpid()) return false;
+                ending = {}; if (creator != ::getpid()) return false;
+                delivery = {}; if (creator != ::getpid()) return false;
+                tail.first = {}; if (creator != ::getpid()) return false;
+                tail.publication = {}; if (creator != ::getpid()) return false;
+                tail.capture = {}; if (creator != ::getpid()) return false;
+                original.reset(); if (creator != ::getpid()) return false;
+                writer.reset(); return creator == ::getpid();
+            }
+        };
+        // All temporary strong Native pins/tails stay on PID-fenced heap
+        // custody through real BEGIN, cleanup and arbitrary detached callbacks.
+        detail::process_bound_resource_owner<begin_fields> held;
+        auto& fields = held.get();
+        struct admission_ending {
+            lattice_db& owner; begin_fields& fields;
+            void release() noexcept {
+                if (!owner.owns_creator_process()) return;
+                if (fields.active_admission) {
+                    owner.active_mutation_operations_.fetch_sub(1, std::memory_order_release);
+                    fields.active_admission = false;
+                }
+                if (fields.prepared_gate_slot && !fields.acquired_gate) {
+                    auto& depths = owner.tls_store_gate_depths();
+                    const auto found = depths.find(&owner);
+                    if (found != depths.end() && found->second == 0) depths.erase(found);
+                    fields.prepared_gate_slot = false;
+                }
+            }
+            ~admission_ending() noexcept { release(); }
+        } admission{*this, fields};
+        {
+            std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+            if (closed_.load(std::memory_order_acquire) || !db_)
+                throw db_error("Core BEGIN requires its live retained writer");
+            if (active_mutation_operations_.load(std::memory_order_relaxed) == std::numeric_limits<size_t>::max())
+                throw db_error("Core receipt admission custody exhausted");
+            fields.writer = db_;
+            active_mutation_operations_.fetch_add(1, std::memory_order_acq_rel); fields.active_admission = true;
+        }
+        if (strict_receipt && fields.writer->raw_handle_escaped_.load(std::memory_order_acquire))
+            throw db_error("Core receipt cannot admit an escaped raw Native handle");
+        const auto check_pending_begin = [&] {
+            require_creator_process();
+            if (closed_.load(std::memory_order_acquire)) throw db_error("Core BEGIN owner closed before admission");
+        };
+        check_pending_begin();
+        database::sql_entry_scope entry(*fields.writer);
+        if (store_write_gate_) {
+            auto& depths = tls_store_gate_depths();
+            const auto [found, inserted] = depths.try_emplace(this, 0); // PRE lock allocation
+            fields.prepared_gate_slot = inserted;
+            if (found->second == std::numeric_limits<int>::max()) throw db_error("Core receipt gate depth exhausted");
+            while (!store_write_gate_->try_lock_for(std::chrono::milliseconds(1))) check_pending_begin();
+            ++found->second; fields.acquired_gate = true;
+        }
+        try {
+            fields.writer->begin_transaction_owned_(txn_owner_thread_, &fields.original, strict_receipt, receipt_fields.ending);
+            require_creator_process();
+            if (!fields.original || fields.original->ending != receipt_fields.ending || fields.original->ended.load(std::memory_order_acquire))
+                throw db_error("Core BEGIN did not retain an original transaction");
+            std::atomic_store(&txn_original_, fields.original);
+            receipt_fields.writer = fields.writer;
+            receipt_fields.original = fields.original;
+            receipt_fields.thread_lifetime = fields.original->lifetime;
+            receipt.issued_ = true; // actual successful BEGIN, before exported error delivery
+            admission.release();
+            return receipt;
+        } catch (...) {
+            if (!owns_creator_process()) { entry.release(); throw; }
+            fields.first = std::current_exception();
+            if (fields.original) {
+                std::atomic_store(&txn_original_, fields.original);
+                try { fields.writer->end_transaction_owned_into_(true, txn_owner_thread_, fields.original, fields.tail, strict_receipt); }
+                catch (...) { fields.ending = std::current_exception(); }
+                (void)retire_core_original_(fields.original);
+            } else if (fields.acquired_gate) release_store_write_gate();
+            entry.release(); admission.release();
+            try { if (fields.tail.delivery) fields.tail.delivery(); }
+            catch (...) { if (!owns_creator_process()) throw; fields.delivery = std::current_exception(); }
+            require_creator_process();
+            if (fields.ending || fields.tail.first || fields.tail.publication || fields.tail.capture || fields.delivery)
+                throw mutation_operation_error(fields.first, fields.ending ? fields.ending : fields.tail.first, {}, fields.delivery,
+                    {}, fields.tail.capture, fields.tail.publication);
+            std::rethrow_exception(fields.first);
+        }
+    }
+    void settle_core_transaction_(bool rollback, const detail::core_transaction_receipt& receipt) {
+        require_creator_process(); require_catalog_callback_absent();
+        const auto* original_fields = receipt_fields_(receipt);
+        if (!original_fields) throw db_error("Core settlement requires its actual BEGIN receipt");
+        // Cleanup of an ended expected original is a no-SQL no-op. A new
+        // COMMIT request cannot claim success for an already-ended original.
+        if (original_fields->ending->ended.load(std::memory_order_acquire)) {
+            if (!rollback) throw db_error("Core COMMIT receipt original already ended");
+            return;
+        }
+        struct settlement_fields {
+            std::shared_ptr<database> writer;
+            std::shared_ptr<const database::core_transaction_original> original;
+            database::core_settlement_result result;
+            std::exception_ptr first, delivery;
+            bool prepare_native_target_destruction(pid_t creator) noexcept {
+                if (creator != ::getpid()) return false;
+                result.delivery = {}; if (creator != ::getpid()) return false;
+                first = {}; if (creator != ::getpid()) return false;
+                delivery = {}; if (creator != ::getpid()) return false;
+                result.first = {}; if (creator != ::getpid()) return false;
+                result.publication = {}; if (creator != ::getpid()) return false;
+                result.capture = {}; if (creator != ::getpid()) return false;
+                original.reset(); if (creator != ::getpid()) return false;
+                writer.reset(); return creator == ::getpid();
+            }
+        };
+        detail::process_bound_resource_owner<settlement_fields> held;
+        auto& state = held.get();
+        state.writer = original_fields->writer.lock();
+        state.original = original_fields->original.lock();
+        if (!state.writer || !state.original || state.original->ending != original_fields->ending ||
+            state.original->creator != original_fields->creator || state.original->thread != original_fields->thread ||
+            state.original->lifetime != original_fields->thread_lifetime || !state.original->same_native_for(*state.writer))
+            throw db_error("Core receipt original resources are unavailable without a known ending");
+        if (state.original->ended.load(std::memory_order_acquire)) {
+            if (!rollback) throw db_error("Core COMMIT receipt original already ended");
+            return;
+        }
+        if (std::atomic_load(&txn_original_) != state.original)
+            throw db_error("Core receipt is not the current originating transaction");
+        try {
+            state.writer->end_transaction_owned_into_(rollback, txn_owner_thread_, state.original, state.result, true);
+        } catch (...) {
+            if (!owns_creator_process()) throw;
+            (void)retire_core_original_(state.original);
+            throw;
+        }
+        require_creator_process();
+        if (state.result.ended) (void)retire_core_original_(state.original);
+        try { if (state.result.delivery) state.result.delivery(); }
+        catch (...) { if (!owns_creator_process()) throw; state.delivery = std::current_exception(); }
+        require_creator_process();
+        state.first = state.result.first ? state.result.first : (state.result.publication ? state.result.publication : state.result.capture);
+        if (state.first) {
+            const bool secondary = state.delivery || (state.result.first && (state.result.publication || state.result.capture)) ||
+                (state.result.publication && state.result.capture);
+            if (secondary) throw mutation_operation_error(state.first, {}, {}, state.delivery, {},
+                state.first == state.result.capture ? std::exception_ptr{} : state.result.capture,
+                state.first == state.result.publication ? std::exception_ptr{} : state.result.publication,
+                state.result.ended, state.result.committed);
+            std::rethrow_exception(state.first);
+        }
+        if (state.delivery) std::rethrow_exception(state.delivery);
+    }
+    void commit_transaction_receipt_(const detail::core_transaction_receipt& receipt) { settle_core_transaction_(false, receipt); }
+    void rollback_transaction_receipt_(const detail::core_transaction_receipt& receipt) { settle_core_transaction_(true, receipt); }
+
+private:
+    void settle_core_transaction_(bool rollback) {
+        require_catalog_callback_absent();
+        auto writer = db_;
+        auto original = std::atomic_load(&txn_original_);
+        if (!writer || !original) throw db_error("Core settlement has no originating transaction");
+        database::core_settlement_result result;
+        try { result = writer->end_transaction_owned_(rollback, txn_owner_thread_, original); }
+        catch (...) {
+            if (original->ended.load(std::memory_order_acquire)) {
+                release_store_write_gate();
+                auto expected = original;
+                std::atomic_compare_exchange_strong(&txn_original_, &expected,
+                    std::shared_ptr<const database::core_transaction_original>{});
+            }
+            throw;
+        }
+        if (result.ended) {
             release_store_write_gate();
-            throw;
+            auto expected = original;
+            std::atomic_compare_exchange_strong(&txn_original_, &expected,
+                std::shared_ptr<const database::core_transaction_original>{});
         }
-        // Record the owning thread: read_db()'s in-transaction routing must
-        // apply ONLY to this thread — other threads' reads keep reader
-        // isolation and never observe the open transaction.
-        txn_owner_thread_.store(std::this_thread::get_id(), std::memory_order_release);
-    }
-    void commit() {
-        try {
-            db_->commit();
-        } catch (...) {
-            // COMMIT can fail with the transaction still open (BUSY) — keep
-            // the gate; the caller retries or rolls back. If the txn is
-            // already gone (auto-rollback), release now.
-            if (!db_->is_in_transaction()) {
-                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
-                release_store_write_gate();
-            }
-            throw;
+        // All Native/store/entry leaves ended. Captured delivery and its final
+        // destruction cannot run beneath those leaves or settle a successor.
+        std::exception_ptr delivery;
+        try { if (result.delivery) result.delivery(); } catch (...) { delivery = std::current_exception(); }
+        const auto first = result.first ? result.first : (result.publication ? result.publication : result.capture);
+        if (first) {
+            const bool secondary = delivery || (result.first && (result.publication || result.capture)) ||
+                (result.publication && result.capture);
+            if (secondary) throw mutation_operation_error(first, {}, {}, delivery, {},
+                first == result.capture ? std::exception_ptr{} : result.capture,
+                first == result.publication ? std::exception_ptr{} : result.publication);
+            std::rethrow_exception(first);
         }
-        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
-        release_store_write_gate();
+        if (delivery) std::rethrow_exception(delivery);
     }
-    void rollback() {
-        try {
-            db_->rollback();
-        } catch (...) {
-            if (!db_->is_in_transaction()) {
-                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
-                release_store_write_gate();
-            }
-            throw;
-        }
-        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
-        release_store_write_gate();
-    }
+public:
+    void commit() { settle_core_transaction_(false); }
+    void rollback() { settle_core_transaction_(true); }
 
     template<typename F>
     void write(F&& block) {
         begin_transaction();
+        const auto original = std::atomic_load(&txn_original_);
         try {
             block();
             commit();
         } catch (...) {
-            rollback();
-            throw;
+            const auto first = std::current_exception();
+            std::exception_ptr cleanup;
+            if (std::atomic_load(&txn_original_) == original) {
+                try { rollback(); } catch (...) { cleanup = std::current_exception(); }
+            }
+            if (cleanup) throw mutation_operation_error(first, cleanup, {});
+            std::rethrow_exception(first);
         }
     }
 
@@ -4978,7 +6372,7 @@ public:
     /// Legacy raw connection access. The caller must keep this lattice alive
     /// and serialize the reference against close/reopen/maintenance. These raw
     /// signatures remain source-compatible; they are not owned reader leases.
-    database& db() { detail::ordinary_require_creator(config_.ordinary_context);return *db_; }
+    database& db() { detail::ordinary_require_creator(config_.ordinary_context);require_catalog_callback_absent();return *db_; }
     database& read_db() { detail::ordinary_require_creator(config_.ordinary_context);return *borrow_read_connection(); }
     database& xproc_read_db() { detail::ordinary_require_creator(config_.ordinary_context);return *borrow_xproc_read_connection(); }
 
@@ -4991,6 +6385,8 @@ public:
     /// promise an exclusive checkpoint/VACUUM gap or erase SQLite busy results.
     /// Only the explicit-transaction owning thread reads through the writer;
     /// xproc prefers its dedicated connection even on that thread.
+    // Denial-only callback guard; it does not create a read/write origin.
+    void require_catalog_callback_absent() const;
     std::shared_ptr<database> borrow_read_connection();
     std::shared_ptr<database> borrow_xproc_read_connection();
     std::vector<database::row_t> query_read(
@@ -5036,26 +6432,35 @@ public:
         // Record by rhs target if known, otherwise into the defensive bucket.
         // Both buckets accept idempotent re-insert (set semantics).
         if (!rhs_target_table.empty()) {
-            link_tables_by_rhs_target_[rhs_target_table].insert(link_table_name);
+            auto target=link_tables_by_rhs_target_.find(rhs_target_table);
+            if(target==link_tables_by_rhs_target_.end())
+                target=link_tables_by_rhs_target_.emplace(detail::core_model_registry_text_from_(rhs_target_table),detail::core_model_registry_set{}).first;
+            if(target->second.find(link_table_name)==target->second.end())
+                target->second.insert(detail::core_model_registry_text_from_(link_table_name));
             // Drop any stale "unknown target" entry from a prior bare call.
-            link_tables_unknown_target_.erase(link_table_name);
-        } else if (!is_known_link_table(link_table_name)) {
-            link_tables_unknown_target_.insert(link_table_name);
+            if(const auto prior=link_tables_unknown_target_.find(link_table_name);prior!=link_tables_unknown_target_.end())
+                link_tables_unknown_target_.erase(prior);
+        } else if (!is_known_link_table(link_table_name)&&link_tables_unknown_target_.find(link_table_name)==link_tables_unknown_target_.end()) {
+            link_tables_unknown_target_.insert(detail::core_model_registry_text_from_(link_table_name));
         }
     }
 
     void note_virtual_link_table(const std::string& link_table_name) {
-        virtual_link_tables_.insert(link_table_name);
+        if(virtual_link_tables_.find(link_table_name)==virtual_link_tables_.end())
+            virtual_link_tables_.insert(detail::core_model_registry_text_from_(link_table_name));
     }
 
     void note_geo_list_table(const std::string& model_table,
                              const std::string& list_table) {
         // Cascade walker side index: parent-row deletes need to clean these
         // by `parent_id = ?` (no `rhs` column on geo_bounds list tables).
-        auto& parent_lists = list_tables_by_parent_[model_table];
+        auto parent=list_tables_by_parent_.find(model_table);
+        if(parent==list_tables_by_parent_.end())
+            parent=list_tables_by_parent_.emplace(detail::core_model_registry_text_from_(model_table),detail::core_model_registry_list{}).first;
+        auto& parent_lists = parent->second;
         if (std::find(parent_lists.begin(), parent_lists.end(), list_table) ==
             parent_lists.end()) {
-            parent_lists.push_back(list_table);
+            parent_lists.push_back(detail::core_model_registry_text_from_(list_table));
         }
     }
 
@@ -5241,9 +6646,11 @@ private:
     std::recursive_timed_mutex& vec0_memory_maintenance_gate_ = process_resources_.get().vec0_memory_maintenance_gate_;
 
     struct vec0_sqlite_hold {
+        detail::store_physical_native_scope physical_call;
         sqlite3_mutex* mutex;
-        explicit vec0_sqlite_hold(sqlite3* connection)
-            : mutex(sqlite3_db_mutex(connection)) {
+        explicit vec0_sqlite_hold(database& owner)
+            : physical_call(owner),mutex(physical_call.entered()?sqlite3_db_mutex(owner.internal_handle()):nullptr) {
+            if(!physical_call.entered())throw db_error("resource Native caller original unavailable");
             if (!mutex) throw db_error("vec0 maintenance requires a SQLite mutex");
             sqlite3_mutex_enter(mutex);
         }
@@ -5256,7 +6663,13 @@ private:
     std::invoke_result_t<F> with_vec0_serialization(const char* operation,
                                                    bool allow_internal_nesting,
                                                    F&& body, database* captured_writer = nullptr) {
-        auto* connection = (captured_writer ? captured_writer : db_.get())->internal_handle();
+        auto* writer = captured_writer ? captured_writer : db_.get();
+        // Offer the turn before any store/SQLite hold. Nested wrapper calls
+        // inside the actual vec0 body must not wait while owning those locks.
+        database::sql_entry_scope entry(*writer);
+        detail::store_physical_native_scope physical_call(*writer);
+        if(!physical_call.entered())throw db_error("resource Native caller original unavailable");
+        auto* connection = writer->internal_handle();
         if (!allow_internal_nesting) {
             for (auto* active = active_vec0_maintenance_; active; active = active->previous) {
                 if (active->connection == connection) {
@@ -5285,7 +6698,7 @@ private:
         }
         // File WAL callbacks already run on SQLite's writer thread. Holding
         // this same recursive mutex creates no maintenance->SQLite inversion.
-        vec0_sqlite_hold hold(connection);
+        vec0_sqlite_hold hold(*writer);
         return run();
     }
 
@@ -6195,7 +7608,8 @@ protected:
     void configured_sync_progress(synchronizer::on_progress_handler);
     synchronizer::sync_progress configured_sync_progress() const;
     lattice_close_result configured_sync_close(std::chrono::steady_clock::time_point) noexcept;
-    const detail::recovery_owner_schema& recovery_schemas_ = process_resources_.get().recovery_schemas_;
+    const std::shared_ptr<const detail::recovery_owner_schema>& recovery_schemas_owner_ = process_resources_.get().recovery_schemas_owner_;
+    const detail::recovery_owner_schema& recovery_schemas_ = *recovery_schemas_owner_;
     bool& recovery_producer_bootstrapped_ = process_resources_.get().recovery_producer_bootstrapped_;
     bool& administrative_owner_ = process_resources_.get().administrative_owner_;
     bool& checked_existing_unpublished_ = process_resources_.get().checked_existing_unpublished_;
@@ -6214,6 +7628,7 @@ protected:
     // Covers admitted SQL and its deferred tail. Writer maintenance refuses
     // publication while nonzero; it never waits for callbacks under a mutex.
     std::atomic<size_t>& active_managed_attachment_operations_ = process_resources_.get().active_managed_attachment_operations_;
+    std::atomic<size_t>& active_mutation_operations_ = process_resources_.get().active_mutation_operations_;
     void publish_managed_attachment(const std::string& alias, const std::string& path,
                                     int64_t token, const std::shared_ptr<database>& writer);
     std::shared_ptr<const managed_attachment_view> managed_view_for_writer(
@@ -6231,6 +7646,7 @@ protected:
     /// cannot invoke database/function destructors under that lock.
     std::vector<std::shared_ptr<database>> view_handles();
     void restore_attached_views(database& connection);
+    void bind_observer_delivery_read_(database&);
     void rebuild_attached_views(const std::vector<std::shared_ptr<database>>& handles,
                                 database::attachment_operation&);
     // Preserve the existing protected caller/test entry; it creates one budget.
@@ -6274,6 +7690,7 @@ private:
     template<typename U> friend class results;
     friend class projection_service;
     friend struct projection_operation_state;
+    friend struct owned_catalog_state;
     friend struct projection_pressure_test_access;
     friend class synchronizer_base;
     friend class synchronizer;
@@ -6316,11 +7733,14 @@ private:
     // destruction. attach -> publication is the only nested lock direction.
     std::mutex& connection_ownership_mutex_ = process_resources_.get().connection_ownership_mutex_;
     uint64_t& connection_revision_ = process_resources_.get().connection_revision_;
+    std::shared_ptr<detail::observer_delivery_startup>& delivery_startup_ = process_resources_.get().delivery_startup_;
+    bool& delivery_facilities_published_ = process_resources_.get().delivery_facilities_published_;
     std::shared_ptr<database>& db_ = process_resources_.get().db_;       // Write connection / fallback owner
     std::shared_ptr<database>& read_db_ = process_resources_.get().read_db_;
     std::shared_ptr<detail::recovery_refresh_state>& recovery_refresh_ = process_resources_.get().recovery_refresh_;
     void recovery_subscriptions_changed();
     // Thread that opened the current explicit transaction (see read_db()).
+    std::shared_ptr<const database::core_transaction_original>& txn_original_ = process_resources_.get().txn_original_;
     std::atomic<std::thread::id>& txn_owner_thread_ = process_resources_.get().txn_owner_thread_;  // Read-only connection for concurrent reads
     std::shared_ptr<database>& xproc_read_db_ = process_resources_.get().xproc_read_db_;  // Dedicated read connection for xproc handler
                                                // (avoids SQLite lock contention with read_db_
@@ -6366,6 +7786,8 @@ private:
     int& sync_lock_fd_ = process_resources_.get().sync_lock_fd_;
 
     struct recovery_commit_batch {
+        // Immutable row/field DATA may outlive its physical writer.
+        std::shared_ptr<const detail::observer_delivery_original> delivery_credit;
         std::vector<change_event> events;
         std::vector<size_t> typed_event_indices;
         std::vector<invalidation_table_change> invalidations;
@@ -6379,6 +7801,7 @@ private:
     // Only off-lock topology delivery holds this depth. Callback writes keep
     // their existing bounded outer drain instead of recursively delivering.
     size_t& topology_delivery_depth_ = process_resources_.get().topology_delivery_depth_; // guarded by change_buffer_mutex_
+    size_t& mutation_delivery_depth_ = process_resources_.get().mutation_delivery_depth_; // same leaf
     // Physical-writer publication also refuses same-thread recursive SQLite
     // callbacks during an admitted private install; whole-owner close may fence
     // new admission without replacing the retained writer.
@@ -6386,7 +7809,10 @@ private:
 
     // Change buffering - accumulates changes until WAL hook fires
     std::mutex& change_buffer_mutex_ = process_resources_.get().change_buffer_mutex_;
+    std::shared_ptr<const detail::observer_delivery_connection>& observer_delivery_connection_ = process_resources_.get().observer_delivery_connection_;
+    std::shared_ptr<const detail::observer_delivery_original>& change_buffer_delivery_credit_ = process_resources_.get().change_buffer_delivery_credit_;
     std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>>& change_buffer_ = process_resources_.get().change_buffer_;  // (table, op, rowId, globalId, mainSchema)
+    uint64_t& change_buffer_custody_epoch_ = process_resources_.get().change_buffer_custody_epoch_; // same leaf
     bool& is_flushing_ = process_resources_.get().is_flushing_;
 
 public:
@@ -6488,19 +7914,19 @@ private:
     // only needs to clean junction rows whose `rhs` references T, so the
     // walker iterates `link_tables_by_rhs_target_[T]` — typically a small
     // set, often empty for leaf types like LatticeHistoricalSignal.
-    std::unordered_map<std::string, std::unordered_set<std::string>>& link_tables_by_rhs_target_ = process_resources_.get().link_tables_by_rhs_target_;
+    detail::core_model_registry_map<detail::core_model_registry_set>& link_tables_by_rhs_target_ = process_resources_.get().link_tables_by_rhs_target_;
     // Defensive bucket for regular link tables registered without a known
     // target (e.g. the idempotent `ensure_link_table(name)` re-call from
     // `managed<T*>::set_link`). After `ensure_link_tables()` has run during
     // init, every link table is also recorded under its rhs target, so this
     // set is normally empty — but the walker still iterates it for safety.
-    std::unordered_set<std::string>& link_tables_unknown_target_ = process_resources_.get().link_tables_unknown_target_;
+    detail::core_model_registry_set& link_tables_unknown_target_ = process_resources_.get().link_tables_unknown_target_;
     // Virtual link tables — rhs is polymorphic, but `rhs_type` scopes per
     // row, so the walker can issue `WHERE rhs = ? AND rhs_type = ?` to
     // target precisely without per-target indexing.
-    std::unordered_set<std::string>& virtual_link_tables_ = process_resources_.get().virtual_link_tables_;
+    detail::core_model_registry_set& virtual_link_tables_ = process_resources_.get().virtual_link_tables_;
     // parent_table -> list tables to clean via `parent_id = ?`.
-    std::unordered_map<std::string, std::vector<std::string>>& list_tables_by_parent_ = process_resources_.get().list_tables_by_parent_;
+    detail::core_model_registry_map<detail::core_model_registry_list>& list_tables_by_parent_ = process_resources_.get().list_tables_by_parent_;
 
     // True if `link_table_name` is already recorded under a known rhs target.
     // Used so a later bare `ensure_link_table(name)` call doesn't pollute the
@@ -6521,6 +7947,7 @@ private:
         // Per-connection SQL function registration — required on BOTH paths
         // (triggers call sync_disabled() at execution time on this connection).
         register_sql_functions();
+        if(initialize_current_model_catalog_if_pending_())return;
         // Enrolled programs must be validated before any ordinary migration can
         // replace them. Bootstrap returns bounded untrusted facts; exact schema,
         // SQL and this constructor's physical hook publication admit the writer.
@@ -6548,13 +7975,21 @@ private:
         // "database is locked", and so the marker commits atomically with the
         // DDL it describes. Note: config_.migration_block runs inside this
         // transaction — it must not manage its own transactions.
-        transaction txn(*db_, /*exclusive=*/false);
+        std::optional<transaction> legacy_transaction;
+        std::optional<database::initialization_transaction> startup_transaction;
+        if(schema_initializing_(*db_))
+            startup_transaction.emplace(begin_schema_initialization_(*db_,schema_startup_transaction::immediate));
+        else legacy_transaction.emplace(*db_, /*exclusive=*/false);
+        const auto commit_schema=[&]{
+            if(startup_transaction)startup_transaction->commit();
+            else legacy_transaction->commit();
+        };
 
         // Double-checked: another process may have completed this exact pass
         // between our probe above and acquiring the write lock.
         if (fingerprint_marker_valid_in_txn(fp_key)) {
             note_tables_for_all_schemas();
-            txn.commit();
+            commit_schema();
             LOG_DEBUG("lattice_db", "ensure_tables: fast path after lock (sibling completed)");
             return;
         }
@@ -6562,8 +7997,16 @@ private:
         // A missing guard family in an already populated schema is an upgrade,
         // not proof that prior receive history was complete. Capture this under
         // the owned bootstrap transaction before creating any internal table.
-        const bool receive_legacy_origin = !db_->query(
-            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").empty();
+        const bool receive_legacy_origin = [&] {
+            if(schema_initializing_(*db_)) {
+                auto* open=db_->delivery_startup_.get();
+                if(!open)throw db_error("receive discovery lacks its actual pending open");
+                using sql=detail::observer_delivery_initialization_sql;
+                auto issued=sql::fixed_(*open,*db_,sql::recipe::receive_prior_table_presence);
+                return !db_->query_initialization_(issued).empty();
+            }
+            return !db_->query("SELECT 1 FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").empty();
+        }();
         detail::initialize_receive_guard_schema(*db_, receive_legacy_origin);
 
         // First create sync control table
@@ -6580,8 +8023,8 @@ private:
         std::vector<const model_schema*> new_tables;
         std::vector<const model_schema*> existing_tables;
 
-        for (const auto* schema : schema_registry::instance().all_schemas()) {
-            if (!db_->table_exists(schema->table_name)) {
+        for (const auto* schema : schema_declarations_()) {
+            if (!schema_table_exists_(schema->table_name)) {
                 new_tables.push_back(schema);
             } else {
                 existing_tables.push_back(schema);
@@ -6618,7 +8061,7 @@ private:
         // naming mirrors the bridge's Phase 8 — see the method comment).
         // Runs for new AND existing tables so an is_unique added to an
         // existing schema gains its index on the next slow-path open.
-        for (const auto* schema : schema_registry::instance().all_schemas()) {
+        for (const auto* schema : schema_declarations_()) {
             ensure_unique_property_indexes(*schema);
             // Metadata-only admission for registered existing vector sidecars.
             // No inference, backfill, or creation from an empty model column.
@@ -6628,7 +8071,7 @@ private:
         }
 
         store_fingerprint_marker(fp_key);
-        txn.commit();
+        commit_schema();
         ordinary_schema_initialized_here_=!receive_legacy_origin;
     }
 
@@ -6639,7 +8082,7 @@ private:
         changes.table_name = schema.table_name;
 
         // Get existing columns from database
-        auto existing = db_->get_table_info(schema.table_name);
+        auto existing = schema_table_info_(schema.table_name);
 
         // Build expected columns map
         std::unordered_map<std::string, std::string> model_cols;
@@ -6693,7 +8136,7 @@ private:
 
     void create_model_table(const model_schema& schema) {
         std::vector<std::pair<std::string,column_type>> columns;
-        db_->execute(detail::ordinary_schema_recipe::model_table(schema,columns));
+        execute_model_schema_(detail::ordinary_schema_recipe::model_table(schema,columns));
 
         // Create audit triggers for sync/observation — with the schema's
         // no_history set, and the marker ensure_audit_triggers compares on
@@ -6706,7 +8149,8 @@ private:
         }
         create_model_table_triggers(schema.table_name, columns, no_history);
         ensure_lattice_meta_table();
-        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+        if(schema_initializing_(*db_))store_model_metadata_("trigger_flags:"+schema.table_name,no_history_marker(schema));
+        else db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
                      {"trigger_flags:" + schema.table_name, no_history_marker(schema)});
 
         // Create R*Tree tables for geo_bounds properties
@@ -6768,7 +8212,9 @@ public:
             }
             const std::string sql =
                 detail::ordinary_schema_recipe::core_unique_index(schema.table_name,i,prop.name);
-            try {
+            if(schema_initializing_(*db_)) {
+                execute_model_schema_(sql);
+            }else try {
                 db_->execute(sql);
             } catch (...) {
                 // Duplicate data exists — deduplicate (keep newest row per value).
@@ -6786,9 +8232,15 @@ public:
 private:
 
     void migrate_model_table(const model_schema& schema) {
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("current model no-op lacks its actual pending Open");
+            open->require_current_model_(*this,*db_,schema);
+            return;
+        }
         LOG_INFO("migrate", "migrate_model_table: %s", schema.table_name.c_str());
         // Get existing columns from database
-        auto existing = db_->get_table_info(schema.table_name);
+        auto existing = schema_table_info_(schema.table_name);
         LOG_INFO("migrate", "  existing columns: %zu", existing.size());
         for (const auto& [col, type] : existing) {
             LOG_DEBUG("migrate", "    existing: %s (%s)", col.c_str(), type.c_str());
@@ -6936,6 +8388,11 @@ private:
     }
 
     void ensure_audit_triggers(const model_schema& schema) {
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("current audit no-op lacks its actual pending Open");
+            open->require_current_model_(*this,*db_,schema);
+        }else {
         // Presence + INTEGRITY check. A real audit trigger always gates on
         // sync_disabled(); if the insert trigger is missing OR its body lacks
         // that gate — e.g. a hand-installed `WHEN (0)` stub squatting the
@@ -6975,6 +8432,7 @@ private:
         if (!healthy) {
             recreate_model_table_triggers(schema);
         }
+            }
     }
 
     void recreate_model_table_triggers(const model_schema& schema) {
@@ -7192,7 +8650,7 @@ private:
         // Eagerly create junction tables for all registered schemas.
         // Without this, link tables only exist after a local write — breaking
         // receive() on relay/downstream nodes that never write locally.
-        for (const auto* schema : schema_registry::instance().all_schemas()) {
+        for (const auto* schema : schema_declarations_()) {
             for (const auto& prop : schema->properties) {
                 if (prop.kind == property_kind::virtual_list ||
                     prop.kind == property_kind::virtual_link) {
@@ -7218,7 +8676,7 @@ private:
     /// ensure_link_tables() / ensure_geo_bounds_list_table(), but issues no
     /// SQL writes — the tables provably exist when the fingerprint matches.
     void note_tables_for_all_schemas() {
-        for (const auto* schema : schema_registry::instance().all_schemas()) {
+        for (const auto* schema : schema_declarations_()) {
             for (const auto& prop : schema->properties) {
                 if (prop.kind == property_kind::virtual_list ||
                     prop.kind == property_kind::virtual_link) {
@@ -7238,6 +8696,17 @@ private:
     }
 
     void ensure_audit_log_table() {
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("AuditLog setup lacks its actual pending open");
+            using operation=detail::observer_delivery_open_startup::audit_operation;
+            // The exact current CREATE already has synthesized. A strict
+            // current pre/postimage replaces duplicate-ALTER exception flow.
+            // Historical pre-synthesized migration remains unimplemented and refused.
+            open->initialize_audit_(*db_,operation::table);
+            open->initialize_audit_(*db_,operation::pending_index);
+            open->initialize_audit_(*db_,operation::lookup_index);
+        }else {
         // Create AuditLog table matching Lattice.swift's schema
         std::string sql = detail::ordinary_schema_recipe::audit_table();
         db_->execute(sql);
@@ -7262,12 +8731,24 @@ private:
         // the kLatticeSchemaFormatEpoch bump (fingerprint slow path re-runs
         // this guarded DDL).
         db_->execute(detail::ordinary_schema_recipe::audit_lookup_index());
+        }
     }
 
     void ensure_sync_control_table() {
         // Create _SyncControl table for temporarily disabling sync
-        db_->execute(detail::ordinary_schema_recipe::sync_control_table());
-        db_->execute(detail::ordinary_schema_recipe::sync_control_initial());
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("sync-control setup lacks its actual pending open");
+            auto create=open->sync_control_table_recipe_(*db_);
+            db_->execute_initialization_(create);
+            // Recapture strict current proof after actual CREATE invalidation;
+            // the original seed must preserve an existing disabled=1 row.
+            auto seed=open->sync_control_initial_recipe_(*db_);
+            db_->execute_initialization_(seed);
+        }else {
+            db_->execute(detail::ordinary_schema_recipe::sync_control_table());
+            db_->execute(detail::ordinary_schema_recipe::sync_control_initial());
+        }
 
         // Create _lattice_sync_set table for tracking filtered sync membership,
         // scoped PER SYNCHRONIZER (sync_id). Two channels with different
@@ -7276,6 +8757,16 @@ private:
         // set and synthesized real DELETEs for them (`!matches && in_set`),
         // and reconcile Phase 1 emitted filter-removal DELETEs for the other
         // channel's rows — cross-channel mirror wipes.
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("static sync setup lacks its actual pending open");
+            using operation=detail::observer_delivery_open_startup::static_sync_operation;
+            open->initialize_static_sync_(*db_,operation::set_table);
+            open->initialize_static_sync_(*db_,operation::state_table);
+            open->initialize_static_sync_(*db_,operation::state_pending_index);
+            open->initialize_static_sync_(*db_,operation::slots_table);
+            open->initialize_static_sync_(*db_,operation::upload_floor);
+        }else {
         db_->execute(detail::ordinary_schema_recipe::sync_set());
 
         // Create _lattice_sync_state table for per-synchronizer sync tracking.
@@ -7306,11 +8797,19 @@ private:
             // Column already exists.
         }
 
+        }
+
         // Runs AFTER the slots table exists — the rebuild's attribution rule
         // reads it. Reaching this on existing DBs requires the
         // kLatticeSchemaFormatEpoch bump (same contract as the ALTER above).
         migrate_sync_set_to_per_sync_id();
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("current cursor observation lacks its actual pending open");
+            open->require_current_static_sync_(*db_,detail::observer_delivery_open_startup::static_sync_observation::cursor);
+        }else {
         ensure_cursor_column(*db_);
+        }
     }
 
     /// One-time rebuild of _lattice_sync_set from the pre-per-sync_id shape
@@ -7326,6 +8825,14 @@ private:
     /// wrong (bandwidth-only cost, surfaced by the Phase-2 synthesis-count
     /// soak metric).
     void migrate_sync_set_to_per_sync_id() {
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("current per-sync set observation lacks its actual pending open");
+            // Strict current proof closes the genuine no-op only. The older
+            // two-column rebuild remains unsupported and cannot gain SQL here.
+            open->require_current_static_sync_(*db_,detail::observer_delivery_open_startup::static_sync_observation::per_sync_set);
+            return;
+        }
         auto cols = db_->query("PRAGMA table_info(_lattice_sync_set)");
         if (cols.empty()) return;  // no table (fresh DB creates the new shape above)
         for (const auto& c : cols) {
@@ -7381,8 +8888,14 @@ private:
     /// fast path (triggers reference sync_disabled() at execution time).
     void register_sql_functions() { register_sql_functions(*db_); }
     void register_sql_functions(database& connection) {
+        if(connection.delivery_startup_) {
+            connection.register_initialization_sync_disabled_();
+            return;
+        }
+        detail::store_physical_native_scope physical_call(connection);
+        if(!physical_call.entered())throw db_error("SQL registration Native original unavailable");
         // sync_disabled() lets triggers check if sync is disabled
-        sqlite3_create_function(
+        ::lattice::detail::store_physical_create_function(
             connection.internal_handle(),
             "sync_disabled",
             0,  // No arguments
@@ -7393,11 +8906,11 @@ private:
                 sqlite3_stmt* stmt = nullptr;
                 int disabled = 0;
 
-                if (sqlite3_prepare_v2(db, "SELECT disabled FROM _SyncControl WHERE id=1", -1, &stmt, nullptr) == SQLITE_OK) {
-                    if (sqlite3_step(stmt) == SQLITE_ROW) {
+                if (::lattice::detail::store_physical_prepare_v2(db, "SELECT disabled FROM _SyncControl WHERE id=1", -1, &stmt, nullptr) == SQLITE_OK) {
+                    if (::lattice::detail::store_physical_step(stmt) == SQLITE_ROW) {
                         disabled = sqlite3_column_int(stmt, 0);
                     }
-                    sqlite3_finalize(stmt);
+                    ::lattice::detail::store_physical_finalize(stmt);
                 }
                 sqlite3_result_int(ctx, disabled);
             },
@@ -7412,6 +8925,17 @@ protected:
     // ========================================================================
 
     void ensure_lattice_meta_table() {
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("metadata setup lacks its actual pending open");
+            auto create=open->metadata_table_recipe_(*db_);
+            db_->execute_initialization_(create);
+            // CREATE's actual return invalidates the old proof, even when
+            // IF NOT EXISTS made no schema change. Seed captures strict anew.
+            auto seed=open->metadata_initial_version_recipe_(*db_);
+            db_->execute_initialization_(seed);
+            return;
+        }
         db_->execute(detail::ordinary_schema_recipe::metadata_table());
         // Initialize schema version to 1 if not set
         db_->execute(detail::ordinary_schema_recipe::metadata_initial_version());
@@ -7485,7 +9009,7 @@ public:
     static constexpr int schema_format_epoch() noexcept { return kLatticeSchemaFormatEpoch; }
 
 protected:
-    static uint64_t fnv1a_hash(const std::string& s) {
+    static uint64_t fnv1a_hash(std::string_view s) {
         uint64_t h = 1469598103934665603ULL;
         for (unsigned char c : s) {
             h ^= c;
@@ -7498,7 +9022,8 @@ protected:
     /// attribute. If an attribute can change the generated DDL (columns,
     /// indexes, FTS5, vec0, R*Tree, union tables), it MUST appear here —
     /// otherwise a code change to that attribute is silently skipped forever.
-    static void serialize_property_for_fingerprint(std::ostringstream& out,
+    template<class Stream>
+    static void serialize_property_for_fingerprint(Stream& out,
                                                    const property_descriptor& p) {
         out << p.name << '\x01'
             << static_cast<int>(p.type) << '\x01'
@@ -7532,18 +9057,22 @@ protected:
     /// Fingerprint key for the C++ schema registry (the core layer's view).
     /// Schemas are sorted by table name — the registry is an unordered_map, so
     /// iteration order is not stable across runs.
-    std::string compute_core_fingerprint_key() const {
-        std::ostringstream out;
+    template<class Text>
+    Text compute_core_fingerprint_key_storage_() const {
+        detail::ordinary_program_storage_stream<Text> out;
         out << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
             << "target_schema_version:" << config_.target_schema_version << '\n';
-        std::vector<const model_schema*> schemas;
+        detail::ordinary_program_storage_vector<Text,const model_schema*> schemas;
         if(recovery_schemas_.valid()) {
             for(const auto& [name,schema]:recovery_schemas_.models)
                 if(!recovery_schemas_.swift_models.count(name))schemas.push_back(&schema);
         } else {
             // Outside the private recovery bounds, ordinary opening retains
             // its existing schema behavior. Recovery admission refuses first.
-            schemas=schema_registry::instance().all_schemas();
+            if constexpr(std::is_same_v<Text,std::string>) {
+                for(const auto* schema:recovery_schemas_.native_fallback_lease_())schemas.push_back(schema);
+            }
+            else throw db_error("pending fingerprint cannot use an uncaptured schema registry");
         }
         std::sort(schemas.begin(), schemas.end(),
                   [](const model_schema* a, const model_schema* b) {
@@ -7555,16 +9084,28 @@ protected:
                 serialize_property_for_fingerprint(out, prop);
             }
         }
-        std::ostringstream hex;
+        detail::ordinary_program_storage_stream<Text> hex;
         hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
         return "schema_fingerprint:" + hex.str();
+    }
+    std::string compute_core_fingerprint_key() const {
+        return compute_core_fingerprint_key_storage_<std::string>();
     }
 
     /// Current value of SQLite's schema cookie. Bumped by any DDL from any
     /// connection/process (and read inside an open transaction it reflects
     /// in-transaction DDL on this connection).
     int64_t read_schema_cookie() const {
-        auto rows = db_->query("PRAGMA schema_version");
+        auto rows = [&] {
+            if(schema_initializing_(*db_)) {
+                auto* open=db_->delivery_startup_.get();
+                if(!open)throw db_error("schema cookie lacks its actual pending open");
+                using sql=detail::observer_delivery_initialization_sql;
+                auto issued=sql::fixed_(*open,*db_,sql::recipe::schema_cookie);
+                return db_->query_initialization_(issued);
+            }
+            return db_->query("PRAGMA schema_version");
+        }();
         if (rows.empty() || rows[0].empty()) return -1;
         const auto& v = rows[0].begin()->second;
         if (const auto* i = std::get_if<int64_t>(&v)) return *i;
@@ -7576,8 +9117,27 @@ protected:
     /// Call either inside an explicit read transaction (fast-path probe) or
     /// inside the slow path's IMMEDIATE transaction (double-checked locking).
     bool fingerprint_marker_valid_in_txn(const std::string& key) const {
-        if (!db_->table_exists("_lattice_meta")) return false;  // fresh DB
-        auto rows = db_->query("SELECT value FROM _lattice_meta WHERE key = ?", {key});
+        const bool metadata_present=[&] {
+            if(schema_initializing_(*db_)) {
+                auto* open=db_->delivery_startup_.get();
+                if(!open)throw db_error("fingerprint discovery lacks its actual pending open");
+                using sql=detail::observer_delivery_initialization_sql;
+                auto issued=sql::fixed_(*open,*db_,sql::recipe::metadata_table_discovery);
+                return !db_->query_initialization_(issued).empty();
+            }
+            return db_->table_exists("_lattice_meta");
+        }();
+        if (!metadata_present) return false;  // fresh DB
+        auto rows = [&] {
+            if(schema_initializing_(*db_)) {
+                auto* open=db_->delivery_startup_.get();
+                if(!open)throw db_error("fingerprint value lacks its actual pending open");
+                using sql=detail::observer_delivery_initialization_sql;
+                auto issued=sql::metadata_read_(*open,*db_,sql::recipe::metadata_marker_read,key);
+                return db_->query_initialization_(issued);
+            }
+            return db_->query("SELECT value FROM _lattice_meta WHERE key = ?", {key});
+        }();
         if (rows.empty()) return false;
         const auto* stored = std::get_if<std::string>(&rows[0].at("value"));
         if (!stored) return false;
@@ -7589,6 +9149,14 @@ protected:
     /// Fast-path probe: marker + cookie read under one read transaction so the
     /// pair can't be torn by concurrent DDL between the two statements.
     bool fingerprint_marker_valid(const std::string& key) const {
+        if(schema_initializing_(*db_)) {
+            auto snapshot=begin_schema_initialization_(*db_,schema_startup_transaction::deferred);
+            const bool valid=fingerprint_marker_valid_in_txn(key);
+            snapshot.commit();return valid;
+            // The private transaction's noexcept destructor uses only its
+            // prepaid exact rollback if anything above throws. Preserve the
+            // first failure; do not renew credit or fall through to DDL.
+        }
         bool valid = false;
         try {
             db_->execute("BEGIN");
@@ -7608,13 +9176,58 @@ protected:
     void store_fingerprint_marker(const std::string& key) {
         int64_t cookie = read_schema_cookie();
         if (cookie < 0) return;
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("marker publication lacks its actual pending open");
+            open->initialize_fingerprint_marker_(*this,*db_,key,cookie);
+            return;
+        }
         const std::string cookie_str = std::to_string(cookie);
-        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
-                     {key, cookie_str});
-        db_->execute(
-            "DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' "
-            "AND key <> ? AND value <> ?",
-            {key, cookie_str});
+        db_->execute(detail::ordinary_schema_recipe::metadata_marker_store(),{key,cookie_str});
+        db_->execute(detail::ordinary_schema_recipe::metadata_marker_prune(),{key,cookie_str});
+    }
+
+    // Statistics DDL and the two actual owner markers settle together.
+    // This uses the existing private maintenance ownership boundary: it never
+    // joins a caller transaction, unblocks a frozen history, or grants an
+    // enrolled producer the unrelated legacy maintenance authority.
+    void optimize_statistics_() {
+        (void)with_audit_prune_transaction_([&]() -> int64_t {
+            if (!recovery_schemas_.valid() || config_.target_schema_version <= 0)
+                throw db_error("statistics maintenance requires the current owner schema");
+            const auto version = db_->query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB)) BETWEEN 1 AND 10 THEN value END AS value FROM main._lattice_meta WHERE key='schema_version' LIMIT 2");
+            if (version.size() != 1 || !std::holds_alternative<std::string>(version[0].at("value")) ||
+                std::get<std::string>(version[0].at("value")) != std::to_string(config_.target_schema_version))
+                throw db_error("statistics maintenance requires an exact current schema version");
+            const auto old_cookie = read_schema_cookie();
+            if (old_cookie < 0) throw db_error("statistics maintenance schema cookie unavailable");
+            const auto old_value = std::to_string(old_cookie);
+            std::vector<std::string> keys{compute_core_fingerprint_key()};
+            if (!recovery_schemas_.swift_fingerprint.empty() &&
+                recovery_schemas_.swift_fingerprint != keys.front())
+                keys.push_back(recovery_schemas_.swift_fingerprint);
+            // Exact TEXT equality, not the legacy permissive atoll fast path.
+            // Missing, stale or noncanonical marker values are never repaired here.
+            for (const auto& key : keys) {
+                const auto rows = db_->query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB)) BETWEEN 1 AND 10 THEN value END AS value FROM main._lattice_meta WHERE key=? LIMIT 2", {key});
+                if (rows.size() != 1 || !std::holds_alternative<std::string>(rows[0].at("value")) ||
+                    std::get<std::string>(rows[0].at("value")) != old_value)
+                    throw db_error("statistics maintenance fingerprint/cookie differs; no repair");
+            }
+            db_->execute("PRAGMA optimize");
+            const auto new_cookie = read_schema_cookie();
+            if (new_cookie < 0) throw db_error("statistics maintenance final cookie unavailable");
+            if (new_cookie == old_cookie) return 0;
+            const auto new_value = std::to_string(new_cookie);
+            for (const auto& key : keys) {
+                db_->execute("UPDATE main._lattice_meta SET value=? WHERE key=? AND value=?", {new_value,key,old_value});
+                const auto changed = db_->query("SELECT changes() AS n");
+                if (changed.size() != 1 || !std::holds_alternative<int64_t>(changed[0].at("n")) ||
+                    std::get<int64_t>(changed[0].at("n")) != 1)
+                    throw db_error("statistics maintenance marker update lost its exact preimage");
+            }
+            return 0;
+        });
     }
 
     void store_recovery_fingerprints() {
@@ -7782,7 +9395,7 @@ protected:
             "       unixepoch('subsec')"
             "   );" + canonical_receipt_tail +
             " END";
-        if (emitted) emitted->push_back(update_trigger); else db_->execute(update_trigger);
+        if (emitted) emitted->push_back(update_trigger); else execute_model_schema_(update_trigger);
 
         // INSERT trigger
         std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Insert"
@@ -7800,7 +9413,7 @@ protected:
             "       unixepoch('subsec')"
             "   );" + canonical_receipt_tail +
             " END";
-        if (emitted) emitted->push_back(insert_trigger); else db_->execute(insert_trigger);
+        if (emitted) emitted->push_back(insert_trigger); else execute_model_schema_(insert_trigger);
 
         // DELETE trigger
         std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Delete"
@@ -7818,7 +9431,7 @@ protected:
             "       unixepoch('subsec')"
             "   );" + canonical_receipt_tail +
             " END";
-        if (emitted) emitted->push_back(delete_trigger); else db_->execute(delete_trigger);
+        if (emitted) emitted->push_back(delete_trigger); else execute_model_schema_(delete_trigger);
     }
 
     void create_link_table_triggers(const std::string& link_table_name,
@@ -7845,7 +9458,7 @@ protected:
             "       unixepoch('subsec')"
             "   );" + canonical_receipt_tail +
             " END";
-        if (emitted) emitted->push_back(insert_trigger); else db_->execute(insert_trigger);
+        if (emitted) emitted->push_back(insert_trigger); else execute_model_schema_(insert_trigger);
 
         // DELETE trigger for link table
         std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
@@ -7863,11 +9476,11 @@ protected:
             "       unixepoch('subsec')"
             "   );" + canonical_receipt_tail +
             " END";
-        if (emitted) emitted->push_back(delete_trigger); else db_->execute(delete_trigger);
+        if (emitted) emitted->push_back(delete_trigger); else execute_model_schema_(delete_trigger);
     }
 
     void create_virtual_link_table_triggers(const std::string& link_table_name) {
-        for(const auto& sql:detail::ordinary_schema_recipe::virtual_link_audit(link_table_name))db_->execute(sql);
+        for(const auto& sql:detail::ordinary_schema_recipe::virtual_link_audit(link_table_name))execute_model_schema_(sql);
     }
 
     std::string generate_global_id() {
@@ -7900,7 +9513,16 @@ protected:
 
 protected:
     int get_schema_version() {
-        auto results = db_->query("SELECT value FROM _lattice_meta WHERE key = 'schema_version'");
+        auto results = [&] {
+            if(schema_initializing_(*db_)) {
+                auto* open=db_->delivery_startup_.get();
+                if(!open)throw db_error("schema version lacks its actual pending open");
+                using sql=detail::observer_delivery_initialization_sql;
+                auto issued=sql::metadata_read_(*open,*db_,sql::recipe::metadata_version_read);
+                return db_->query_initialization_(issued);
+            }
+            return db_->query("SELECT value FROM _lattice_meta WHERE key = 'schema_version'");
+        }();
         if (!results.empty()) {
             return std::stoi(std::get<std::string>(results[0].at("value")));
         }
@@ -7908,7 +9530,11 @@ protected:
     }
 
     void set_schema_version(int version) {
-        db_->execute("UPDATE _lattice_meta SET value = '" + std::to_string(version) + "' WHERE key = 'schema_version'");
+        if(schema_initializing_(*db_)) {
+            auto* open=db_->delivery_startup_.get();
+            if(!open)throw db_error("schema version producer lacks actual pending open");
+            open->initialize_model_version_(*this,*db_,version);
+        }else db_->execute("UPDATE _lattice_meta SET value = '" + std::to_string(version) + "' WHERE key = 'schema_version'");
     }
     
     // Exposed for swift_lattice to create tables from Swift schemas
@@ -7997,6 +9623,10 @@ protected:
             obj.source.table_name = table_name;
         }
 
+        // Preserve actual query identity before any generated field binds.
+        // A projection without globalId stays readable but cannot mint an
+        // UPDATE target through a later current-row lookup.
+        prepare_observer_delivery_identity_(obj,obj.table_name_,obj.global_id_);
         // Bind properties to DB
         obj.bind_to_db();
 
@@ -8053,12 +9683,27 @@ private:
         std::shared_ptr<detail::configured_recovery_connection> managed_wss_connection_;
         // Actual first-local start destruction only, never admission/source authority.
         std::shared_ptr<const detail::ordinary_managed_owner_release> managed_wss_start_release_;
-        const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
+        // One immutable DATA snapshot before any Native open. Moving the
+        // already captured bounded catalog into this fixed shared allocation
+        // avoids another map/property/string clone at pending publication.
+        // Connection tails retain DATA only, never this owner or a database.
+        const std::shared_ptr<const detail::recovery_owner_schema> recovery_schemas_owner_=
+            std::make_shared<const detail::recovery_owner_schema>(detail::recovery_owner_schema::capture_native());
+        const detail::recovery_owner_schema& recovery_schemas_=*recovery_schemas_owner_;
+        // Closed, creator-bound borrowed DATA; only the actual Swift constructor
+        // installs its fixed compiled checker. No owner/Native is retained.
+        struct pending_model_registry_checker_binding {
+            void(*check)(const lattice_db&,const detail::recovery_owner_schema&)=nullptr;
+            const lattice_db* owner=nullptr;
+            const detail::recovery_owner_schema* catalog=nullptr;
+            std::uint64_t creator=0;
+        } pending_model_registry_checker_;
         bool recovery_producer_bootstrapped_=false;
         bool administrative_owner_=false;
         bool checked_existing_unpublished_=false;
         std::shared_ptr<const managed_attachment_view> managed_attachment_view_;
         std::atomic<size_t> active_managed_attachment_operations_{0};
+        std::atomic<size_t> active_mutation_operations_{0};
         mutable std::mutex projection_service_mutex_;
         std::shared_ptr<projection_service> projection_service_;
         std::shared_ptr<projection_capture_account> projection_capture_account_;
@@ -8068,11 +9713,17 @@ private:
         std::atomic<const projection_pressure_map*> projection_pressure_maps_[2]{};
         std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> projection_pressure_owners_[2];
         configuration config_;
+        // The selected actual policy and borrowed immutable catalog exist
+        // BEFORE the first writer/read/xproc Native open. No Native owner is
+        // retained by this context; per-open tokens carry its DATA identity.
+        std::shared_ptr<detail::observer_delivery_startup> delivery_startup_;
+        bool delivery_facilities_published_=false;
         std::mutex connection_ownership_mutex_;
         uint64_t connection_revision_ = 0;
         std::shared_ptr<database> db_;
         std::shared_ptr<database> read_db_;
         std::shared_ptr<detail::recovery_refresh_state> recovery_refresh_;
+        std::shared_ptr<const database::core_transaction_original> txn_original_;
         std::atomic<std::thread::id> txn_owner_thread_{};
         std::shared_ptr<database> xproc_read_db_;
         std::atomic<bool> closed_{false};
@@ -8090,9 +9741,16 @@ private:
         int sync_lock_fd_ = -1;
         bool recovery_change_buffer_reserved_ = false;
         size_t topology_delivery_depth_ = 0;
+        size_t mutation_delivery_depth_ = 0;
         std::atomic<size_t> active_recovery_install_operations_{0};
         std::mutex change_buffer_mutex_;
+        // Immutable profile/client DATA; accesses use atomic shared publication.
+        // It contains no Native owner/retirement or arbitrary callback.
+        std::shared_ptr<const detail::observer_delivery_connection> observer_delivery_connection_;
+        // Declared before rows: actual row strings end BEFORE this credit.
+        std::shared_ptr<const detail::observer_delivery_original> change_buffer_delivery_credit_;
         std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> change_buffer_;
+        uint64_t change_buffer_custody_epoch_ = 0;
         bool is_flushing_ = false;
         std::atomic<bool> applying_remote_changes_{false};
         std::mutex observers_mutex_;
@@ -8110,10 +9768,10 @@ private:
         bool audit_maint_stop_ = false;
         std::shared_ptr<std::mutex> xproc_callback_mutex_ = std::make_shared<std::mutex>();
         std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
-        std::unordered_map<std::string, std::unordered_set<std::string>> link_tables_by_rhs_target_;
-        std::unordered_set<std::string> link_tables_unknown_target_;
-        std::unordered_set<std::string> virtual_link_tables_;
-        std::unordered_map<std::string, std::vector<std::string>> list_tables_by_parent_;
+        detail::core_model_registry_map<detail::core_model_registry_set> link_tables_by_rhs_target_;
+        detail::core_model_registry_set link_tables_unknown_target_;
+        detail::core_model_registry_set virtual_link_tables_;
+        detail::core_model_registry_map<detail::core_model_registry_list> list_tables_by_parent_;
 
         // Final automatic-destruction fallback only, after actual app
         // destructor/close phases. Preserve ordinary listener persistence.
@@ -8135,42 +9793,82 @@ private:
         owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>);
         explicit owned_resources(const std::string&);
         owned_resources();
-        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<detail::recovery_continuous_admission>,std::shared_ptr<detail::database_open_ledger> = {});
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<detail::recovery_continuous_admission>,std::shared_ptr<detail::database_open_ledger> = {},
+            detail::store_resource_initialization_original* = nullptr);
+        void open_prepared_native_connections_(detail::store_resource_initialization_original*);
     };
 };
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
     std::shared_ptr<database> writer,checked_managed_existing_key)
-    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(config),db_(std::move(writer)),
+    :recovery_schemas_owner_(std::make_shared<const detail::recovery_owner_schema>(std::move(catalog).prepare_native_fallback_())),checked_existing_unpublished_(true),config_(detail::ordinary_resource_configuration(detail::ordinary_wal_configuration(config))),db_(std::move(writer)),
      scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
     std::shared_ptr<database> writer,checked_mounted_server_existing_key)
-    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(config),db_(std::move(writer)),
+    :recovery_schemas_owner_(std::make_shared<const detail::recovery_owner_schema>(std::move(catalog).prepare_native_fallback_())),checked_existing_unpublished_(true),config_(detail::ordinary_resource_configuration(detail::ordinary_wal_configuration(config))),db_(std::move(writer)),
      scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,std::shared_ptr<database> writer)
-    : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(config), db_(std::move(writer)) {}
+    : recovery_schemas_owner_(std::make_shared<const detail::recovery_owner_schema>(std::move(catalog).prepare_native_fallback_())), administrative_owner_(true), config_(detail::ordinary_resource_configuration(detail::ordinary_wal_configuration(config))), db_(std::move(writer)) {}
 inline lattice_db::owned_resources::owned_resources(const std::string& path)
-        : config_(path)
-        , db_(std::make_shared<database>(path, database::open_mode::read_write))
-        , read_db_(!configuration::path_is_memory(path) ? std::make_shared<database>(path, database::open_mode::read_only) : nullptr)
+        : config_(detail::ordinary_resource_configuration(configuration(path)))
+        , delivery_startup_(detail::observer_delivery_startup::select(config_,recovery_schemas_))
+        , db_(database::make_owned_connection(config_.path,database::open_mode::read_write,
+              config_.busy_timeout_ms,{},config_.ordinary_context,connection_ledger_,false,config_.wal_extent_limit_bytes,
+              delivery_startup_?delivery_startup_->make_open_(detail::observer_delivery_startup::open_kind::writer,config_.path,delivery_startup_->initial_deadline_()):nullptr))
+        , read_db_(!config_.is_in_memory() ? database::make_owned_connection(config_.path,database::open_mode::read_only,
+              config_.busy_timeout_ms,{},config_.ordinary_context,connection_ledger_,false,0,
+              delivery_startup_?delivery_startup_->make_open_(detail::observer_delivery_startup::open_kind::reader,config_.path,delivery_startup_->initial_deadline_()):nullptr) : nullptr)
         , scheduler_(std::make_shared<immediate_scheduler>()) {}
 inline lattice_db::owned_resources::owned_resources()
         : config_()
         , db_(std::make_shared<database>(":memory:", database::open_mode::read_write))
         , read_db_(nullptr)  // In-memory DB can't have separate read connection
         , scheduler_(std::make_shared<immediate_scheduler>()) {}
-inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema recovery_schemas,std::shared_ptr<detail::recovery_continuous_admission> continuous,std::shared_ptr<detail::database_open_ledger> connection_ledger)
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema recovery_schemas,std::shared_ptr<detail::recovery_continuous_admission> continuous,std::shared_ptr<detail::database_open_ledger> connection_ledger,detail::store_resource_initialization_original* normal_creation)
         : recovery_continuous_(std::move(continuous))
-        , recovery_schemas_(std::move(recovery_schemas))
-        , config_(config)
+        , recovery_schemas_owner_(std::make_shared<const detail::recovery_owner_schema>(std::move(recovery_schemas).prepare_native_fallback_()))
+        , config_(detail::ordinary_resource_configuration(detail::ordinary_wal_configuration(config)))
         , connection_ledger_(std::move(connection_ledger))
-        , db_(recovery_continuous_ ? detail::open_continuous_writer(config,recovery_continuous_) : database::make_owned_connection(resolve_path(config),
-              config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
-              config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_))
-        , read_db_(config.read_only ? nullptr :
-                   (!config.is_in_memory() && !config.is_sync_enabled() ? database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr))
-        , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
-                         database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr)
+        , delivery_startup_(recovery_continuous_?detail::select_continuous_startup(config_,recovery_schemas_,recovery_continuous_):
+            normal_creation?detail::observer_delivery_startup::select_with_deadline_(config_,recovery_schemas_,normal_creation->original_deadline_()):detail::observer_delivery_startup::select(config_,recovery_schemas_))
+
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {}
+
+inline void lattice_db::owned_resources::open_prepared_native_connections_(detail::store_resource_initialization_original* normal_creation) {
+    const auto creator=::getpid();
+    if(db_||read_db_||xproc_read_db_||closed_.load(std::memory_order_acquire))
+        throw db_error("prepared owner Native construction was already consumed");
+    db_=recovery_continuous_ ? detail::open_continuous_writer(config_,recovery_continuous_,delivery_startup_,recovery_schemas_) : database::make_owned_connection(resolve_path(config_),
+              config_.read_only ? database::open_mode::read_only : database::open_mode::read_write,
+              config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_,false,config_.wal_extent_limit_bytes,
+              delivery_startup_?delivery_startup_->make_open_(detail::observer_delivery_startup::open_kind::writer,resolve_path(config_),delivery_startup_->initial_deadline_()):nullptr,normal_creation);
+    if(creator!=::getpid())throw db_error("inherited prepared writer return");
+    read_db_=config_.read_only ? nullptr :
+                   (!config_.is_in_memory() && !config_.is_sync_enabled() ? database::make_owned_connection(config_.path, database::open_mode::read_only, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_,false,0,
+                       delivery_startup_?delivery_startup_->make_open_(detail::observer_delivery_startup::open_kind::reader,config_.path,delivery_startup_->initial_deadline_()):nullptr) : nullptr);
+    if(creator!=::getpid())throw db_error("inherited prepared reader return");
+    xproc_read_db_=!config_.is_in_memory() && !config_.read_only ?
+                         database::make_owned_connection(config_.path, database::open_mode::read_only, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_,false,0,
+                           delivery_startup_?delivery_startup_->make_open_(detail::observer_delivery_startup::open_kind::cross_process_reader,config_.path,delivery_startup_->initial_deadline_()):nullptr) : nullptr;
+    if(creator!=::getpid())throw db_error("inherited prepared cross-process reader return");
+}
+inline detail::process_bound_resource_owner<lattice_db::owned_resources> lattice_db::prepare_owner_resources_(
+    const configuration& config,detail::recovery_owner_schema catalog,
+    std::shared_ptr<detail::recovery_continuous_admission> continuous,
+    std::shared_ptr<detail::database_open_ledger> ledger,detail::store_resource_initialization_original* normal_creation) {
+    using owner=detail::process_bound_resource_owner<owned_resources>;
+    const auto creator=::getpid();
+    std::unique_ptr<owned_resources,owner::native_deleter> data(nullptr,owner::native_deleter{creator});
+    // This constructor contains DATA allocation/copy/defaults only. A later
+    // same-account scope may surround exactly this allocation/constructor; no
+    // scope installed here may span the separate real Native phase below.
+    data.reset(new owned_resources(config,std::move(catalog),std::move(continuous),std::move(ledger),normal_creation));
+    if(creator!=::getpid())throw db_error("inherited prepared owner DATA return");
+    observe_prepared_owner_data_(*data);
+    if(creator!=::getpid())throw db_error("inherited prepared owner DATA observation");
+    data->open_prepared_native_connections_(normal_creation);
+    if(creator!=::getpid())throw db_error("inherited prepared owner Native return");
+    return owner(data.release(),creator,owner::prepared_data_allocation{});
+}
 
 
 // ============================================================================
@@ -9048,6 +10746,9 @@ inline lattice_close_result lattice_db::close_checked() noexcept {
         catch (...) { result.remember(std::current_exception()); }
         return result;
     }
+    try { require_catalog_callback_absent(); }
+    catch (...) { result.remember(std::current_exception()); return result; }
+    const auto maintenance_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
     const auto attempt=[&](auto&& operation) noexcept {
         try {operation();}catch(...) {result.remember(std::current_exception());}
     };
@@ -9067,11 +10768,16 @@ inline lattice_close_result lattice_db::close_checked() noexcept {
     const int own=instance_guard::tls_depth(guard_.get());
     while(guard_->notify_refcount.load(std::memory_order_seq_cst)>own)std::this_thread::yield();
     attempt([&]{stop_audit_maintenance();});
+    result.merge(detail::retire_authenticated_ready_maintenance(guard_,maintenance_deadline));
+    if(!owns_creator_process()){result.cleanup_complete=false;return result;}
     result.merge(teardown_sync_checked());sync_policy_.reset();
     attempt([&]{if(scheduler_)scheduler_->shutdown();});
     attempt([&]{if(!finish_configured_listener_retirement()){
         result.cleanup_complete=false;
-        if(result.sync!=sync_drain_state::failed)result.sync=sync_drain_state::deadline_pending;
+        // Preserve the actual configured/callback self-join refusal. Listener
+        // debt cannot downgrade a reentrant report or replace a first failure.
+        if(result.sync!=sync_drain_state::failed&&result.sync!=sync_drain_state::reentrant_pending)
+            result.sync=sync_drain_state::deadline_pending;
     }});
     if(!owns_creator_process()){result.cleanup_complete=false;return result;}
     attempt([&]{instance_registry::instance().unregister_instance(config_.path,this);});
@@ -9454,6 +11160,10 @@ inline void managed<std::vector<uint8_t>>::set_optional_value_on(
 }
 
 inline void managed<std::vector<uint8_t>>::set_value(const std::vector<uint8_t>& val) {
+    if(detail::observer_delivery_assignment::enabled(*this)) {
+        detail::observer_delivery_assignment::blob(*this,val);return;
+    }
+
     unmanaged_value = val;
     if (!is_bound()) return;
     detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer, is_vector_column);

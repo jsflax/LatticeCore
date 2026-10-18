@@ -1,4 +1,5 @@
 #include "recovery_receiver_controller.hpp"
+#include "recovery_cohort_progress_observation.hpp"
 #include "recovery_unknown_reconciliation.hpp"
 #include "recovery_export_adapter.hpp"
 #include "recovery_receipt_json.hpp"
@@ -8,6 +9,9 @@
 #include "canonical_writer_adapter.hpp"
 #include "recovery_witness.hpp"
 #include "sync_callback_lifetime.hpp"
+#include "recovery_controller_executor.hpp"
+#include "controller_store_ending.hpp"
+#include <lattice/native_retirement_storage.hpp>
 #include "vendor/picosha2/picosha2.h"
 #include <lattice/lattice.hpp>
 #include <nlohmann/json.hpp>
@@ -21,6 +25,9 @@
 #endif
 
 namespace lattice::detail {
+#ifndef __EMSCRIPTEN__
+thread_local recovery_controller_executor::state* recovery_controller_executor::current_ = nullptr;
+#endif
 namespace {
 namespace cr=canonical_range;
 using json=nlohmann::json;
@@ -28,7 +35,24 @@ constexpr size_t pending_bytes=16777216;
 constexpr unsigned admission_retry_attempts=32;
 constexpr int64_t admission_retry_window_ms=5000,admission_retry_tick_ms=100;
 [[noreturn]] void refuse(const char* reason){throw db_error(reason);}
-class controller_admission_wait final {};
+// Actual returned no-effect admission kind retained only for the existing
+// private controller test probe; no retry, grant or public diagnostic channel.
+class controller_admission_wait final {
+public:
+    recovery_install_deferred reason;
+    explicit controller_admission_wait(recovery_install_deferred actual)noexcept:reason(actual){}
+};
+const char* deferred_observation_label(recovery_install_deferred actual)noexcept {
+    switch(actual){
+        case recovery_install_deferred::connection_mutex:return "admission-deferred-connection-mutex";
+        case recovery_install_deferred::engine_read:return "admission-deferred-engine-read";
+        case recovery_install_deferred::store_gate:return "admission-deferred-store-gate";
+        case recovery_install_deferred::core_write:return "admission-deferred-core-write";
+        case recovery_install_deferred::schema_registry:return "admission-deferred-schema-registry";
+        case recovery_install_deferred::none:return "admission-deferred-none-unexpected";
+    }
+    return "admission-deferred-unknown";
+}
 // Only the two exact disposal-generation guards create this primary marker.
 // A primary class alone never grants SQL replay or proves no source effect.
 class controller_generation_changed final : public db_error {
@@ -261,7 +285,7 @@ void known(const recovery_install_result& result) {
         require(result.state==recovery_install_state::refused&&!result.primary_error&&!result.cleanup_error&&
             !result.postcommit_error&&!result.notification_error&&!result.unexpected_commit_observed,
             "controller invalid no-effect admission outcome");
-        throw controller_admission_wait{};
+        throw controller_admission_wait{result.deferred};
     }
     if(result.state!=recovery_install_state::committed){
         if(result.primary_error)try{std::rethrow_exception(result.primary_error);}
@@ -314,6 +338,13 @@ struct recovery_receiver_route::state {
     std::shared_ptr<sync_callback_lifetime> lifetime;
     std::atomic<bool> retired{false},blocked{true};
     std::function<void()> resumed,renew,reconcile;
+    std::shared_ptr<const std::function<void()>> wake_notifications;
+    bool notifications_bound=false;
+    std::mutex notification_mutex;
+    unsigned notification_kinds=0;
+    uint64_t notification_generation=0;
+    uint64_t notification_serial=0,notification_queued=0;
+    std::exception_ptr notification_error;
     std::atomic<bool> renewal_requested{false};
     // Set only by worker validation of the actual current orphan profile.
     // Coordinator mutex guards this weak record; it cannot retain old sources.
@@ -325,16 +356,26 @@ struct recovery_receiver_route::state {
     // controller mutex. Historical observation is not current membership.
     // The worker-only observed map is never read by drain callers.
     std::weak_ptr<const receiver_source_binding::record> checked_selected_view;
-    std::function<void(std::exception_ptr)> error;
+    std::function<void(const std::exception_ptr&)> error;
 };
 struct recovery_receiver_controller::state {
     const std::uint64_t creator=controller_process();
     const recovery_continuous_policy policy;
     const canonical_scoped_limits caps;
     std::shared_ptr<const test_probe> probe;
+#ifndef __EMSCRIPTEN__
+    std::unique_ptr<recovery_controller_executor> executor;
+#endif
     std::mutex mutex;
     std::vector<std::weak_ptr<recovery_receiver_route>> routes;
     bool scheduled=false,running=false,demand=true,idle=false,deferred_external_request=false;
+    bool deletion_retired=false; // only explicit Core deletion retirement
+    // One coalesced actual wake, not a new external revision or SQL permit.
+    // A wake arriving after a running turn's final inbox check must survive
+    // until that turn (or reconciliation reservation) really releases it.
+    bool wake_pending=false;
+    const void* scheduled_token=nullptr; // identity only, never dereferenced
+    void wake_released(recovery_receiver_controller&)noexcept;
     const recovery_reconciliation_reservation* reconciliation_reservation=nullptr;
     uint64_t revision=1,external_revision=1,reconciled_external_revision=0;
     uint64_t delivery_retry_revision=0,reconciled_delivery_retry_revision=0;
@@ -347,6 +388,31 @@ struct recovery_receiver_controller::state {
         unsigned attempts=0;
         int64_t deadline=0,next_due=0;
     } admission_wait;
+    // A deferred real install is a milestone, not permission for a preliminary
+    // phase/audit unit to release its denial. Every access is under mutex.
+    struct install_target_id {
+        uint64_t revision=0;
+        int64_t physical=0,barrier=0,attempt=0;
+        const verified_unsent_set* frozen=nullptr;
+        bool operator==(const install_target_id&)const=default;
+    };
+    struct install_target {install_target_id id;std::shared_ptr<const verified_unsent_set> frozen;};
+    struct install_target_delete {
+        uint64_t creator;
+        install_target_delete()noexcept:creator(controller_process()){}
+        explicit install_target_delete(uint64_t original)noexcept:creator(original){}
+        void operator()(install_target* target)const noexcept {
+            // The controller capsule is creator-fenced too. Detached retired
+            // custody must likewise abandon before an inherited proof release.
+            if(creator==controller_process())delete target;
+        }
+    };
+    using install_target_ptr=std::unique_ptr<install_target,install_target_delete>;
+    install_target_ptr admission_install{nullptr,install_target_delete{creator}};
+    // Exact physical denial cell; the controller mutex never
+    // destroys its retained writer. It spans only the original retry episode.
+    recovery_writer_access::controller_admission_intent admission_intent;
+    bool admission_intent_revoked=false; // coordinator leaf; never refreshes admission_wait
     std::shared_ptr<const verified_unsent_set> frozen;
     std::shared_ptr<const recovery_reconciliation_descriptor> reconciliation;
     int64_t frozen_attempt=0,frozen_barrier=0;
@@ -354,19 +420,40 @@ struct recovery_receiver_controller::state {
     // Reservations outlive the outstanding pointer when a callback or worker
     // still owns bytes. Only reservations run under mutex; atomic releases
     // happen after payload destruction and never need the coordinator leaf.
-    struct inbox_budget { std::atomic<size_t> bytes{0},slots{0}; };
+    struct inbox_budget {
+        const uint64_t creator=controller_process();
+        std::atomic<size_t> bytes{0},slots{0};
+        std::atomic<bool> capacity_wait{false};
+        // Bound once under the coordinator leaf before the first actual route
+        // publication. Weak DATA cannot keep a controller/Native owner alive.
+        std::weak_ptr<recovery_receiver_controller> controller;
+        bool controller_bound=false;
+    };
     struct charge {
+        const uint64_t creator;
         std::shared_ptr<inbox_budget> budget;
-        size_t bytes=0;bool slot=false;
-        explicit charge(std::shared_ptr<inbox_budget> value):budget(std::move(value)){}
-        ~charge(){budget->bytes.fetch_sub(bytes);if(slot)budget->slots.fetch_sub(1);}
+        size_t bytes=0;bool slot=false,charged=false;
+        // Required promotion custody exists before any charge publication. A
+        // child abandons this entire heap object before inherited last release.
+        std::shared_ptr<recovery_receiver_controller> wake_owner;
+        std::shared_ptr<recovery_receiver_route> wake_route;
+        std::exception_ptr wake_error;
+        std::array<std::weak_ptr<recovery_receiver_route>,128> wake_routes{};
+        explicit charge(std::shared_ptr<inbox_budget> value):creator(value->creator),budget(std::move(value)){}
+        static void destroy(charge*)noexcept;
         void shrink(size_t actual){require(actual<=bytes,"controller reservation exceeded");budget->bytes.fetch_sub(bytes-actual);bytes=actual;}
     };
     std::shared_ptr<inbox_budget> budget=std::make_shared<inbox_budget>();
     std::shared_ptr<charge> reserve_locked(size_t bytes,bool slot) {
+        require(budget->creator==controller_process(),"controller credit belongs to another process");
         if(bytes>pending_bytes-budget->bytes.load()||(slot&&budget->slots.load()>=2))return {};
-        auto result=std::make_shared<charge>(budget);result->bytes=bytes;result->slot=slot;
-        budget->bytes.fetch_add(bytes);if(slot)budget->slots.fetch_add(1);return result;
+        // A failed shared_ptr control allocation destroys an UNCHARGED empty
+        // object; it must not consume another wait bit or run a wake under leaf.
+        auto result=std::shared_ptr<charge>(new charge(budget),charge::destroy);
+        require(budget->creator==controller_process(),"controller credit changed process during allocation");
+        result->bytes=bytes;result->slot=slot;
+        budget->bytes.fetch_add(bytes);if(slot)budget->slots.fetch_add(1);
+        result->charged=true;return result;
     }
     struct reply {
         std::shared_ptr<charge> reservation; // destroyed after bytes
@@ -437,20 +524,77 @@ struct recovery_receiver_controller::state {
 };
 // One result owns the successful admission until known-COMMIT publication or
 // abandonment. SQL bodies and owner destruction never run under the leaf.
+// Every published charge is retained beyond coordinator-leaf pointer removal:
+// receive owns its local reply/pending, turn owns front/pending, and retire/error
+// paths move originals to off-leaf custody. Reservation is the FIRST field of
+// reply/pending, so payload bytes, inbox and view destruction precede this call.
+void recovery_receiver_controller::state::charge::destroy(charge* value)noexcept {
+    if(!value||value->creator!=controller_process())return;
+    const auto current=[&]{return value->creator==controller_process();};
+    if(value->charged){
+        value->budget->bytes.fetch_sub(value->bytes);
+        if(value->slot)value->budget->slots.fetch_sub(1);
+        // Publication BEFORE the waiter's zero check pairs with this actual
+        // last-release zero check. No polling, timer or new retry allowance.
+        if(value->budget->bytes.load()==0&&value->budget->slots.load()==0&&
+           value->budget->capacity_wait.exchange(false)){
+            value->wake_owner=value->budget->controller.lock();
+            if(value->wake_owner&&current())try{
+                auto& runtime=*value->wake_owner->state_;
+                bool live=false;
+                {std::lock_guard lock(runtime.mutex);
+                    live=!runtime.deletion_retired&&!runtime.failure;
+                    if(live){runtime.wake_pending=true;std::copy(runtime.routes.begin(),runtime.routes.end(),value->wake_routes.begin());}}
+                if(live)for(const auto& route:value->wake_routes){
+                    value->wake_route=route.lock();
+                    if(value->wake_route&&!value->wake_route->state_->retired.load()){
+                        try{value->wake_owner->wake(value->wake_route);}
+                        catch(...){
+                            if(!current())return;
+                            value->wake_error=std::current_exception();
+                            value->wake_owner->scheduling_failed(value->wake_error);
+                        }
+                        if(!current())return;
+                        // Retirement can win inside wake's initial check. Do
+                        // not consume the only capacity event for a dead route
+                        // while an actual registered sibling could carry it.
+                        if(!value->wake_route->state_->retired.load())break;
+                    }
+                    value->wake_route.reset();if(!current())return;
+                }
+            }
+            catch(...){
+                if(!current())return;
+                value->wake_error=std::current_exception();
+                value->wake_owner->scheduling_failed(value->wake_error);
+            }
+        }
+    }
+    if(!current())return;
+    value->wake_error={};if(!current())return;
+    value->wake_route.reset();if(!current())return;
+    value->wake_owner.reset();if(!current())return;
+    for(auto& route:value->wake_routes){route.reset();if(!current())return;}
+    delete value; // no Native-bearing promotion/callback remains in its fields
+}
+
 struct recovery_reconciliation_reservation {
     std::shared_ptr<recovery_receiver_controller> controller;
     std::shared_ptr<lattice_db> owner;
     bool active=false;
     void release()noexcept {
         std::shared_ptr<const recovery_reconciliation_descriptor> retired;
+        bool ended=false;
         if(active){auto& runtime=*controller->state_;{
             std::lock_guard lock(runtime.mutex);
-            if(runtime.reconciliation_reservation==this){runtime.reconciliation_reservation=nullptr;runtime.running=false;
+            if(runtime.reconciliation_reservation==this){runtime.reconciliation_reservation=nullptr;runtime.running=false;ended=true;
                 // Admission reserves room for publication plus this one
                 // coalesced actual external event. Internal wakes never set it.
                 if(runtime.deferred_external_request){runtime.deferred_external_request=false;++runtime.revision;++runtime.external_revision;
                     runtime.demand=true;runtime.failure={};runtime.awaiting_delivery_retry=false;retired=std::move(runtime.reconciliation);}}
             active=false;}}
+        retired.reset(); // release old payload owners before any next turn
+        if(ended)controller->state_->wake_released(*controller);
     }
     ~recovery_reconciliation_reservation(){release();}
 };
@@ -465,10 +609,58 @@ canonical_scoped_limits recovery_receiver_controller::limits(const recovery_cont
 }
 std::mutex recovery_receiver_controller::test_mutex_;
 std::shared_ptr<const recovery_receiver_controller::test_probe> recovery_receiver_controller::test_probe_;
-recovery_receiver_controller::recovery_receiver_controller(const recovery_continuous_policy& policy):state_(std::make_unique<state>(policy)){
-    std::lock_guard lock(test_mutex_);state_->probe=test_probe_;
+std::shared_ptr<const recovery_receiver_controller::worker_observer> recovery_receiver_controller::test_worker_observer_;
+recovery_receiver_controller::recovery_receiver_controller(const recovery_continuous_policy& policy,
+    const std::shared_ptr<controller_worker_original>& original):state_(std::make_unique<state>(policy)){
+#ifndef __EMSCRIPTEN__
+    // Reserve actual ending capacity and launch before this controller can be
+    // published into a producer or accept any route/wake.
+    auto staged=std::make_unique<recovery_controller_executor>();
+    if(!original)throw db_error("controller worker lacks preconstruction ending custody");
+    // Before any constructor callback or producer publication. If retaining
+    // DATA fails, the reserved producer original remains honestly unavailable.
+    original->bind(staged->retain_ending());
+#endif
+    std::shared_ptr<const worker_observer> worker_observed;
+    {std::lock_guard lock(test_mutex_);state_->probe=test_probe_;worker_observed=test_worker_observer_;}
+#ifndef __EMSCRIPTEN__
+    state_->executor=std::move(staged);
+    if(worker_observed)(*worker_observed)(*state_->executor); // Actual constructor observation, off test/producer leaves.
+#endif
 }
-recovery_receiver_controller::~recovery_receiver_controller()=default;
+void recovery_receiver_controller::retire_for_deletion(){
+    if(state_->creator!=controller_process())throw db_error("controller deletion belongs to another process");
+    native_retirement_storage<std::shared_ptr<database_retirement_state>,
+        std::shared_ptr<database>,state::install_target_ptr> retired; // before effects
+    if(!retired.in_creator_process()||state_->creator!=controller_process())
+        throw db_error("controller deletion changed process during ending admission");
+    {
+        std::lock_guard lock(state_->mutex);
+        state_->deletion_retired=true;state_->wake_pending=false;
+        state_->admission_intent_revoked=true;
+        retired.get<2>()=std::move(state_->admission_install);
+        if(!state_->running){
+            auto actual=state_->admission_intent.retire();
+            retired.get<0>()=std::move(actual.retirement);retired.get<1>()=std::move(actual.writer);
+            state_->admission_wait={};
+        }
+    }
+    // Each arbitrary final release is off leaf and followed by a creator
+    // check before another payload or state access. A child abandons the
+    // entire remaining heap graph rather than unwinding automatic owners.
+    if(!retired.release<0>()||!retired.release<1>()||!retired.release<2>())
+        throw db_error("controller deletion changed process during retained ending");
+#ifndef __EMSCRIPTEN__
+    // Cancel only unexecuted slots; actual executing work must return before
+    // its original worker and reserved reaper can establish a real join.
+    state_->executor->retire();
+#endif
+}
+recovery_receiver_controller::~recovery_receiver_controller(){
+    // Abandon the entire inherited process capsule before worker/thread,
+    // callback/shared ownership or leaf destruction in a fork child.
+    if(state_&&state_->creator!=controller_process())(void)state_.release();
+}
 void recovery_receiver_controller::initialize_owned(std::shared_ptr<lattice_db> owner,const recovery_continuous_policy& policy) {
     const auto caps=limits(policy);recovery_request_store requests(owner);requests.initialize();
     canonical_range_staging stage(owner,caps.install.installations,caps.codec,caps.staging);stage.initialize();
@@ -476,7 +668,7 @@ void recovery_receiver_controller::initialize_owned(std::shared_ptr<lattice_db> 
     (void)bump_recovery_witness(*owner);
 }
 void recovery_receiver_controller::validate_reopen_owned(std::shared_ptr<lattice_db> owner,const recovery_continuous_policy& policy,int64_t phase,int64_t barrier,int64_t attempt) {
-    const auto caps=limits(policy);recovery_request_store requests(owner);requests.audit();
+    const auto caps=limits(policy);recovery_request_store requests(owner);requests.migrate_existing();
     initialize_canonical_domains_owned(owner,caps.install,false);
     require(read_recovery_witness(*recovery_writer_access::active_writer(*owner)).has_value(),"controller witness missing on reopen");
     canonical_range_staging stages(owner,caps.install.installations,caps.codec,caps.staging);stages.audit();
@@ -494,6 +686,8 @@ void recovery_receiver_controller::validate_reopen_owned(std::shared_ptr<lattice
         if(framing){
             const auto decoded=cr::decode(framing->request_frame,caps.codec);const auto* q=std::get_if<cr::request>(&decoded.body);
             require(q&&decoded.logical.channel==c.profile.binding.channel&&decoded.logical.sequence==uint64_t(framing->sequence)&&q->source==source_binding(c.profile),"controller reopened Q differs");
+            if(phase==4)require(framing->receipt_decisions=="0"||(q->receipts.size()<=recovery_request_store::decision_entries&&framing->receipt_decisions.size()==65+2*q->receipts.size()&&!framing->receipt_decisions.empty()&&framing->receipt_decisions[0]=='1'),
+                "controller reopened canceled receipt decisions missing or count differs");
             if(!framing->manifest_frame.empty()){
                 const auto m=cr::decode(framing->manifest_frame,caps.codec);require(m.logical==decoded.logical&&std::holds_alternative<cr::manifest>(m.body),"controller reopened manifest framing differs");
                 const auto described=describe_canonical_range(decoded.logical,*q,std::get<cr::manifest>(m.body),caps.codec,framing->route);
@@ -523,31 +717,97 @@ std::shared_ptr<recovery_receiver_route> recovery_receiver_controller::attach(st
     const std::shared_ptr<scheduler>& scheduler,const std::shared_ptr<sync_callback_lifetime>& lifetime) {
     auto route_state=std::make_shared<recovery_receiver_route::state>();route_state->owner=owner;route_state->continuous=continuous;route_state->source=source;route_state->transport=transport;route_state->dispatch=scheduler;route_state->lifetime=lifetime;
     auto route=std::shared_ptr<recovery_receiver_route>(new recovery_receiver_route(shared_from_this(),std::move(route_state)));
-    {std::lock_guard lock(state_->mutex);auto& all=state_->routes;all.erase(std::remove_if(all.begin(),all.end(),[](const auto& value){return value.expired();}),all.end());
+    {std::lock_guard lock(state_->mutex);require(!state_->deletion_retired,"controller deletion retired route admission");
+        if(!state_->budget->controller_bound){state_->budget->controller=weak_from_this();state_->budget->controller_bound=true;}
+        auto& all=state_->routes;all.erase(std::remove_if(all.begin(),all.end(),[](const auto& value){return value.expired();}),all.end());
         require(all.size()<state_->policy.physical_routes,"controller physical route capacity");all.push_back(route);}
     return route;
 }
 recovery_receiver_route::recovery_receiver_route(std::shared_ptr<recovery_receiver_controller> controller,std::shared_ptr<state> state):state_(std::move(state)),controller_(std::move(controller)){}
 recovery_receiver_route::~recovery_receiver_route(){state_->retired.store(true,std::memory_order_release);controller_->retire(this);}
 void recovery_receiver_controller::retire(recovery_receiver_route*)noexcept {
+    if(state_->creator!=controller_process())return;
+    recovery_writer_access::controller_admission_intent::retired_custody retired_writer;
+    state::install_target_ptr retired_install;
     std::shared_ptr<state::pending> released;
     std::array<std::shared_ptr<state::reply>,2> retired;
     {std::lock_guard lock(state_->mutex);
+        state_->admission_intent_revoked=true;
+        retired_install=std::move(state_->admission_install);
+        if(!state_->running){retired_writer=state_->admission_intent.retire();state_->admission_intent_revoked=false;}
         if(state_->outstanding&&state_->outstanding->route.expired())released=std::move(state_->outstanding);
         for(size_t i=0;i<retired.size();++i)if(state_->late_inbox[i]&&state_->late_inbox[i]->late_route.expired())
             retired[i]=std::move(state_->late_inbox[i]);}
+#ifndef __EMSCRIPTEN__
+    state_->executor->cancel_retry();
+#endif
     // In-flight callbacks/worker retain their charges until actual disposal.
     // Durable barrier/Q survives; a later actual route can continue it.
 }
 void recovery_receiver_route::wake(){if(!state_->retired.load(std::memory_order_acquire))controller_->wake(shared_from_this());}
-void recovery_receiver_route::notifications(std::function<void()> resumed,std::function<void()> renew,std::function<void(std::exception_ptr)> error,std::function<void()> reconcile){state_->resumed=std::move(resumed);state_->renew=std::move(renew);state_->error=std::move(error);state_->reconcile=std::move(reconcile);}
-void recovery_receiver_route::request(){
+void recovery_receiver_route::notifications(std::function<void()> resumed,std::function<void()> renew,std::function<void(const std::exception_ptr&)> error,std::function<void()> reconcile,std::function<void()> wake_notifications){
+    require(static_cast<bool>(wake_notifications),"controller requires its actual pacer notification wake");
+    // Existing controllers may observe this registration before the new sync
+    // constructor reaches callback binding. Stage allocation/captures off leaf,
+    // then publish immutable callbacks once; readers only copy a shared holder.
+    const auto wake=std::make_shared<const std::function<void()>>(std::move(wake_notifications));
+    bool bound=false,pending=false;
+    {std::lock_guard lock(state_->notification_mutex);
+        if(!state_->notifications_bound){
+            state_->resumed=std::move(resumed);state_->renew=std::move(renew);state_->error=std::move(error);state_->reconcile=std::move(reconcile);
+            state_->wake_notifications=wake;state_->notifications_bound=true;bound=true;
+            pending=state_->notification_kinds!=0;
+        }}
+    require(bound,"controller notification callbacks already bound");
+    if(pending)(*wake)(); // earlier retained DATA, off leaf; no user scheduler
+}
+void recovery_receiver_route::request(){request_impl(nullptr,nullptr);}
+void recovery_receiver_route::legacy_delivery_acknowledged(){
+    if(!creator_current())throw db_error("controller ACK belongs to another process");
+    // Prepare fenced weak-original custody before reading inherited bindings.
+    // This capsule grants no Native/source permission and owns no database.
+    native_retirement_storage<std::weak_ptr<recovery_receiver_route>,
+        std::weak_ptr<recovery_receiver_controller>> identity;
+    if(!identity.in_creator_process()||!creator_current())return;
+    identity.get<0>()=weak_from_this();identity.get<1>()=controller_;
+    request_impl(&identity.get<0>(),&identity.get<1>());
+}
+void recovery_receiver_route::request_impl(const std::weak_ptr<recovery_receiver_route>* legacy_origin,
+    const std::weak_ptr<recovery_receiver_controller>* actual_controller){
+    if(!creator_current())throw db_error("controller request belongs to another process");
+    recovery_writer_access::controller_admission_intent::retired_custody retired_writer;
+    recovery_receiver_controller::state::install_target_ptr retired_install;
     std::shared_ptr<const recovery_reconciliation_descriptor> retired;
+    bool preserve_pass=false;
     {std::lock_guard lock(controller_->state_->mutex);auto& state=*controller_->state_;
+        if(legacy_origin){
+            if(state_->retired.load())return;
+            const auto& current=state.reconciliation;
+            const auto same=[](const auto& x,const auto& y)noexcept{return !x.owner_before(y)&&!y.owner_before(x);};
+            if(current&&current->phase_==4&&current->controller_revision_==state.revision&&
+                current->external_revision_==state.external_revision&&actual_controller&&
+                same(current->controller_,*actual_controller)&&same(current->owner_,state_->owner)){
+                size_t matched=0;
+                for(const auto& part:current->contributions_)
+                    if(same(part.route,*legacy_origin)&&part.source==state_->source)++matched;
+                preserve_pass=matched==1;
+            }
+        }
+        // Even an entirely handed-off pass must finish its actual refreeze
+        // publication. ACKs do not reset that cursor or become external demand.
+        if(!preserve_pass){
         require(state.revision!=UINT64_MAX&&state.external_revision!=UINT64_MAX,"controller demand revision exhausted");
         if(state.reconciliation_reservation)state.deferred_external_request=true;
-        else {++state.revision;++state.external_revision;state.demand=true;state.failure={};state.awaiting_delivery_retry=false;retired=std::move(state.reconciliation);}}
-    retired.reset();wake();
+        else {++state.revision;++state.external_revision;state.demand=true;state.failure={};state.awaiting_delivery_retry=false;retired=std::move(state.reconciliation);
+            state.admission_intent_revoked=true;
+            retired_install=std::move(state.admission_install);
+            if(!state.running){retired_writer=state.admission_intent.retire();state.admission_intent_revoked=false;}}}}
+    if(preserve_pass){wake();return;} // normal worker/handoff still verify the actual source/view
+    retired_writer.reset();retired.reset();
+#ifndef __EMSCRIPTEN__
+    controller_->state_->executor->cancel_retry();
+#endif
+    wake();
 }
 std::function<void()> recovery_receiver_route::delivery_timeout_retry(const committed_export_frame& frame,uint64_t physical) {
     if(!frame.reconciliation_)return {};
@@ -615,14 +875,197 @@ std::exception_ptr recovery_receiver_route::checked_disposal_failure(uint64_t li
     }
     return error;
 }
-void recovery_receiver_controller::dropped_turn()noexcept {std::lock_guard lock(state_->mutex);state_->scheduled=false;}
+void recovery_receiver_controller::dropped_turn(const void* scheduled_token)noexcept {
+    std::lock_guard lock(state_->mutex);
+    if(state_->scheduled_token!=scheduled_token)return;
+    state_->scheduled_token=nullptr;state_->scheduled=false;state_->wake_pending=true;
+    // A failed/dropped dispatch does not spin or renew a deadline. A later
+    // actual event may try again; no scheduled flag may remain stranded.
+}
 void recovery_receiver_controller::wake(const std::shared_ptr<recovery_receiver_route>& route) {
-    if(route->state_->retired.load())return;
-    {std::lock_guard lock(state_->mutex);if(state_->scheduled||state_->running)return;state_->scheduled=true;}
-    struct scheduled {std::shared_ptr<recovery_receiver_controller> owner;std::atomic<bool> invoked{false};~scheduled(){if(!invoked.load())owner->dropped_turn();}};
+    if(state_->creator!=controller_process()||route->state_->retired.load())return;
+    {std::lock_guard lock(state_->mutex);
+        if(state_->deletion_retired)return;
+        if(state_->running){state_->wake_pending=true;return;}
+        if(state_->scheduled)return;}
+    struct scheduled {
+        std::shared_ptr<recovery_receiver_controller> owner;
+        std::atomic<bool> armed{false},invoked{false};
+        ~scheduled(){if(armed.load()&&!invoked.load())owner->dropped_turn(this);}
+    };
+    // Allocate before scheduled publication. Failure here leaves the next real
+    // wake eligible; neither a token allocation nor its absence is authority.
+    const auto probe=state_->probe;
+    std::shared_ptr<void> allocation_scope;
+    if(probe&&probe->owner==route->state_->owner.lock().get()&&probe->scope)
+        allocation_scope=probe->scope("schedule-token-before-allocation");
     auto held=std::make_shared<scheduled>();held->owner=shared_from_this();
-    try {route->state_->dispatch->invoke([held]{if(held->invoked.exchange(true))return;held->owner->turn();});}
-    catch(...){dropped_turn();throw;}
+    {std::lock_guard lock(state_->mutex);
+        if(state_->deletion_retired)return;
+        if(state_->running){state_->wake_pending=true;return;}
+        if(state_->scheduled)return;
+        state_->scheduled=true;state_->scheduled_token=held.get();held->armed.store(true);}
+    try {
+#ifndef __EMSCRIPTEN__
+        state_->executor->invoke([held]{if(held->invoked.exchange(true))return;held->owner->turn();});
+#else
+        route->state_->dispatch->invoke([held]{if(held->invoked.exchange(true))return;held->owner->turn();});
+#endif
+    }
+    catch(...){if(!held->invoked.exchange(true))dropped_turn(held.get());throw;}
+}
+void recovery_receiver_route::post(notification kind,std::exception_ptr failure) {
+    if(!creator_current()||state_->retired.load())return;
+    const auto generation=state_->lifetime->dispatch_generation();
+    if(!state_->lifetime->current(generation))return;
+    std::exception_ptr retired;
+    std::shared_ptr<const std::function<void()>> wake;
+    {std::lock_guard lock(state_->notification_mutex);
+        if(state_->notification_generation!=generation){
+            retired=std::move(state_->notification_error);state_->notification_kinds=0;state_->notification_generation=generation;}
+        state_->notification_kinds|=static_cast<unsigned>(kind);
+        if(failure&&!state_->notification_error)state_->notification_error=std::move(failure);
+        wake=state_->wake_notifications;
+    }
+    // Closed native metadata wake only. The private controller lane never
+    // invokes an original scheduler that is allowed to execute user work inline.
+    if(wake)(*wake)();
+}
+void recovery_receiver_route::drain_notifications(){
+    if(!creator_current()||state_->retired.load())return;
+    // One original-scheduler handoff per route, independent of notification
+    // arrival/tick count. A blocked original worker cannot accumulate hints.
+    {std::lock_guard lock(state_->notification_mutex);
+        if(!state_->notifications_bound||state_->notification_queued||!state_->notification_kinds)return;}
+    struct handoff {
+        struct payload {
+            std::shared_ptr<recovery_receiver_route::state> metadata;
+            std::shared_ptr<recovery_receiver_route> route;
+            uint64_t serial=0,generation=0;unsigned kinds=0;
+            std::atomic<bool> invoked{false};std::exception_ptr error;
+        };
+        const uint64_t creator=controller_process();payload* held=nullptr;
+        explicit handoff(std::shared_ptr<recovery_receiver_route> route)
+            :held(new payload{route->state_,std::move(route)}){}
+        bool current()const noexcept{return creator==controller_process();}
+        ~handoff(){
+            // Arbitrary callback/capture ending may occur on another process.
+            // Abandon the whole Native-bearing capsule before inherited leaves
+            // or shared/callback release. The outer wrapper owns only DATA.
+            if(!current()){held=nullptr;return;}
+            auto* ended=held;held=nullptr;if(!ended)return;
+            ended->error={};if(!current())return;
+            ended->route.reset();if(!current())return;
+            // Keep the exact identity reserved through actual user callback
+            // AND captured route/error final release, not callback entry.
+            if(ended->serial){std::lock_guard lock(ended->metadata->notification_mutex);
+                if(ended->metadata->notification_queued==ended->serial)ended->metadata->notification_queued=0;}
+            delete ended; // all remaining closed DATA release is off leaf
+        }
+    };
+    auto pending=std::make_shared<handoff>(shared_from_this());
+    bool exhausted=false;
+    {std::lock_guard lock(state_->notification_mutex);
+        if(!state_->notifications_bound||state_->notification_queued||!state_->notification_kinds)return;
+        exhausted=state_->notification_serial==UINT64_MAX;
+        if(!exhausted){pending->held->serial=++state_->notification_serial;state_->notification_queued=pending->held->serial;}}
+    require(!exhausted,"controller notification serial exhausted"); // exception construction off leaf
+    try{state_->dispatch->invoke([pending]{
+        if(!pending->current())return;
+        auto& actual=*pending->held;if(actual.invoked.exchange(true))return;
+        const auto& held=actual.route;
+        {std::lock_guard lock(actual.metadata->notification_mutex);
+            if(actual.metadata->notification_queued!=actual.serial)return;
+            actual.kinds=actual.metadata->notification_kinds;actual.metadata->notification_kinds=0;
+            actual.generation=actual.metadata->notification_generation;actual.error=std::move(actual.metadata->notification_error);}
+        if(held->state_->retired.load()||!held->state_->lifetime->current(actual.generation))return;
+        for(const auto kind:{notification::renew,notification::resumed,notification::reconcile,notification::error}){
+            if(!(actual.kinds&static_cast<unsigned>(kind)))continue;
+            if(!pending->current()||held->state_->retired.load()||!held->state_->lifetime->current(actual.generation))return;
+            try{switch(kind){
+                case notification::resumed:if(held->state_->resumed)held->state_->resumed();break;
+                case notification::renew:if(held->state_->renew)held->state_->renew();break;
+                case notification::reconcile:if(held->state_->reconcile)held->state_->reconcile();break;
+                case notification::error:if(held->state_->error)held->state_->error(actual.error);break;
+            }}catch(...){if(!pending->current())return;if(kind!=notification::error)held->controller_->scheduling_failed(std::current_exception());}
+        }
+    });}catch(...){
+        if(!creator_current())return;
+        // A throwing scheduler may already have retained/invoked its payload.
+        // Only actual last capture release retires this handoff identity; this
+        // catch cannot clear it or allow overlapping work on a custom scheduler.
+        controller_->scheduling_failed(std::current_exception());
+    }
+}
+void recovery_receiver_controller::scheduling_failed(std::exception_ptr error)noexcept {
+    if(state_->creator!=controller_process())return;
+    recovery_writer_access::controller_admission_intent::retired_custody retired;
+    state::install_target_ptr retired_install;
+    std::array<std::weak_ptr<recovery_receiver_route>,128> routes;
+    {std::lock_guard lock(state_->mutex);
+        if(!state_->failure)state_->failure=error;
+        retired_install=std::move(state_->admission_install);
+        if(!state_->running){retired=state_->admission_intent.retire();state_->admission_wait={};}
+        else state_->admission_intent_revoked=true;
+        std::copy(state_->routes.begin(),state_->routes.end(),routes.begin());}
+    retired.reset();
+#ifndef __EMSCRIPTEN__
+    state_->executor->cancel_retry();
+#endif
+    for(const auto& weak:routes)if(auto route=weak.lock())try{route->post(recovery_receiver_route::notification::error,error);}catch(...){}
+}
+void recovery_receiver_controller::arm_admission_retry(int64_t due) {
+#ifndef __EMSCRIPTEN__
+    auto weak=weak_from_this();
+    state_->executor->retry_at(std::chrono::steady_clock::time_point(std::chrono::milliseconds(due)),[weak]{
+        const auto controller=weak.lock();if(!controller||controller->state_->creator!=controller_process())return;
+        std::array<std::weak_ptr<recovery_receiver_route>,128> routes;
+        {std::lock_guard lock(controller->state_->mutex);
+            std::copy(controller->state_->routes.begin(),controller->state_->routes.end(),routes.begin());}
+        for(const auto& entry:routes)if(auto route=entry.lock())if(!route->state_->retired.load()){
+            try{controller->wake(route);}catch(...){controller->scheduling_failed(std::current_exception());}return;
+        }
+    });
+#else
+    (void)due; // Continuous browser routes already refuse before construction.
+#endif
+}
+void recovery_receiver_controller::state::wake_released(recovery_receiver_controller& controller)noexcept {
+    // Custom schedulers may invoke inline. Nested settlement keeps demand
+    // pending for this outer constant-stack drain, never another recursive turn.
+    static thread_local bool handing_off=false;
+    if(handing_off)return;
+    struct handoff_scope {bool& active;explicit handoff_scope(bool& v):active(v){active=true;}~handoff_scope(){active=false;}} hold(handing_off);
+    for(unsigned quantum=0;quantum<8;++quantum){
+        // physical_routes is validated <=128. Copy only registered weak
+        // identities under the leaf, not source owners or callback work.
+        std::array<std::weak_ptr<recovery_receiver_route>,128> next;
+        {std::lock_guard lock(mutex);
+            if(deletion_retired||running||scheduled||!wake_pending)return;
+            wake_pending=false;std::copy(routes.begin(),routes.end(),next.begin());}
+        bool handed_off=false;
+        for(const auto& weak:next)if(auto route=weak.lock()){
+            if(route->state_->retired.load())continue;
+            try{controller.wake(route);}catch(...){
+                // The event was removed from the pending bit before this
+                // attempt. Even allocation before token publication can fail.
+                // Retain it, without recursive retry or a renewed deadline.
+                {std::lock_guard lock(mutex);wake_pending=true;}
+                try{if(probe&&probe->owner==route->state_->owner.lock().get()&&probe->observed)
+                    probe->observed("wake-handoff-failed-pending");}catch(...){}
+                return;
+            }
+            // A racing retirement cannot select an inherited source. Another
+            // actual live registration may carry the coalesced wake instead.
+            if(!route->state_->retired.load()){handed_off=true;break;}
+        }
+        if(!handed_off)return;
+        // An asynchronous dispatch leaves scheduled/running set, so the next
+        // check returns. An inline dispatch may have received one real event.
+    }
+    // Any demand beyond this fixed quantum remains pending. Only another real
+    // event (including the unchanged native pacer) may continue it; no busy
+    // loop, new timer, deadline renewal, SQL permit or source authority exists.
 }
 bool recovery_receiver_route::receive(const platform_transport_callbacks& endpoint,uint64_t lifecycle,const transport_message& message) {
     const std::string_view raw(reinterpret_cast<const char*>(message.data.data()),message.data.size());
@@ -696,21 +1139,98 @@ bool recovery_receiver_route::receive(const platform_transport_callbacks& endpoi
     }
     {std::lock_guard lock(coordinator.mutex);if(coordinator.outstanding!=pending)return true;
         reply->ready=true;}
-    wake();return true;
+    // Copies only actual successful publication, before the existing wake.
+    // No grant, source lookup, SQL or callback executes under the leaf.
+    const auto probe=coordinator.probe;
+    if(probe&&probe->owner==state_->owner.lock().get()&&probe->observed)
+        probe->observed("physical-reply-ready-before-wake");
+    wake();
+    if(probe&&probe->owner==state_->owner.lock().get()&&probe->observed)
+        probe->observed("physical-reply-wake-returned");
+    return true;
 }
 void recovery_receiver_controller::turn() {
     auto& runtime=*state_;
-    {std::lock_guard lock(runtime.mutex);runtime.scheduled=false;if(runtime.running)return;runtime.running=true;}
-    struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;
+    {std::lock_guard lock(runtime.mutex);runtime.scheduled=false;runtime.scheduled_token=nullptr;
+        if(runtime.deletion_retired)return;
+        if(runtime.running){runtime.wake_pending=true;return;}
+        runtime.running=true;runtime.wake_pending=false;}
+    // Existing private restriction/observation seam only. Its holder precedes
+    // settlement so the observed turn includes settlement's inline successors.
+    std::shared_ptr<void> turn_scope;
+    std::optional<recovery_writer_access::controller_admission_intent::turn> intent_turn;
+    using notification=recovery_receiver_route::notification;
+    struct settlement {recovery_receiver_controller& controller;recovery_receiver_controller::state& value;std::function<void()> after;
+        struct notice {const recovery_receiver_route* identity=nullptr;std::weak_ptr<recovery_receiver_route> route;unsigned kinds=0;std::exception_ptr error;};
+        std::array<notice,128> notices{};size_t notice_count=0;
+        void notify(const std::shared_ptr<recovery_receiver_route>& route,notification kind,std::exception_ptr error={}){
+            size_t slot=0;while(slot<notice_count&&notices[slot].identity!=route.get())++slot;
+            require(slot<notices.size(),"controller notification route capacity");
+            auto& item=notices[slot];if(slot==notice_count){++notice_count;item.identity=route.get();item.route=route;}
+            item.kinds|=static_cast<unsigned>(kind);if(error&&!item.error)item.error=std::move(error);
+        }
         // Admission-retry composition consumes this flag. Merely disposing a
         // late frame (or waiting for its copy) is not recovery progress and
         // must not reset an already-running admission deadline/allowance.
         bool keep_admission_wait=false;
-        ~settlement(){{std::lock_guard lock(value.mutex);value.running=false;if(!keep_admission_wait)value.admission_wait={};}if(after)try{after();}catch(...) {}}} settle{runtime,{}};
+        ~settlement(){
+            recovery_writer_access::controller_admission_intent::retired_custody retired_writer;
+            state::install_target_ptr retired_install;
+            bool cancel_retry=false,episode_exhausted=false;int64_t retry_due=0;
+            {std::lock_guard lock(value.mutex);
+                // Retire the exact old hint before publishing !running. A
+                // concurrent wake must not let this destructor erase a new
+                // turn's intent; final writer release stays off the leaf.
+                const bool revoked=value.deletion_retired||value.admission_intent_revoked||
+                    (value.admission_install&&value.admission_install->id.revision!=value.revision);
+                const auto stamp=now();
+                episode_exhausted=value.admission_install&&!revoked&&
+                    (stamp>=value.admission_wait.deadline||
+                     (value.admission_wait.attempts>=admission_retry_attempts&&stamp>=value.admission_wait.next_due));
+                const bool keep=(keep_admission_wait||bool(value.admission_install))&&!revoked&&!episode_exhausted;
+                if(!keep){
+                    value.admission_wait={};retired_install=std::move(value.admission_install);
+                    retired_writer=value.admission_intent.retire();cancel_retry=true;
+                }else if(value.admission_install){
+                    // A consumed timer/quantum boundary cannot strand a target
+                    // behind the original route FIFO. Preserve future due time;
+                    // otherwise use one fixed tick within the original episode.
+                    if(value.admission_wait.next_due<=stamp)
+                        value.admission_wait.next_due=std::min(value.admission_wait.deadline,stamp+admission_retry_tick_ms);
+                    retry_due=value.admission_wait.next_due;
+                }
+                value.admission_intent_revoked=false;
+                value.running=false;
+            }
+            retired_writer.reset();retired_install.reset(); // no final proof/writer decrement on the coordinator leaf
+#ifndef __EMSCRIPTEN__
+            if(cancel_retry)value.executor->cancel_retry();
+#endif
+            if(episode_exhausted){
+                try{controller.scheduling_failed(std::make_exception_ptr(db_error("controller admission retry budget exhausted; gate remains closed")));}
+                catch(...){controller.scheduling_failed(std::current_exception());}
+            }else if(retry_due){
+                try{controller.arm_admission_retry(retry_due);}
+                catch(...){controller.scheduling_failed(std::current_exception());}
+            }
+            if(after)try{after();}catch(...){controller.scheduling_failed(std::current_exception());}
+            // This is after the real turn relinquishes its denial cell and
+            // running flag. Inline custom route schedulers cannot occupy the
+            // private controller lane before its required install can retire.
+            for(size_t n=0;n<notice_count;++n)if(auto route=notices[n].route.lock())
+                for(const auto kind:{notification::renew,notification::resumed,notification::reconcile,notification::error})
+                    if(notices[n].kinds&static_cast<unsigned>(kind))
+                        try{route->post(kind,notices[n].error);}catch(...){controller.scheduling_failed(std::current_exception());}
+            value.wake_released(controller);
+        }} settle{*this,runtime,{}};
     std::weak_ptr<lattice_db> observed_owner;
     int64_t admission_deadline=now()+admission_retry_window_ms;
     uint64_t admission_revision=0;
+    std::optional<state::install_target_id> attempted_install;
     try {
+        // Capture failure remains in the existing retained failure/settlement
+        // path. The optional holder still outlives settlement and its tails.
+        intent_turn.emplace(runtime.admission_intent);
         // Drain before idle/failure/cohort/source-count returns: even a dead
         // route's payload must leave the shared byte/slot budget. No SQL or
         // lifecycle proof publication is permitted in this bounded lane.
@@ -785,7 +1305,7 @@ void recovery_receiver_controller::turn() {
             if(route->state_->retired.load())continue;
             auto owner=route->state_->owner.lock();if(!owner||owner->is_closed())continue;
             const auto view=route->state_->source->recovery_current();if(!view) {
-                if(route->state_->source->recovery_expired()&&!route->state_->renewal_requested.exchange(true)&&route->state_->renew)route->state_->renew();
+                if(route->state_->source->recovery_expired()&&!route->state_->renewal_requested.exchange(true)&&route->state_->renew)settle.notify(route,notification::renew);
                 continue;
             }
             route->state_->renewal_requested.store(false);
@@ -804,6 +1324,8 @@ void recovery_receiver_controller::turn() {
         if(connected_routes.size()!=runtime.policy.contributions.size())return;
         auto owner=connected_routes.begin()->second.route->state_->owner.lock();if(!owner||owner->is_closed())return;
         observed_owner=owner;
+        if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope)
+            turn_scope=runtime.probe->scope("selected-controller-turn-through-settlement");
         std::string common_domain;
         const auto common_receipt_binding=connected_routes.begin()->second.description.value("receiptBinding",json{});
         for(const auto& [channel,c]:connected_routes) {
@@ -835,19 +1357,24 @@ void recovery_receiver_controller::turn() {
         }
         for(const auto& [_,c]:connected_routes)
             admission_deadline=std::min(admission_deadline,now()+c.route->state_->source->recovery_remaining(c.view));
-        bool reconciliation_waiting=false;
+        bool reconciliation_waiting=false,retire_admission_intent=false;
+        state::install_target_ptr retired_revision_install;
         {std::lock_guard lock(runtime.mutex);reconciliation_waiting=static_cast<bool>(runtime.reconciliation);
             if(!reconciliation_waiting&&(runtime.failure||(runtime.idle&&!runtime.demand&&!runtime.outstanding)))return;
             admission_revision=runtime.revision;
             if(runtime.outstanding)admission_deadline=std::min(admission_deadline,runtime.outstanding->deadline);
             auto& wait=runtime.admission_wait;
-            if(wait.attempts&&wait.revision!=runtime.revision)wait={};
+            if(wait.attempts&&wait.revision!=runtime.revision){
+                wait={};retired_revision_install=std::move(runtime.admission_install);retire_admission_intent=true;
+            }
             if(wait.attempts){
                 wait.deadline=std::min(wait.deadline,admission_deadline);
                 require(now()<wait.deadline&&wait.attempts<admission_retry_attempts,"controller admission retry budget exhausted; gate remains closed");
                 if(now()<wait.next_due){settle.keep_admission_wait=true;return;}
             }}
-        if(reconciliation_waiting){settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;}
+        if(retire_admission_intent)runtime.admission_intent.release();
+        retired_revision_install.reset(); // old proof custody leaves after the coordinator leaf
+        if(reconciliation_waiting){for(const auto& route:routes)settle.notify(route,notification::reconcile);return;}
         const auto observe=[&](const char* stage){if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)runtime.probe->observed(stage);};
         // No new Q/frozen/journal graph may coexist with a retired cohort.
         // The actual running/current-controller reservation spans this whole
@@ -860,15 +1387,41 @@ void recovery_receiver_controller::turn() {
         };
         const auto probe_scope=[&](const char* stage)->std::shared_ptr<void>{return runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope?runtime.probe->scope(stage):nullptr;};
         const auto live=[&]{for(const auto& [_,c]:connected_routes)require(!c.route->state_->retired.load()&&c.route->state_->source->recovery_live(c.view),"controller authenticated source retired during owned operation");};
-        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);known(result);settle.keep_admission_wait=false;};
+        const auto finish_install_target=[&](const state::install_target_id& completed){
+            state::install_target_ptr retired_install;
+            recovery_writer_access::controller_admission_intent::retired_custody retired_writer;
+            bool cancel_retry=false;
+            {std::lock_guard lock(runtime.mutex);
+                if(runtime.admission_install){
+                    require(runtime.admission_install->id==completed,"controller completed a different admission install target");
+                    retired_install=std::move(runtime.admission_install);runtime.admission_wait={};
+                    retired_writer=runtime.admission_intent.retire();cancel_retry=true;
+                }
+                settle.keep_admission_wait=false;
+            }
+            retired_writer.reset();retired_install.reset();
+#ifndef __EMSCRIPTEN__
+            if(cancel_retry)runtime.executor->cancel_retry();
+#endif
+        };
+        const auto owned=[&](const std::function<void(database&)>& body,const state::install_target_id* install=nullptr){
+            attempted_install=install?std::optional<state::install_target_id>{*install}:std::nullopt;
+            const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();recovery_cohort_progress_observation::body_entered();body(db);live();},true);
+            recovery_cohort_progress_observation::returned(result);known(result);
+            // The Native unit has returned with known COMMIT. Intermediate
+            // success must not discharge a different, deferred install.
+            if(install)finish_install_target(*install);
+            else {std::lock_guard lock(runtime.mutex);settle.keep_admission_wait=bool(runtime.admission_install);}
+        };
         const auto owned_completed_disposal=[&](const std::function<void(database&)>& body){
+            attempted_install.reset();
             const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);
             try {known(result);}
             catch(const controller_admission_wait&){throw;}
             catch(const controller_stale_turn_cancelled&){throw;}
             catch(const controller_generation_unsettled&){throw;}
             catch(...){throw controller_disposal_refused(std::current_exception(),result);}
-            settle.keep_admission_wait=false;
+            {std::lock_guard lock(runtime.mutex);settle.keep_admission_wait=bool(runtime.admission_install);}
         };
         // Read and validate the COMPLETE local precursor before any remote
         // disposal. The installed branch deliberately precedes old context
@@ -934,8 +1487,20 @@ void recovery_receiver_controller::turn() {
             int64_t physical=0,int64_t phase=0,int64_t barrier=0,int64_t attempt=0,uint64_t revision=0,
             std::optional<state::disposal> completed={}) {
             auto outgoing=std::make_shared<state::pending>();
-            {std::lock_guard lock(runtime.mutex);if(runtime.budget->bytes.load()==0&&runtime.budget->slots.load()==0)outgoing->reservation=runtime.reserve_locked(8388608,false);}
-            if(!outgoing->reservation){settle.keep_admission_wait=true;return;}
+            {std::lock_guard lock(runtime.mutex);
+                // Subscribe BEFORE inspecting actual credit. A concurrent final
+                // callback release either sees this bit or precedes our zero check.
+                runtime.budget->capacity_wait.store(true);
+                if(runtime.budget->bytes.load()==0&&runtime.budget->slots.load()==0){
+                    runtime.budget->capacity_wait.store(false);
+                    outgoing->reservation=runtime.reserve_locked(8388608,false);
+                }}
+            if(!outgoing->reservation){
+                settle.keep_admission_wait=true;
+                if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->response_capacity_wait)
+                    runtime.probe->response_capacity_wait(); // passive DATA, off leaf
+                return;
+            }
             outgoing->route=c.route;outgoing->view=c.view;outgoing->request_id=uuid_t::generate().to_string();outgoing->operation=op;outgoing->index=index;outgoing->completed_disposal=std::move(completed);
             {std::lock_guard lock(runtime.mutex);outgoing->terminal_inbox=terminal_profile(c.description)||outgoing->completed_disposal.has_value()||c.route->state_->issued_discard_view.lock()==c.view.value;}
             outgoing->proof_physical=physical;outgoing->proof_phase=phase;outgoing->proof_barrier=barrier;outgoing->proof_attempt=attempt;outgoing->proof_revision=revision;
@@ -950,11 +1515,21 @@ void recovery_receiver_controller::turn() {
                 // off. Throwing unwinds the leaf before its final owner drops.
                 if(outgoing->completed_disposal&&runtime.revision!=outgoing->completed_disposal->key.revision)
                     throw controller_stale_turn_cancelled(outgoing->completed_disposal->key.revision,"controller disposal handoff generation changed");
-                late_pending=runtime.budget->slots.load()!=0;if(!late_pending)runtime.outstanding=outgoing;}
-            if(late_pending){settle.keep_admission_wait=true;observe("late-control-handoff-deferred");return;}
+                runtime.budget->capacity_wait.store(true);
+                late_pending=runtime.budget->slots.load()!=0;
+                if(!late_pending){runtime.budget->capacity_wait.store(false);runtime.outstanding=outgoing;}}
+            if(late_pending){
+                settle.keep_admission_wait=true;
+                if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->response_capacity_wait)
+                    runtime.probe->response_capacity_wait();
+                observe("late-control-handoff-deferred");return;
+            }
             auto message=transport_message::from_string(outgoing->request_bytes);message.msg_type=transport_message::type::binary;
             require(c.route->state_->source->recovery_send(c.view,*c.route->state_->transport,message),"controller final physical handoff refused");
             if(outgoing->completed_disposal){std::lock_guard lock(runtime.mutex);c.route->state_->issued_discard_view=c.view.value;c.route->state_->late_control_view=c.view.value;}
+            // Passive private probe only, off coordinator/SQL/transport leaves.
+            // The actual pending request has been published and handed off.
+            observe("outgoing-handed-off-before-turn-settlement");
         };
         // Socket callbacks reserve at most two bounded replies. Only this worker
         // parses it or touches SQL. Claiming the reply keeps its full byte
@@ -1186,6 +1761,13 @@ void recovery_receiver_controller::turn() {
             int64_t phase=0,barrier=0,attempt=0,physical_incarnation=0;uint64_t demand_revision;
             {std::lock_guard lock(runtime.mutex);demand_revision=runtime.revision;}
             owned([&](database& db){const auto rows=db.query("SELECT CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(phase)='integer' THEN phase END AS phase,CASE WHEN typeof(barrier)='integer' THEN barrier END AS barrier,CASE WHEN typeof(attempt)='integer' THEN attempt END AS attempt FROM main._lattice_producer_continuity WHERE id=1 LIMIT 2");require(rows.size()==1,"controller physical phase missing");phase=integer(rows[0],"phase");barrier=integer(rows[0],"barrier");attempt=integer(rows[0],"attempt");physical_incarnation=integer(rows[0],"incarnation");});
+            {std::lock_guard lock(runtime.mutex);if(runtime.admission_install){const auto& target=runtime.admission_install->id;
+                require(target.revision==demand_revision&&target.physical==physical_incarnation&&phase==2&&
+                    target.barrier==barrier&&target.attempt==attempt&&target.frozen==runtime.frozen.get(),
+                    "controller deferred install target changed without cancellation or revision");}}
+            try{if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->phase_committed)
+                runtime.probe->phase_committed();}catch(...){} // passive DATA, off Native/coordinator leaves
+
             for(auto at=runtime.disposals.begin();at!=runtime.disposals.end();) {
                 const auto& key=at->second.key;
                 if(key.physical!=physical_incarnation||key.phase!=phase||key.barrier!=barrier||key.attempt!=attempt||key.revision!=demand_revision)at=runtime.disposals.erase(at);
@@ -1261,26 +1843,44 @@ void recovery_receiver_controller::turn() {
                             "controller restricted restart lacks exact canceled receiver/journal");
                         const auto& actual=connected_routes.at(c.profile.binding.channel);require(row->domain==common_domain&&compatible(*row,actual),"controller restricted restart source changed");
                         auto snapshot=journal.snapshot_for_reconciliation(scope->address);const auto q=cr::decode(row->request_frame,runtime.caps.codec);
-                        std::set<std::string> requested;for(const auto& item:std::get<cr::request>(q.body).receipts)requested.insert(canonical_writer_adapter::uuid_key(item.original_id));
+                        // The retained projection is indexed by the exact Q receipt order.
                         recovery_reconciliation_descriptor::contribution contribution{*row,std::move(snapshot),{},actual.route,actual.route->state_->source,actual.view};
                         require(compatible(*row,actual),"controller descriptor source compatibility changed");
                         if(row->source_context!=source_context(actual.description))contribution.compatibility=runtime.predecessors.at(row->journal.channel);
-                        for(const auto& entry:contribution.journal.entries)if(entry.stage==recovery_obligation_stage::open&&!entry.acknowledged&&requested.count(entry.canonical_original_id))contribution.unknown_originals.push_back(entry.canonical_original_id);
+                        if(row->receipt_decisions=="0")descriptor->dispositions_unavailable_=true;
+                        else {
+                            const auto& decisions=row->receipt_decisions;const auto& receipts=std::get<cr::request>(q.body).receipts;
+                            require(receipts.size()<=recovery_request_store::decision_entries&&decisions.size()==65+2*receipts.size()&&!decisions.empty()&&decisions[0]=='1',"controller canceled receipt decisions missing or count differs");
+                            std::set<std::string> selected;
+                            for(size_t i=0;i<receipts.size();++i)if(decisions[66+2*i]=='1')selected.insert(canonical_writer_adapter::uuid_key(receipts[i].original_id));
+                            for(const auto& entry:contribution.journal.entries)if(selected.count(entry.canonical_original_id)){
+                                require(entry.stage==recovery_obligation_stage::open,"controller retained retry original already settled");contribution.unknown_originals.push_back(entry.canonical_original_id);}
+                        }
                         descriptor->contributions_.push_back(std::move(contribution));
                     }
                 });
+                // Migrated unavailable knowledge permits only no-send refreeze.
+                // Missing/corrupt v2 data never selects this migration path.
+                if(descriptor->dispositions_unavailable_)for(const auto& part:descriptor->contributions_)
+                    require(part.framing.receipt_decisions=="0"&&part.unknown_originals.empty(),"controller mixed migrated and verified receipt decisions");
+                if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->reconciliation_prepublication)
+                    runtime.probe->reconciliation_prepublication(); // No Native/coordinator/test leaf is held.
                 {std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller restricted restart generation changed");
-                    runtime.reconciled_external_revision=runtime.external_revision;
+                    // An unavailable legacy projection authorizes no restricted
+                    // send. Its local no-send refreeze must not spend the one
+                    // actual UNKNOWN pass of the fresh, reserved successor Q.
+                    if(!descriptor->dispositions_unavailable_)runtime.reconciled_external_revision=runtime.external_revision;
                     descriptor->external_revision_=runtime.external_revision;descriptor->delivery_retry_revision_=runtime.delivery_retry_revision;
                     // Only the fresh phase-2 UNKNOWN decision consumes retry
                     // demand. Reconstruction cannot discard an earlier expiry.
-                    runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;
+                    runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");for(const auto& route:routes)settle.notify(route,notification::reconcile);return;
             }
             if(phase==1) {auto status=recovery_continuous_producer::inspect_impl(owner,true);known(status.settlement);require(status.barrier.has_value(),"controller closed phase lacks actual barrier");
                 auto frozen=recovery_continuous_producer::finish_impl(*status.barrier,true);if(frozen.waiting)return;known(frozen.settlement);
                 if(runtime.terminal_successor_attempt==attempt)observe("terminal-refreeze-committed");continue;}
             if(phase==3) {
                 auto scope_probe=probe_scope("resume");
+                recovery_cohort_progress_observation::before(recovery_cohort_progress_observation::stage::resume);
                 owned([&](database& db){
                     recovery_request_store requests(owner);receive_install_store receiver(owner,runtime.caps.install.installations);
                     recovery_obligation_store journals(owner,runtime.caps.obligations,runtime.caps.install.installations);
@@ -1300,11 +1900,12 @@ void recovery_receiver_controller::turn() {
                     }
                     recovery_continuous_producer::controller_resume_owned(*this,owner,barrier,attempt);
                 });
+                recovery_cohort_progress_observation::completed();
                 scope_probe.reset();observe("resume-committed");
                 recovery_continuous_producer::controller_publish_resume(*this,owner,barrier,attempt);
                 runtime.frozen.reset();runtime.framing_committed=false;runtime.predecessors.clear();runtime.idle=true;
                 {std::lock_guard lock(runtime.mutex);if(runtime.revision==demand_revision)runtime.demand=false;runtime.failure={};runtime.awaiting_delivery_retry=false;}
-                for(const auto& route:routes){route->state_->blocked.store(false,std::memory_order_release);if(route->state_->resumed)route->state_->resumed();}return;
+                for(const auto& route:routes){route->state_->blocked.store(false,std::memory_order_release);settle.notify(route,notification::resumed);}return;
             }
             require(phase==2,"controller unsupported durable phase");
             if(!runtime.frozen||runtime.frozen_attempt!=attempt||runtime.frozen_barrier!=barrier) {
@@ -1397,12 +1998,30 @@ void recovery_receiver_controller::turn() {
                     const auto& part=connected_routes.at(c.profile.binding.channel);const auto& d=part.description;require(compatible(*row,part)&&row->domain==common_domain,"controller retained source context changed");const auto route=decimal(d,"routeGeneration");
                     const auto q=cr::decode(row->request_frame,runtime.caps.codec);
                     if(row->route!=static_cast<int64_t>(route)){
-                        if(!row->manifest_frame.empty()){const auto m=cr::decode(row->manifest_frame,runtime.caps.codec);stages.rebind(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route,route);}
-                        requests.rebind(*row,route);row->route=route;
+                        bool migrated_local_cancel=false;
+                        if(!row->manifest_frame.empty()){
+                            const auto m=cr::decode(row->manifest_frame,runtime.caps.codec);
+                            // A real v1 row has no receipt projection/reservation.
+                            // No unavailable legacy receipt is classified here.
+                            // Audit its exact addressed stage but retain even
+                            // incomplete reconstructible bytes on their durable
+                            // route solely for local no-send cancellation.
+                            // No new frame intake or route authority is issued.
+                            if(row->receipt_decisions=="0"){
+                                (void)stages.resume(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route);
+                                migrated_local_cancel=true;
+                            }
+                            if(!migrated_local_cancel)stages.rebind(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route,route);
+                        }
+                        if(migrated_local_cancel)observe("migrated-staged-local-cancel");
+                        else {requests.rebind(*row,route);row->route=route;}
                     }
                     if(row->manifest_frame.empty()){all_complete=false;if(!selected){selected=std::move(row);index=0;}continue;}
                     const auto m=cr::decode(row->manifest_frame,runtime.caps.codec);const auto progress=stages.resume(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route);
-                    if(!progress.content_verified){all_complete=false;if(!selected){selected=std::move(row);index=1+progress.state.next_content_page+progress.state.next_receipt_page;}}
+                    // Typed migrated-unavailable rows need only an audited
+                    // exact manifest/stage for local cancellation. Ordinary
+                    // rows still need complete verification before disposition.
+                    if(!progress.content_verified&&row->receipt_decisions!="0"){all_complete=false;if(!selected){selected=std::move(row);index=1+progress.state.next_content_page+progress.state.next_receipt_page;}}
                 }});
             if(runtime.terminal_rearm) {
                 // One terminal contribution closes the entire frozen cohort.
@@ -1477,6 +2096,7 @@ void recovery_receiver_controller::turn() {
                         {std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller terminal cancellation demand changed");}
                         recovery_continuous_producer::controller_restart_terminal_owned(*this,owner,physical_incarnation,barrier,attempt);
                     });
+                    finish_install_target({demand_revision,physical_incarnation,barrier,attempt,proof.get()});
                     scope_probe.reset();observe("terminal-cancel-committed");
                     recovery_continuous_producer::controller_publish_reconcile(*this,owner,barrier+1,attempt+1);
                     runtime.terminal_successor_attempt=attempt+1;
@@ -1487,9 +2107,11 @@ void recovery_receiver_controller::turn() {
             if(all_complete) {
                 auto descriptor=std::shared_ptr<recovery_reconciliation_descriptor>(new recovery_reconciliation_descriptor);
                 if(!reserve_cohort(descriptor))return;
+                recovery_cohort_progress_observation::reserved();
                 descriptor->owner_=owner;descriptor->limits_=runtime.caps;descriptor->controller_=shared_from_this();descriptor->frozen_=proof;descriptor->controller_revision_=demand_revision;
                 descriptor->physical_incarnation_=physical_incarnation;descriptor->barrier_=barrier;descriptor->attempt_=attempt;descriptor->phase_=2;
                 bool unknown=false;const std::set<std::string> unsent(proof->canonical_originals().begin(),proof->canonical_originals().end());
+                recovery_cohort_progress_observation::before(recovery_cohort_progress_observation::stage::classification);
                 owned([&](database&){recovery_continuous_producer::verify_for_owned_write(*proof);recovery_request_store requests(owner);
                     canonical_range_staging stages(owner,runtime.caps.install.installations,runtime.caps.codec,runtime.caps.staging);
                     for(const auto& snapshot:proof->frozen_journals()){
@@ -1499,25 +2121,56 @@ void recovery_receiver_controller::turn() {
                         recovery_reconciliation_descriptor::contribution contribution{*row,snapshot,{},actual.route,actual.route->state_->source,actual.view};
                         require(compatible(*row,actual),"controller descriptor source compatibility changed");
                         if(row->source_context!=source_context(actual.description))contribution.compatibility=runtime.predecessors.at(row->journal.channel);
-                        const auto verified=stages.resume(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route);require(verified.content_verified,"controller pending stage unverified");
-                        std::set<std::string> unknown_ids;
+                        const auto verified=stages.resume(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route);
+                        require(verified.content_verified||row->receipt_decisions=="0","controller pending stage unverified");
+                        if(row->receipt_decisions=="0"){
+                            // This Q predates future-projection reservation. Do not
+                            // classify it as UNKNOWN or issue restricted exports:
+                            // cancel with explicit unavailable history, refreeze,
+                            // and reacquire evidence using a new reserved Q.
+                            descriptor->dispositions_unavailable_=true;unknown=true;
+                            contribution.receipt_decisions="0";
+                            descriptor->contributions_.push_back(std::move(contribution));continue;
+                        }
+                        // Receipt knowledge and retry eligibility are separate from
+                        // the need to cancel. A genuine UNKNOWN may acquire its
+                        // first claim in a mixed restricted pass; C/N never may.
+                        bool needs_cancel=false;
+                        std::set<std::string> unknown_ids;contribution.receipt_decisions.clear();
+                        require(std::get<cr::request>(q.body).receipts.size()<=recovery_request_store::decision_entries,"controller verified request entry cap");
+                        contribution.receipt_decisions.reserve(2*std::get<cr::request>(q.body).receipts.size());
                         for(uint64_t n=0;n<verified.state.offer.counts.receipt_pages;++n){const auto page=std::get<cr::receipt_page>(stages.read_verified_page(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route,cr::stream_kind::receipts,n));
-                            for(const auto& item:page.items)if(!std::holds_alternative<cr::committed>(item.value)&&!std::holds_alternative<cr::not_committed>(item.value)){
-                                const auto id=canonical_writer_adapter::uuid_key(item.original_id);if(!unsent.count(id))unknown_ids.insert(id);}}
+                            for(const auto& item:page.items){
+                                require(contribution.receipt_decisions.size()<=recovery_request_store::decision_bytes-65-2,"controller verified receipt projection exceeds entry cap");
+                                const bool unresolved=std::holds_alternative<cr::unknown>(item.value);const auto id=canonical_writer_adapter::uuid_key(item.original_id);
+                                needs_cancel|=unresolved&&!unsent.count(id);
+                                contribution.receipt_decisions.push_back(unresolved?'U':std::holds_alternative<cr::committed>(item.value)?'C':'N');
+                                contribution.receipt_decisions.push_back(unresolved?'1':'0');if(unresolved)unknown_ids.insert(id);}}
+                        require(contribution.receipt_decisions.size()==2*std::get<cr::request>(q.body).receipts.size(),"controller verified receipt projection count differs");
+                        contribution.receipt_decisions=requests.seal_receipt_decisions(*row,contribution.receipt_decisions);
                         for(const auto& entry:snapshot.entries)if(unknown_ids.count(entry.canonical_original_id))contribution.unknown_originals.push_back(entry.canonical_original_id);
-                        // Contextual union requests on other channels may also
-                        // be UNKNOWN; keep the entire cohort closed even when
-                        // this channel has no own unresolved entry for that ID.
-                        unknown|=!unknown_ids.empty();descriptor->contributions_.push_back(std::move(contribution));
+                        // Only possibly exported UNKNOWN requires cancellation.
+                        // If the whole cohort is globally UNSENT, retain the
+                        // direct install path. If any member needs cancel, the
+                        // persisted U1 subset also permits genuine first claims.
+                        unknown|=needs_cancel;descriptor->contributions_.push_back(std::move(contribution));
                     }
                 });
+                recovery_cohort_progress_observation::completed();
+                if(descriptor->dispositions_unavailable_)for(const auto& part:descriptor->contributions_)
+                    require(part.framing.receipt_decisions=="0"&&part.receipt_decisions=="0"&&part.unknown_originals.empty(),
+                        "controller mixed migrated and reserved frozen framing");
                 if(unknown){{std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller pending generation changed");
-                    if(runtime.reconciled_external_revision==runtime.external_revision&&runtime.reconciled_delivery_retry_revision==runtime.delivery_retry_revision)
-                        throw delivery_retry_wait();
-                    runtime.reconciled_external_revision=runtime.external_revision;runtime.reconciled_delivery_retry_revision=runtime.delivery_retry_revision;
+                    if(!descriptor->dispositions_unavailable_){
+                        if(runtime.reconciled_external_revision==runtime.external_revision&&runtime.reconciled_delivery_retry_revision==runtime.delivery_retry_revision)
+                            throw delivery_retry_wait();
+                        runtime.reconciled_external_revision=runtime.external_revision;runtime.reconciled_delivery_retry_revision=runtime.delivery_retry_revision;
+                    }
                     descriptor->external_revision_=runtime.external_revision;descriptor->delivery_retry_revision_=runtime.delivery_retry_revision;
-                    runtime.awaiting_delivery_retry=false;runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;}
+                    runtime.awaiting_delivery_retry=false;runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");for(const auto& route:routes)settle.notify(route,notification::reconcile);return;}
+                const state::install_target_id install_target{demand_revision,physical_incarnation,barrier,attempt,proof.get()};
                 auto scope_probe=probe_scope("install");
+                recovery_cohort_progress_observation::before(recovery_cohort_progress_observation::stage::install);
                 owned([&](database& db){
                     recovery_continuous_producer::verify_for_owned_write(*proof);recovery_request_store requests(owner);
                     canonical_cohort_admission cohort;cohort.owner_=owner;cohort.local_=proof;cohort.verify_current_sources_=[&]{live();
@@ -1539,7 +2192,8 @@ void recovery_receiver_controller::turn() {
                         cohort.channels_.push_back(std::move(grant));cohort.domains_.push_back(common_domain);
                     }
                     (void)install_canonical_cohort_owned(cohort);
-                });
+                },&install_target);
+                recovery_cohort_progress_observation::completed();
                 scope_probe.reset();observe("install-committed");continue;
             }
             require(selected.has_value(),"controller incomplete stage selection missing");
@@ -1587,27 +2241,74 @@ void recovery_receiver_controller::turn() {
                 return;
             }
         }
-        bool admission_busy=false;
-        try{std::rethrow_exception(error);}catch(const controller_admission_wait&){admission_busy=true;}catch(...){}
+        bool admission_busy=false;recovery_install_deferred actual_deferred=recovery_install_deferred::none;
+        try{std::rethrow_exception(error);}catch(const controller_admission_wait& actual){admission_busy=true;actual_deferred=actual.reason;}catch(...){}
         if(admission_busy) {
-            bool deferred=false;
+          try {
+            state::install_target_ptr candidate_install{nullptr,state::install_target_delete{runtime.creator}};
+            bool needs_target=false;
+            {std::lock_guard lock(runtime.mutex);needs_target=attempted_install&&
+                runtime.revision==admission_revision&&!runtime.admission_intent_revoked&&!runtime.admission_install;}
+            if(needs_target){
+                candidate_install.reset(new state::install_target{});
+                require(runtime.creator==controller_process(),"controller install target belongs to another process");
+                candidate_install->id=*attempted_install; // proof custody is captured only under the coordinator leaf below
+            }
+            bool deferred=false,current_episode=false;int64_t intent_deadline=0,retry_due=0;
             {std::lock_guard lock(runtime.mutex);auto& wait=runtime.admission_wait;
                 // An external generation is observed by the next ordinary
                 // turn. This stale turn cannot spend or reset its allowance.
-                if(runtime.revision!=admission_revision)deferred=true;
+                if(runtime.revision!=admission_revision||runtime.admission_intent_revoked)deferred=true;
                 else {
+                    if(attempted_install){
+                        require(attempted_install->revision==admission_revision&&attempted_install->frozen==runtime.frozen.get()&&
+                            attempted_install->barrier==runtime.frozen_barrier&&attempted_install->attempt==runtime.frozen_attempt,
+                            "controller deferred install lost its exact frozen target");
+                        if(runtime.admission_install)require(runtime.admission_install->id==*attempted_install,
+                            "controller admission cannot overwrite an unfinished install target");
+                        else {
+                            require(candidate_install&&!candidate_install->frozen,"controller deferred install target empty custody missing");
+                            // The off-leaf allocation is still empty: this exact
+                            // strong copy cannot release a prior proof on leaf.
+                            candidate_install->frozen=runtime.frozen;
+                            require(candidate_install->frozen.get()==attempted_install->frozen,"controller deferred install target custody changed");
+                            runtime.admission_install=std::move(candidate_install);
+                        }
+                    }
                     if(!wait.attempts){wait.revision=admission_revision;wait.deadline=admission_deadline;}
                     wait.deadline=std::min(wait.deadline,admission_deadline);
-                    if(now()<wait.deadline&&wait.attempts<admission_retry_attempts){++wait.attempts;wait.next_due=now()+admission_retry_tick_ms;deferred=true;}
+                    if(now()<wait.deadline&&wait.attempts<admission_retry_attempts){++wait.attempts;wait.next_due=now()+admission_retry_tick_ms;deferred=true;current_episode=true;intent_deadline=wait.deadline;retry_due=wait.next_due;}
                 }
                 if(deferred)settle.keep_admission_wait=true;
             }
             if(deferred){
+                // Publish denial before the actual deferral observation. This
+                // uses the same episode end; a coalesced wake cannot renew it.
+                // Cell publication/strong custody happens outside the leaf.
+                std::exception_ptr intent_error;
+                try{if(current_episode){
+                    const auto owner=observed_owner.lock();require(owner&&!owner->is_closed(),"controller admission intent owner retired");
+                    runtime.admission_intent.begin(owner,std::chrono::steady_clock::time_point(std::chrono::milliseconds(intent_deadline)));
+                    arm_admission_retry(retry_due); // same actual episode/next_due, no renewed budget
+                }else {runtime.admission_intent.release();
+#ifndef __EMSCRIPTEN__
+                    runtime.executor->cancel_retry();
+#endif
+                }}
+                catch(...){intent_error=std::current_exception();settle.keep_admission_wait=false;runtime.admission_intent.release();}
+                if(!intent_error){
                 try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)
                     runtime.probe->observed("admission-deferred");}catch(...){}
+                // Separate production-null passive copy after actual no-effect
+                // refusal and after the leaf ended. Existing fault-stage
+                // callbacks are not invoked with any new stage.
+                try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->admission_observed)
+                    runtime.probe->admission_observed(deferred_observation_label(actual_deferred));}catch(...){}
                 return;
-            }
-            error=std::make_exception_ptr(db_error("controller admission retry budget exhausted; gate remains closed"));
+                }
+                error=std::move(intent_error); // real cell/owner failure, never relabel as a retry
+            }else error=std::make_exception_ptr(db_error("controller admission retry budget exhausted; gate remains closed"));
+          }catch(...){error=std::current_exception();settle.keep_admission_wait=false;}
         }
         std::array<std::shared_ptr<state::reply>,2> retired_late;
         bool awaiting_delivery=false,retry_arrived=false;
@@ -1617,7 +2318,9 @@ void recovery_receiver_controller::turn() {
         if(awaiting_delivery)try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&
             runtime.probe->owner==owner.get()&&runtime.probe->observed)
                 runtime.probe->observed("delivery-retry-wait-before-latch");}catch(...){}
+        state::install_target_ptr failed_install;
         {std::lock_guard lock(runtime.mutex);
+            failed_install=std::move(runtime.admission_install);settle.keep_admission_wait=false;
             // The actual timer may arrive after the UNKNOWN decision unlocks
             // but before this catch stores its wait. Preserve that admitted
             // demand instead of latching over it until an unrelated event.
@@ -1633,7 +2336,7 @@ void recovery_receiver_controller::turn() {
         std::vector<std::shared_ptr<recovery_receiver_route>> report;
         {std::lock_guard lock(runtime.mutex);for(const auto& weak:runtime.routes)if(auto route=weak.lock())report.push_back(std::move(route));}
         if(retry_arrived){settle.after=[report]{for(const auto& route:report)if(!route->state_->retired.load()){route->wake();break;}};return;}
-        for(const auto& route:report)if(route->state_->error)try{route->state_->error(error);}catch(...){}
+        for(const auto& route:report)settle.notify(route,notification::error,error);
         try{std::rethrow_exception(error);}catch(const std::exception& e){LOG_ERROR("recovery-controller","receiver remains closed: %s",e.what());}catch(...){LOG_ERROR("recovery-controller","receiver remains closed after unknown failure");}
     }
 }
@@ -1670,12 +2373,28 @@ void recovery_receiver_controller::verify_reconciliation_route(
     auto controller=descriptor->controller_.lock();require(controller!=nullptr,"restricted export controller retired");
     {std::lock_guard lock(controller->state_->mutex);require(controller->state_->reconciliation==descriptor&&controller->state_->revision==descriptor->controller_revision_,"restricted export descriptor replaced");}
     const recovery_reconciliation_descriptor::contribution* matched=nullptr;
-    for(const auto& c:descriptor->contributions_)if(auto route=c.route.lock())if(route->state_->continuous==continuous&&route->state_->owner.lock()==owner&&
-        !route->state_->retired.load()&&c.source==route->state_->source&&c.source->recovery_live(c.view)&&c.source->recovery_lifecycle(c.view)==physical){
+    // Record the first actual failed predicate for each contribution while
+    // performing the SAME short-circuit checks. Do not re-read source/lifetime
+    // state after refusal and mistake that later observation for its cause.
+    std::array<size_t,7> missed{};
+    for(const auto& c:descriptor->contributions_){
+        const auto route=c.route.lock();
+        if(!route){++missed[0];continue;}
+        if(route->state_->continuous!=continuous){++missed[1];continue;}
+        if(route->state_->owner.lock()!=owner){++missed[2];continue;}
+        if(route->state_->retired.load()){++missed[3];continue;}
+        if(c.source!=route->state_->source){++missed[4];continue;}
+        if(!c.source->recovery_live(c.view)){++missed[5];continue;}
+        if(c.source->recovery_lifecycle(c.view)!=physical){++missed[6];continue;}
         require(!matched,"restricted export ambiguous actual route");
         require(compatible_context(c.framing,parse(c.source->recovery_description(c.view),65536),c.compatibility,route,c.view,
-            descriptor->controller_revision_,descriptor->physical_incarnation_,descriptor->phase_,descriptor->barrier_,descriptor->attempt_,descriptor->limits_.codec),"restricted export source compatibility changed");matched=&c;}
-    require(matched!=nullptr,"restricted export physical authenticated source differs");
+            descriptor->controller_revision_,descriptor->physical_incarnation_,descriptor->phase_,descriptor->barrier_,descriptor->attempt_,descriptor->limits_.codec),"restricted export source compatibility changed");matched=&c;
+    }
+    if(!matched)throw db_error("restricted export physical authenticated source differs"
+        " [first-failed predicates: routeExpired="+std::to_string(missed[0])+
+        ", continuous="+std::to_string(missed[1])+", owner="+std::to_string(missed[2])+
+        ", retired="+std::to_string(missed[3])+", source="+std::to_string(missed[4])+
+        ", viewLive="+std::to_string(missed[5])+", lifecycle="+std::to_string(missed[6])+"]");
     if(originals){require(!originals->empty()&&originals->size()<=8192,"restricted export original window capacity");
         size_t next=0;for(const auto& allowed:matched->unknown_originals)if(next<originals->size()&&allowed==(*originals)[next])++next;
         require(next==originals->size(),"restricted export window outside exact ordered retained-Q candidates");}
@@ -1718,7 +2437,8 @@ recovery_reconciliation_result recovery_receiver_controller::controller_reconcil
         require(rows.size()==1&&integer(rows[0],"incarnation")==descriptor->physical_incarnation_&&integer(rows[0],"phase")==descriptor->phase_&&
             integer(rows[0],"barrier")==descriptor->barrier_&&integer(rows[0],"attempt")==descriptor->attempt_,"controller reconciliation physical generation differs");
         if(cancel){require(descriptor->frozen_!=nullptr,"controller frozen reconciliation lacks actual provenance");recovery_continuous_producer::verify_for_owned_write(*descriptor->frozen_);}
-        recovery_request_store requests(owner);const auto framing=requests.fingerprints();
+        recovery_request_store requests(owner);auto framing=requests.fingerprints();
+        if(cancel)for(const auto& part:descriptor->contributions_){auto after=part.framing;after.receipt_decisions=part.receipt_decisions;framing.at(after.journal.channel)=requests.fingerprint(after);}
         recovery_obligation_store journal(owner,runtime.caps.obligations,runtime.caps.install.installations);
         receive_install_store receiver(owner,runtime.caps.install.installations);receiver.audit();journal.audit();
         std::vector<recovery_obligation_snapshot> journals;std::vector<receive_install_snapshot> receivers;
@@ -1766,13 +2486,30 @@ void recovery_receiver_controller::controller_reconcile_publish(recovery_reconci
     auto& runtime=*controller->state_;
     {std::lock_guard lock(runtime.mutex);require(reservation->active&&runtime.running&&runtime.reconciliation_reservation==reservation.get()&&
         runtime.reconciliation==descriptor&&runtime.revision==descriptor->controller_revision_&&runtime.revision<UINT64_MAX,
-        "controller reconciliation publication reservation changed");}
+        "controller reconciliation publication reservation changed");
+        if(runtime.admission_install){
+            const state::install_target_id canceled{descriptor->controller_revision_,descriptor->physical_incarnation_,
+                descriptor->barrier_,descriptor->attempt_,descriptor->frozen_.get()};
+            require(result.step_==recovery_reconciliation_step::cancelled&&runtime.admission_install->id==canceled,
+                "controller reconciliation cannot retire another install target");
+        }
+    }
     // All coordinator preconditions are checked before runtime publication.
     // The reserved result excludes worker turns; real external requests are
     // coalesced until release, and cannot relabel this known COMMIT.
     recovery_continuous_producer::controller_publish_reconcile(*controller,owner,result.next_barrier_,result.next_attempt_);
     std::shared_ptr<const recovery_reconciliation_descriptor> retired;
-    {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);++runtime.revision;runtime.failure={};runtime.awaiting_delivery_retry=false;runtime.demand=true;}
+    state::install_target_ptr retired_install;
+    recovery_writer_access::controller_admission_intent::retired_custody retired_writer;
+    {std::lock_guard lock(runtime.mutex);
+        retired_install=std::move(runtime.admission_install);runtime.admission_wait={};
+        retired_writer=runtime.admission_intent.retire();
+        retired=std::move(runtime.reconciliation);++runtime.revision;runtime.failure={};runtime.awaiting_delivery_retry=false;runtime.demand=true;
+    }
+    retired_writer.reset();retired_install.reset();
+#ifndef __EMSCRIPTEN__
+    runtime.executor->cancel_retry();
+#endif
     runtime.frozen.reset();runtime.framing_committed=false;runtime.predecessors.clear();
     reservation->release(); // payload/owner release is outside the leaf
     if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)

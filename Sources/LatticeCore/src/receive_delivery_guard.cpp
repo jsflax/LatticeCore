@@ -1,4 +1,6 @@
+#include <lattice/store_physical_api.hpp>
 #include "receive_delivery_guard.hpp"
+#include "receive_guard_initialization_statement.hpp"
 #include "recovery_writer_access.hpp"
 #include <lattice/ordinary_schema_recipe.hpp>
 #include <lattice/lattice.hpp>
@@ -8,13 +10,6 @@
 
 namespace lattice::detail {
 namespace receive_guard_test_hooks { thread_local std::function<void()> after_intake_commit; }
-// Only this three-literal producer is a recipe friend; namespace inventory
-// helpers receive no native writer, owner/current or arbitrary SQL capability.
-struct ordinary_receive_recipe_access final {
-    static constexpr const char* store() noexcept {return ordinary_schema_recipe::receive_store();}
-    static constexpr const char* channel() noexcept {return ordinary_schema_recipe::receive_channel();}
-    static constexpr const char* index() noexcept {return ordinary_schema_recipe::receive_index();}
-};
 namespace {
 constexpr receive_guard_limits caps{};
 constexpr const char* store_sql = ordinary_receive_recipe_access::store();
@@ -25,10 +20,10 @@ void key(const std::string& s, int64_t bound) {
     if (s.empty() || s.size() > static_cast<uint64_t>(bound)) refuse("opaque key exceeds qualification bound");
 }
 struct statement {
-    sqlite3* db; std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> p;
-    statement(sqlite3* h, const char* sql) : db(h), p(nullptr, &sqlite3_finalize) {
+    sqlite3* db; std::unique_ptr<sqlite3_stmt, decltype(&::lattice::detail::store_physical_finalize)> p;
+    statement(sqlite3* h, const char* sql) : db(h), p(nullptr, &::lattice::detail::store_physical_finalize) {
         database::record_statement(); sqlite3_stmt* raw = nullptr;
-        const int rc = sqlite3_prepare_v2(db, sql, -1, &raw, nullptr); p.reset(raw);
+        const int rc = ::lattice::detail::store_physical_prepare_v2(db, sql, -1, &raw, nullptr); p.reset(raw);
         if (rc != SQLITE_OK || !raw) refuse("prepare failed");
     }
     void integer(int i, int64_t v) { if (sqlite3_bind_int64(p.get(), i, v) != SQLITE_OK) refuse("integer bind failed"); }
@@ -43,7 +38,7 @@ struct statement {
     void optional(int i, const std::optional<std::string>& s) {
         if (s) bytes(i, *s); else if (sqlite3_bind_null(p.get(), i) != SQLITE_OK) refuse("NULL bind failed");
     }
-    int step() { const int rc = sqlite3_step(p.get()); if (rc != SQLITE_ROW && rc != SQLITE_DONE) refuse("step failed"); return rc; }
+    int step() { const int rc = ::lattice::detail::store_physical_step(p.get()); if (rc != SQLITE_ROW && rc != SQLITE_DONE) refuse("step failed"); return rc; }
     void done() { if (step() != SQLITE_DONE) refuse("unexpected result row"); }
     int64_t number(int c) {
         if (sqlite3_column_type(p.get(), c) != SQLITE_INTEGER) refuse("expected integer state");
@@ -180,6 +175,7 @@ sqlite3* receive_delivery_guard_access::owned(lattice_db& owner, database& write
     return h;
 }
 void receive_delivery_guard_access::initialize_schema(database& writer, bool legacy) {
+    if(receive_guard_initialization_reader::initialize_if_pending_(writer,legacy))return;
     auto* h = writer.internal_handle();
     if (sqlite3_get_autocommit(h) || sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE) refuse("schema initialization requires owned bootstrap WRITE");
     if (schema(h, true)) {

@@ -8,6 +8,8 @@
 namespace lattice { struct instance_guard; }
 namespace lattice::detail {
 class ordinary_cohort_attachment_access;
+// Exact registered native WAL owner, not a caller supplied quota/flag.
+bool wal_extent_attachment_guard_required(sqlite3*) noexcept;
 int ordinary_composed_attachment_authorize(sqlite3*,int,const char*,const char*) noexcept;
 int restore_ordinary_attachment_guard(sqlite3*) noexcept;
 // Native lifetime and topology permission only. No wire/source/profile issuer.
@@ -17,7 +19,12 @@ class ordinary_cohort_attachment_binding final {
     std::shared_ptr<const ordinary_managed_profile> recipient_profile_, target_profile_;
     std::shared_ptr<instance_guard> recipient_guard_, target_guard_;
     std::shared_ptr<const physical_store_identity> recipient_identity_, target_identity_;
-    std::string path_, alias_;
+    std::string path_, alias_,recipient_path_;
+    std::optional<sqlite3_int64> recipient_wal_limit_,target_wal_limit_;
+    // A native-only typed binding retains real owner/physical/token facts;
+    // it never substitutes for an ordinary managed profile or cohort issuer.
+    bool native_wal_only_=false,physical_resource_=false;
+    void validate_wal_policy()const;
     std::int64_t token_=0, creator_=0;
     ordinary_cohort_attachment_binding()=default;
     void validate(std::chrono::steady_clock::time_point)const;
@@ -31,7 +38,7 @@ class ordinary_cohort_attachment_access final {
     friend class ::lattice::lattice_db;
     // Only native topology paths create a binding after retaining actual
     // parent/target handles and checking their immutable enrolled profiles.
-    static ordinary_cohort_attachment bind(lattice_db&,lattice_db&,const std::string& alias,
+    static ordinary_cohort_attachment bind(lattice_db&,lattice_db&,database& recipient_connection,database& target_connection,const std::string& alias,
         std::int64_t token,const std::shared_ptr<const physical_store_identity>& target,
         const std::shared_ptr<const physical_store_identity>& recipient,database::attachment_operation&);
 public:
@@ -45,6 +52,9 @@ public:
     static void validate(const ordinary_cohort_attachment&,std::chrono::steady_clock::time_point);
     static void validate_target(const ordinary_cohort_attachment&,
         const std::shared_ptr<const physical_store_identity>&,std::chrono::steady_clock::time_point);
+    static void validate_target(const ordinary_cohort_attachment&,
+        const std::shared_ptr<const physical_store_identity>&,std::optional<sqlite3_int64> actual_wal_limit,
+        std::chrono::steady_clock::time_point);
     static std::int64_t token(const ordinary_cohort_attachment& value){if(!value)throw db_error("managed attachment binding missing");return value->token_;}
     // SQLite authorizer sees filename for ATTACH and alias for DETACH. Its
     // second argument is NULL; it does not prove the ATTACH alias. The latter

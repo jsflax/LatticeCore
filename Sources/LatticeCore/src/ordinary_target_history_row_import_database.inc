@@ -5,6 +5,7 @@
 #include "ordinary_target_raw_history_storage_recipe.hpp"
 namespace lattice {
 struct database::target_staging_state::row_import_native {
+    terminal_native_outer_tail terminal_outer; // First: follows ALL actual outer member destruction.
     using arguments=std::vector<column_value_t>;
     using program_type=detail::ordinary_group_target_schema_original::row_import_program;
     struct phase;
@@ -21,11 +22,12 @@ struct database::target_staging_state::row_import_native {
     bool completed=false;
     std::exception_ptr first_failure;
     row_import_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
-        const std::shared_ptr<program_type>& input):shell(&actual),owner(receiving),
+        const std::shared_ptr<program_type>& input):terminal_outer(actual,receiving,this,1),shell(&actual),owner(receiving),
         schema(receiving->require_header_schema(*actual.target_staging_->connection.lock())),program(input),
         raw_storage(actual.target_staging_->history_chain->raw_storage),
         final_stage(actual.target_staging_->history_chain->final_stage),final_meta(actual.target_staging_->history_chain->final_meta) {
         bytes=receiving->require_header_original(*actual.target_staging_->connection.lock()).header.size();
+        terminal_outer.constructor_returned(); // Actual final constructor operation.
     }
 };
 struct database::target_staging_state::row_import_native::phase {
@@ -158,7 +160,7 @@ struct database::target_staging_state::row_import_native::phase {
         if(statement.prepare_entered||sql.empty())throw db_error("GROUP bounded row import statement reissue refused");
         require(actual,unwind);auto& call=reserve(kind::prepare,index,unwind);require(actual,unwind);
         const char* tail=nullptr;statement.prepare_entered=true;call.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(actual.db_,sql.data(),static_cast<int>(sql.size()),&statement.held,&tail);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(actual.db_,sql.data(),static_cast<int>(sql.size()),&statement.held,&tail);
         statement.prepared_identity=statement.held;statement.prepare_returned=true;returned(call,statement.prepare_rc);
         require(actual,unwind);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held||tail!=sql.data()+sql.size())throw db_error("GROUP bounded row import actual Native preparation failed/changed");
@@ -186,7 +188,7 @@ struct database::target_staging_state::row_import_native::phase {
     }
     int step(database& actual,std::size_t index,bool unwind=false) {
         auto& statement=statements[index];require(actual,unwind);auto& call=reserve(kind::step,index,unwind);require(actual,unwind);call.entered=true;
-        const int rc=sqlite3_step(statement.held);returned(call,rc);
+        const int rc=::lattice::detail::store_physical_step(statement.held);returned(call,rc);
         if(!statement.first_step_returned){statement.first_step_rc=rc;statement.first_step_returned=true;}
         if(rc!=SQLITE_ROW){statement.terminal_rc=rc;statement.terminal_returned=true;}
         if(index==begin)scope->record_schema_begin(actual,rc);
@@ -198,7 +200,7 @@ struct database::target_staging_state::row_import_native::phase {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)return;
         require(actual,unwind);auto& call=reserve(kind::finalize,index,unwind);require(actual,unwind);
         statement.finalized_identity=statement.held;statement.finalize_entered=true;call.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
         if((statement.finalize_rc&0xff)!=SQLITE_MISUSE){statement.destruction_known=true;statement.held=nullptr;}
         scope->record_schema_finalized(actual,statement.finalize_rc);require(actual,unwind);
         // A returned non-MISUSE finalize has destroyed this SAME VM even

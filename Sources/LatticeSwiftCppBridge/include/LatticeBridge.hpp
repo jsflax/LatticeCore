@@ -96,14 +96,28 @@ using DynamicObjectRefPtrVector = std::vector<dynamic_object_ref*>;
 // Helper function for Swift to push to vector
 // (Works around Swift-C++ interop bug where SWIFT_SHARED_REFERENCE types
 // are incorrectly converted when passed to std::vector::push_back)
+inline bool push_dynamic_object_ref_checked(DynamicObjectRefPtrVector& vec, dynamic_object_ref* ptr) noexcept {
+    return sealed([&] {
+        if (!ptr || !ptr->valid()) throw std::runtime_error("Bulk add requires valid object refs");
+        vec.push_back(ptr);
+        return true;
+    });
+}
 inline void push_dynamic_object_ref(DynamicObjectRefPtrVector& vec, dynamic_object_ref* ptr) {
-    vec.push_back(ptr);
+    (void)push_dynamic_object_ref_checked(vec, ptr);
 }
 #else
 using DynamicObjectRefPtrVector = std::vector<dynamic_object_ref>;
 
+inline bool push_dynamic_object_ref_checked(DynamicObjectRefPtrVector& vec, const dynamic_object_ref& r) noexcept {
+    return sealed([&] {
+        if (!r.valid()) throw std::runtime_error("Bulk add requires valid object refs");
+        vec.push_back(r);
+        return true;
+    });
+}
 inline void push_dynamic_object_ref(DynamicObjectRefPtrVector& vec, const dynamic_object_ref& r) {
-    vec.push_back(r);
+    (void)push_dynamic_object_ref_checked(vec, r);
 }
 #endif
 

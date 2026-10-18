@@ -88,7 +88,12 @@ size_t recovery_unknown_reconciliation::continuity_bytes(size_t cap)const noexce
     const auto count=claim_capacity_;
     const size_t fixed=sizeof(*this)+sizeof(recovery_reconciliation_operation)+2*sizeof(std::vector<int64_t>);
     if(fixed>cap||contributions_.capacity()>(cap-fixed)/sizeof(progress))return cap+1;
-    const auto retained=fixed+contributions_.capacity()*sizeof(progress);
+    size_t retained=fixed+contributions_.capacity()*sizeof(progress);
+    // New durable-projection copies remain inside the SAME frame allowance.
+    // Count actual string capacities rather than only their current lengths.
+    const auto descriptor=descriptor_.lock();if(!descriptor)return cap+1;
+    for(const auto& part:descriptor->contributions_)for(const auto* value:{&part.framing.receipt_decisions,&part.receipt_decisions}){
+        if(value->capacity()>=cap-retained)return cap+1;retained+=value->capacity()+1;}
     if(count>(cap-retained)/(2*sizeof(int64_t)))return cap+1;
     return retained+count*2*sizeof(int64_t);
 }
@@ -187,7 +192,7 @@ size_t recovery_reconciliation_export::retained_bytes(size_t cap)const noexcept 
 std::shared_ptr<recovery_reconciliation_export> recovery_unknown_reconciliation::reserve(
     const std::shared_ptr<const recovery_reconciliation_descriptor>& descriptor,
     const std::shared_ptr<recovery_receiver_route>& route,size_t count,const std::vector<int64_t>& in_flight) {
-    if(!count||count>1000||in_flight.size()>2000||descriptor_.lock()!=descriptor||descriptor->phase_!=4)
+    if(!count||count>1000||in_flight.size()>2000||descriptor_.lock()!=descriptor||descriptor->phase_!=4||descriptor->dispositions_unavailable_)
         refuse("reconciliation window lacks exact restricted descriptor");
     size_t index=descriptor->contributions_.size();
     for(size_t n=0;n<descriptor->contributions_.size();++n)if(descriptor->contributions_[n].route.lock()==route){
@@ -236,12 +241,18 @@ void recovery_unknown_reconciliation::cancel(const std::shared_ptr<const recover
             const auto& caps=descriptor->limits_;
             canonical_range_staging stages(owner,caps.install.installations,caps.codec,caps.staging);
             recovery_obligation_store journal(owner,caps.obligations,caps.install.installations);
+            recovery_request_store requests(owner);
             for(const auto& part:descriptor->contributions_){
                 const auto q=canonical_range::decode(part.framing.request_frame,caps.codec);
                 const auto m=canonical_range::decode(part.framing.manifest_frame,caps.codec);
                 const auto* manifest=std::get_if<canonical_range::manifest>(&m.body);
                 if(!std::holds_alternative<canonical_range::request>(q.body)||!manifest||q.logical!=m.logical||part.framing.route<=0)
                     refuse("reconciliation cancellation framing differs");
+                // SAME cancellation COMMIT retains verified knowledge before deleting pages.
+                if(descriptor->dispositions_unavailable_){
+                    if(part.framing.receipt_decisions!="0"||part.receipt_decisions!="0"||!part.unknown_originals.empty())
+                        refuse("migrated cancellation attempted a receipt classification or send");
+                }else requests.retain_receipt_decisions(part.framing,part.receipt_decisions);
                 stages.abandon_active(q.logical,manifest->manifest_digest,static_cast<uint64_t>(part.framing.route));
                 journal.cancel_frozen_for_retry(part.journal.scope.address,descriptor->attempt_,part.journal.scope.revision);
             }

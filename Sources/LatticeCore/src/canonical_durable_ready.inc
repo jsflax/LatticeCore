@@ -847,22 +847,32 @@ recovery_install_result canonical_writer_adapter::discard_authenticated_ready(st
     auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;
     return retention_owned(owner,writer,state,session,ready_abandon,[&](database& actual,retention_session&){
         validate_namespace_admission(owner,writer,state,held);
-        if(!state->ready || !held.authenticated_ || request.source!=ready_source(state->profile,*state->ready) ||
-           request.registered_producer!=held.receipt_binding_ ||
-           (request.registered_producer&&request.receipt_namespace!=std::optional<std::string>{held.namespace_.namespace_id}))
+        if(!state->ready || !held.authenticated_ || request.source!=ready_source(state->profile,*state->ready))
             refuse("canonical READY disposal source differs");
+        const bool exact_registration=request.registered_producer==held.receipt_binding_&&
+            (!request.registered_producer||request.receipt_namespace==std::optional<std::string>{held.namespace_.namespace_id});
+        // A canonical v2 Q may name a capsule already removed by the actual
+        // receipt-coverage migration. This narrower branch can prove only
+        // current terminal/no-effect state, never historical Q acceptance or
+        // migration provenance. It cannot dispose an extant capsule.
+        const bool legacy_terminal_only=held.receipt_binding_.has_value()&&!request.registered_producer&&!request.receipt_namespace;
+        if(!exact_registration&&!legacy_terminal_only)refuse("canonical READY disposal source differs");
         const auto& p=*state->ready;const auto raw=cr::encode({attempt,ready_route,request},p.package.codec);
         (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
         const auto key=ready_binding(held.namespace_.namespace_id,held.replica_,attempt);
         const auto rows=actual.query(ready_transfer_query(p)+" WHERE binding=? LIMIT 2",{bytes(key)});
         if(rows.size()>1)refuse("canonical READY disposal capsule is ambiguous");
         if(!rows.empty()) {
+            if(!exact_registration)refuse("canonical READY extant disposal registered source differs");
             ready_require_identity(rows[0],p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
             dispose_ready(actual,p,rows[0]);
         } else {
             // Current audited no-effect settlement after a lost discard reply.
             // This neither creates/advances a binding nor proves a prior call
-            // outcome, historical Q spelling, or any original receipt.
+            // outcome, historical Q spelling, or any original receipt. The
+            // legacy-terminal-only spelling does not claim migration origin;
+            // it has the SAME fresh owned audit, exact authenticated key and
+            // sequence checks, and zero durable writes in this body.
             const auto prior=actual.query("SELECT "+ready_i("sequence")+" FROM main._lattice_canonical_ready_binding WHERE binding=? LIMIT 2",{bytes(key)});
             if(prior.size()!=1||integer(prior[0],"sequence")<=0||uint64_t(integer(prior[0],"sequence"))!=attempt.sequence)
                 refuse("canonical READY disposal terminal high-water differs");

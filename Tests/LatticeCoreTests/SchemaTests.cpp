@@ -5,15 +5,15 @@
 // ============================================================================
 
 TEST(Schema, CreateFromSchema) {
-    auto* schema = lattice::schema_registry::instance().get_schema(typeid(TestTrip));
+    auto schema = lattice::schema_registry::instance().get_schema(typeid(TestTrip));
     ASSERT_NE(schema, nullptr);
     EXPECT_EQ(schema->table_name, "TestTrip");
     EXPECT_EQ(schema->properties.size(), 3u);
 }
 
 TEST(Schema, RegistryContainsAll) {
-    auto* person = lattice::schema_registry::instance().get_schema(typeid(TestPerson));
-    auto* dog = lattice::schema_registry::instance().get_schema(typeid(TestDog));
+    auto person = lattice::schema_registry::instance().get_schema(typeid(TestPerson));
+    auto dog = lattice::schema_registry::instance().get_schema(typeid(TestDog));
     ASSERT_NE(person, nullptr);
     ASSERT_NE(dog, nullptr);
     EXPECT_EQ(person->table_name, "TestPerson");
@@ -572,4 +572,212 @@ TEST(Schema, CoreUniquePassDeduplicatesPreexistingRowsKeepingNewest) {
         "SELECT name FROM sqlite_master "
         "WHERE type='index' AND name='unique_CoreUniqueGadget_0'");
     EXPECT_EQ(idx.size(), 1u);
+}
+
+// Registry-generation controls use isolated real registries, not extra static
+// application models. The final SQL callback control uses the actual global
+// registry gate and replaces TestPerson with its exact original declaration.
+#include <condition_variable>
+#include <exception>
+#include <atomic>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/wait.h>
+#include <signal.h>
+#endif
+
+#include "SchemaRegistryGenerationTestAccess.hpp"
+
+namespace {
+using RegistryAccess=lattice::detail::schema_registry_generation_test_access;
+lattice::model_schema registry_declaration(std::string table,std::string property) {
+    lattice::model_schema result;result.table_name=std::move(table);
+    lattice::property_descriptor value{};value.name=std::move(property);value.type=lattice::column_type::text;
+    result.properties.push_back(std::move(value));return result;
+}
+struct RegistryRendezvous {
+    std::mutex mutex;std::condition_variable changed;bool ready=false,release=false,timed_out=false;
+    void arrive() {std::lock_guard lock(mutex);ready=true;changed.notify_all();}
+    bool wait_ready() {std::unique_lock lock(mutex);return changed.wait_for(lock,std::chrono::seconds(5),[&]{return ready;});}
+    void wait_release() {std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return release;}))timed_out=true;}
+    void resume() {std::lock_guard lock(mutex);release=true;changed.notify_all();}
+};
+struct RegistryThread {
+    std::thread value;
+    template<class F> explicit RegistryThread(F&& body):value(std::forward<F>(body)){}
+    ~RegistryThread(){if(value.joinable())value.join();}
+};
+}
+
+TEST(SchemaRegistryGeneration, RetainedReplacementAndTypeRemapSurviveRegistryDestruction) {
+    lattice::schema_snapshot_v2 old;
+    lattice::schema_handle_v2 original;
+    RegistryAccess::isolated([&](auto& registry){
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistryAlpha","first"));
+        old=registry.all_schemas();original=old.get_schema(typeid(TestPerson));
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistryAlpha","second"));
+        const auto replaced=registry.get_schema(typeid(TestPerson));
+        ASSERT_NE(replaced,nullptr);EXPECT_EQ(replaced->properties.at(0).name,"second");
+        EXPECT_EQ(original->properties.at(0).name,"first");
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistryBeta","third"));
+        const auto remapped=registry.all_schemas();
+        EXPECT_EQ(remapped.get_schema(typeid(TestPerson))->table_name,"RegistryBeta");
+        EXPECT_EQ(remapped.get_schema("RegistryAlpha")->properties.at(0).name,"second");
+        EXPECT_EQ(remapped.size(),2u);EXPECT_GT(remapped.generation(),old.generation());
+    });
+    ASSERT_NE(original,nullptr);EXPECT_EQ(original->table_name,"RegistryAlpha");
+    EXPECT_EQ(original->properties.at(0).name,"first");EXPECT_EQ(old.size(),1u);
+}
+
+TEST(SchemaRegistryGeneration, ConcurrentPublicationRebasesWithoutLosingEitherWholeModel) {
+    RegistryAccess::isolated([&](auto& registry){
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistrySeed","seed"));
+        const auto before=registry.all_schemas();RegistryRendezvous paused;
+        struct context {RegistryRendezvous* rendezvous;std::atomic<bool> first{true};} state{&paused};
+        std::exception_ptr worker_error;
+        RegistryAccess::observe(registry,[](void* raw,auto&){
+            auto& state=*static_cast<context*>(raw);
+            if(state.first.exchange(false)){state.rendezvous->arrive();state.rendezvous->wait_release();}
+        },&state,[&]{
+            RegistryThread worker([&]{try{registry.register_model(typeid(TestDog),registry_declaration("RegistryLeft","left"));}catch(...){worker_error=std::current_exception();}});
+            const bool ready=paused.wait_ready();EXPECT_TRUE(ready);
+            if(ready) {
+                EXPECT_EQ(registry.all_schemas().generation(),before.generation());
+                registry.register_model(typeid(TestTrip),registry_declaration("RegistryRight","right"));
+                const auto middle=registry.all_schemas();
+                EXPECT_EQ(middle.get_schema(typeid(TestTrip))->properties.at(0).name,"right");
+                EXPECT_EQ(middle.get_schema(typeid(TestDog)),nullptr);
+            }
+            paused.resume();
+        });
+        EXPECT_FALSE(paused.timed_out);EXPECT_EQ(worker_error,nullptr);
+        const auto final=registry.all_schemas();EXPECT_EQ(final.size(),3u);
+        EXPECT_EQ(final.get_schema(typeid(TestDog))->properties.at(0).name,"left");
+        EXPECT_EQ(final.get_schema(typeid(TestTrip))->properties.at(0).name,"right");
+        EXPECT_EQ(before.size(),1u);EXPECT_EQ(before.get_schema("RegistryLeft"),nullptr);
+    });
+}
+
+TEST(SchemaRegistryGeneration, ReentrantPublicationRunsOffGateAndOldLeaseRetires) {
+    RegistryAccess::isolated([&](auto& registry){
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistrySame","old"));
+        auto retained=registry.all_schemas();auto handle=retained.get_schema(typeid(TestPerson));
+        const auto old=RegistryAccess::weak(retained);bool entered=false,off_gate=false;
+        struct context {bool* entered;bool* off_gate;} state{&entered,&off_gate};
+        RegistryAccess::observe(registry,[](void* raw,auto& actual){
+            auto& state=*static_cast<context*>(raw);if(*state.entered)return;
+            *state.entered=true;*state.off_gate=RegistryAccess::gate_free(actual);
+            actual.register_model(typeid(TestDog),registry_declaration("RegistryNested","nested"));
+        },&state,[&]{registry.register_model(typeid(TestPerson),registry_declaration("RegistrySame","new"));});
+        EXPECT_TRUE(entered);EXPECT_TRUE(off_gate);
+        EXPECT_EQ(registry.get_schema(typeid(TestDog))->properties.at(0).name,"nested");
+        EXPECT_EQ(registry.get_schema(typeid(TestPerson))->properties.at(0).name,"new");
+        retained={};EXPECT_FALSE(old.expired());EXPECT_EQ(handle->properties.at(0).name,"old");
+        handle={};EXPECT_TRUE(old.expired());
+    });
+}
+
+TEST(SchemaRegistryGeneration, FailedCandidateKeepsActualFirstAndPriorGeneration) {
+    RegistryAccess::isolated([&](auto& registry){
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistryFailure","before"));
+        const auto before=registry.all_schemas();std::exception_ptr primary;
+        try{throw std::runtime_error("actual candidate refusal");}catch(...){primary=std::current_exception();}
+        std::exception_ptr caught;
+        RegistryAccess::observe(registry,[](void* raw,auto&){std::rethrow_exception(*static_cast<std::exception_ptr*>(raw));},&primary,[&]{
+            try{registry.register_model(typeid(TestPerson),registry_declaration("RegistryFailure","after"));}
+            catch(...){caught=std::current_exception();}
+        });
+        EXPECT_EQ(caught,primary);EXPECT_EQ(registry.all_schemas().generation(),before.generation());
+        EXPECT_EQ(registry.get_schema(typeid(TestPerson))->properties.at(0).name,"before");
+        EXPECT_TRUE(RegistryAccess::gate_free(registry));
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistryFailure","after"));
+        EXPECT_EQ(registry.get_schema(typeid(TestPerson))->properties.at(0).name,"after");
+    });
+}
+
+TEST(SchemaRegistryGeneration, ActualSqlCallbackBorrowsGenerationWithoutWaitingPublicationGate) {
+    auto& registry=lattice::schema_registry::instance();
+    const auto person=registry.get_schema(typeid(TestPerson));ASSERT_NE(person,nullptr);
+    lattice::database db(":memory:");RegistryRendezvous callback_entered,gate_held;
+    struct context {RegistryRendezvous* entered;RegistryRendezvous* held;std::exception_ptr error;std::uint64_t seen=0;} state{&callback_entered,&gate_held};
+    ASSERT_EQ(sqlite3_create_function_v2(db.handle(),"actual_registry_generation",0,SQLITE_UTF8,&state,
+        [](sqlite3_context* result,int,sqlite3_value**){
+            auto& state=*static_cast<context*>(sqlite3_user_data(result));
+            try {
+                state.entered->arrive();if(!state.held->wait_ready())throw std::runtime_error("publication gate rendezvous missing");
+                const auto actual=lattice::detail::schema_read_scope_v2::lookup("TestPerson");
+                if(!actual)throw std::runtime_error("actual registered model missing");
+                state.seen=RegistryAccess::entered_generation();state.held->resume();
+                sqlite3_result_int64(result,static_cast<sqlite3_int64>(state.seen));
+            }catch(...){state.error=std::current_exception();state.held->resume();sqlite3_result_error(result,"actual registry callback failed",-1);}
+        },nullptr,nullptr,nullptr),SQLITE_OK);
+    std::exception_ptr worker_error;
+    RegistryThread worker([&]{try{
+        if(!callback_entered.wait_ready())throw std::runtime_error("actual SQL callback missing");
+        RegistryAccess::gate(registry,[&]{gate_held.arrive();gate_held.wait_release();});
+    }catch(...){worker_error=std::current_exception();gate_held.arrive();}});
+    const auto before=registry.all_schemas().generation();
+    std::vector<lattice::database::row_t> rows;
+    try{rows=db.query("SELECT actual_registry_generation() AS generation");}catch(...){gate_held.resume();throw;}
+    worker.value.join();EXPECT_EQ(state.error,nullptr);EXPECT_EQ(worker_error,nullptr);
+    EXPECT_FALSE(gate_held.timed_out);ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(std::get<int64_t>(rows.at(0).at("generation")),static_cast<int64_t>(before));
+    registry.register_model(typeid(TestPerson),*person); // exact declaration, no new catalog model
+    const auto after=registry.all_schemas().generation();EXPECT_GT(after,before);
+    // The next actual operation receives the successor generation. No old TLS
+    // view survives the preceding physical entry's actual destructor.
+    ASSERT_EQ(sqlite3_create_function_v2(db.handle(),"next_registry_generation",0,SQLITE_UTF8,&state,
+        [](sqlite3_context* result,int,sqlite3_value**){
+            auto& state=*static_cast<context*>(sqlite3_user_data(result));
+            try{sqlite3_result_int64(result,static_cast<sqlite3_int64>(RegistryAccess::entered_generation()));}
+            catch(...){state.error=std::current_exception();sqlite3_result_error(result,"actual next registry callback failed",-1);}
+        },nullptr,nullptr,nullptr),SQLITE_OK);
+    const auto next=db.query("SELECT next_registry_generation() AS generation");
+    EXPECT_EQ(state.error,nullptr);
+    ASSERT_EQ(next.size(),1u);EXPECT_EQ(std::get<int64_t>(next.at(0).at("generation")),static_cast<int64_t>(after));
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST(SchemaRegistryGeneration, ForkRefusesInheritedGateAndRetainedDataBeforeSynchronization) {
+    RegistryAccess::isolated([&](auto& registry){
+        registry.register_model(typeid(TestPerson),registry_declaration("RegistryFork","parent"));
+        const auto snapshot=registry.all_schemas();const auto model=snapshot.get_schema(typeid(TestPerson));
+        RegistryRendezvous locked;
+        RegistryThread holder([&]{RegistryAccess::gate(registry,[&]{locked.arrive();locked.wait_release();});});
+        const bool ready=locked.wait_ready();EXPECT_TRUE(ready);
+        if(!ready){locked.resume();return;}
+        const pid_t child=::fork();
+        if(child==0) {
+            int refused=0;
+            try{(void)registry.all_schemas();}catch(...){++refused;}
+            try{(void)lattice::schema_registry::instance();}catch(...){++refused;}
+            try{(void)snapshot.size();}catch(...){++refused;}
+            if(!model)++refused;
+            {const auto abandoned=snapshot;if(!abandoned.valid())++refused;}
+            ::_exit(refused==5?0:41);
+        }
+        locked.resume();holder.value.join();ASSERT_GT(child,0);
+        int status=0;bool ended=false;
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(std::chrono::steady_clock::now()<end){const auto rc=::waitpid(child,&status,WNOHANG);if(rc==child){ended=true;break;}if(rc<0)break;std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        if(!ended){::kill(child,SIGKILL);::waitpid(child,&status,0);}
+        EXPECT_TRUE(ended);ASSERT_TRUE(WIFEXITED(status));EXPECT_EQ(WEXITSTATUS(status),0);
+        EXPECT_FALSE(locked.timed_out);EXPECT_EQ(model->properties.at(0).name,"parent");
+    });
+}
+#endif
+
+TEST(SchemaRegistryGeneration, ValidDeepCatalogDoesNotRetainUnusedFallbackAndManualRefusalRecaptures) {
+    auto& registry=lattice::schema_registry::instance();auto original=registry.all_schemas();
+    const auto retired=RegistryAccess::weak(original);
+    lattice::model_schema exact_person=*original.get_schema(typeid(TestPerson));
+    auto captured=lattice::detail::recovery_owner_schema::capture_native();ASSERT_TRUE(captured.valid());
+    const auto count=captured.models.size();const auto original_generation=original.generation();original={};
+    registry.register_model(typeid(TestPerson),std::move(exact_person)); // exact full same application value
+    EXPECT_TRUE(retired.expired());EXPECT_EQ(captured.models.size(),count);
+    EXPECT_EQ(captured.models.at("TestPerson").table_name,"TestPerson");
+    captured.refuse();auto&& refused=std::move(captured).prepare_native_fallback_();
+    const auto current=registry.all_schemas();
+    EXPECT_EQ(refused.native_fallback_lease_().generation(),current.generation());
+    EXPECT_GT(refused.native_fallback_lease_().generation(),original_generation);
+    EXPECT_EQ(refused.native_fallback_lease_().size(),current.size());
 }

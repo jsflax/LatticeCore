@@ -48,6 +48,12 @@ void continuous_result::assign(const detail::recovery_install_result& value)noex
     errors_=(value.primary_error?1:0)|(value.cleanup_error?2:0)|(value.postcommit_error?4:0)|(value.notification_error?8:0);
     diagnostic(primary_,value.primary_error);diagnostic(cleanup_,value.cleanup_error);
     diagnostic(postcommit_,value.postcommit_error);diagnostic(notification_,value.notification_error);
+    owner_close_.fill(0);
+}
+void continuous_result::assign(const detail::recovery_continuous_open_result& value)noexcept {
+    assign(value.settlement);
+    if(value.owner_close_error)errors_|=16;
+    diagnostic(owner_close_,value.owner_close_error);
 }
 void continuous_result::failure(std::exception_ptr error)noexcept {
     const uint8_t bit=phase_==2?4:1;
@@ -69,6 +75,7 @@ std::string continuous_result::primary_error()const noexcept{return sealed([&]{r
 std::string continuous_result::cleanup_error()const noexcept{return sealed([&]{return std::string(cleanup_.data());});}
 std::string continuous_result::postcommit_error()const noexcept{return sealed([&]{return std::string(postcommit_.data());});}
 std::string continuous_result::notification_error()const noexcept{return sealed([&]{return std::string(notification_.data());});}
+std::string continuous_result::owner_close_error()const noexcept{return sealed([&]{return std::string(owner_close_.data());});}
 continuous_result continuous_barrier::finish()const noexcept {
     continuous_result out;try{require(static_cast<bool>(value_),"continuous barrier unavailable");out.assign(detail::recovery_continuous_producer::finish(*value_));}catch(...){out.failure(std::current_exception());}return out;
 }
@@ -106,7 +113,7 @@ swift_lattice_ref swift_lattice_ref::create_continuous(const swift_configuration
             detail::LatticeCache::instance().register_pointer(std::static_pointer_cast<swift_lattice>(owner));
         };
         auto opened=detail::recovery_continuous_producer::open_owned(config,native,std::move(recipe));
-        result.assign(opened.settlement);
+        result.assign(opened);
         if(opened.owner&&!result.has_error())ref->impl_=std::static_pointer_cast<swift_lattice>(std::move(opened.owner));
     }catch(...){result.failure(std::current_exception());}
 #if LATTICE_HAS_FRT

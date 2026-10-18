@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "ordinary_source_upload.hpp"
 #include "ordinary_export_storage_access.hpp"
 #include "ordinary_v2_property.hpp"
@@ -148,8 +149,8 @@ std::vector<database::row_t> read_ordinary_upload_rows(database& db,const std::s
     const std::vector<column_value_t>& args,size_t limit,const ordinary_v2_retained_charge& charge) {
     auto* h=ordinary_export_storage_access::borrow(db);if(!h||!limit||limit>caps::originals||sqlite3_txn_state(h,"main")==SQLITE_TXN_NONE)fail("bounded upload read view required");
     database::record_statement();sqlite3_stmt* raw=nullptr;const char* tail=nullptr;
-    const auto rc=sqlite3_prepare_v2(h,sql.data(),int(sql.size()),&raw,&tail);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const auto rc=::lattice::detail::store_physical_prepare_v2(h,sql.data(),int(sql.size()),&raw,&tail);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(rc!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||tail!=sql.data()+sql.size()||sqlite3_bind_parameter_count(raw)!=int(args.size()))fail("upload query shape");
     for(size_t i=0;i<args.size();++i){int result=SQLITE_MISUSE;
         if(const auto* v=std::get_if<std::string>(&args[i])){if(v->size()>4096)fail("upload query key bound");result=sqlite3_bind_text(raw,int(i+1),v->data(),int(v->size()),SQLITE_STATIC);}
@@ -157,7 +158,7 @@ std::vector<database::row_t> read_ordinary_upload_rows(database& db,const std::s
         if(result!=SQLITE_OK)fail("upload query bind");}
     const auto count=sqlite3_column_count(raw);if(count<1||count>32)fail("upload query column bound");
     std::vector<database::row_t> rows;int step;
-    while((step=sqlite3_step(raw))==SQLITE_ROW){if(rows.size()==limit)fail("upload query row bound");charge(sizeof(database::row_t)+size_t(count)*(sizeof(database::row_t::value_type)+4*sizeof(void*)));
+    while((step=::lattice::detail::store_physical_step(raw))==SQLITE_ROW){if(rows.size()==limit)fail("upload query row bound");charge(sizeof(database::row_t)+size_t(count)*(sizeof(database::row_t::value_type)+4*sizeof(void*)));
         database::row_t row;
         for(int c=0;c<count;++c){const auto* key=sqlite3_column_name(raw,c);if(!key)fail("upload column name");size_t length=0;while(length<=256&&key[length])++length;if(!length||length>256)fail("upload column name bound");charge(length+1);
             column_value_t value=nullptr;switch(sqlite3_column_type(raw,c)){

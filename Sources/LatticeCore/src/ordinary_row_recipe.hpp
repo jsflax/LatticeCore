@@ -1,5 +1,7 @@
 #pragma once
 #include "ordinary_export.hpp"
+#include "ordinary_initialization_storage.hpp"
+#include <string_view>
 #include <cmath>
 // Exact normal physical row/INSERT producer only. Returns DATA; no target/native
 // SQL role, model selection, source cut, currentness or import grant is issued.
@@ -7,8 +9,13 @@ namespace lattice::detail {
 struct ordinary_row_recipe final {
 private:
     [[noreturn]] static void refuse(const char* reason){throw db_error(std::string("ordinary owned export: ")+reason);}
+    static void require_ordinary_storage_() {
+        if(ordinary_initialization_storage_scope::debit_scope_active())
+            throw ordinary_initialization_storage_error("startup cannot enter generic row recipe");
+    }
 public:
-    static std::string quote(const std::string& name) {
+    static std::string quote(std::string_view name) {
+    require_ordinary_storage_();
     if(name.empty()||name.size()>256||name.find('\0')!=std::string::npos)refuse("invalid identifier");
     std::string out="\"";for(char c:name){out+=c;if(c=='\"')out+='\"';}return out+'\"';
 }
@@ -29,6 +36,7 @@ public:
 
     struct fields_program {std::string columns,arguments,assignments;};
     static fields_program fields(const std::vector<std::string>& names) {
+        require_ordinary_storage_();
         fields_program out;auto& columns=out.columns;auto& arguments=out.arguments;auto& assignments=out.assignments;
         for(const auto& name:names) {
             if(!columns.empty()){columns+=',';arguments+=',';assignments+=',';}
@@ -36,7 +44,8 @@ public:
         }
         return out;
     }
-    static std::string insert(const std::string& name,const fields_program& fields) {
+    static std::string insert(std::string_view name,const fields_program& fields) {
+        require_ordinary_storage_();
         const auto& columns=fields.columns;const auto& arguments=fields.arguments;
         return "INSERT INTO main."+quote(name)+'('+columns+") VALUES("+arguments+')';
     }

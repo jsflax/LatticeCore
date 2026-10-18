@@ -1,6 +1,7 @@
 // Included only after the actual Conn, scope and physical spool originals.
 // No descriptor open, mmap, SQL operation, caller offset or whole-chain copy.
 struct ordinary_target_history_page_reader::state {
+    ordinary_target_raw_object_tail terminal_raw_tail_; // First, after actual buffer/scope/charge member destruction.
     using spool_state=ordinary_target_history_spool::state;
     // Charge destruction follows actual buffer destruction on every path.
     std::shared_ptr<ordinary_resource_reservation<true>> decoder_charge;
@@ -45,14 +46,15 @@ struct ordinary_target_history_page_reader::state {
     state(const std::shared_ptr<spool_state>& original,const ordinary_target_history_spool& spool_original,
         const ::lattice::database& actual,const void* scope,const void* output,ordinary_target_history_read_span coordinates,
         std::shared_ptr<ordinary_resource_reservation<true>> charge)
-        :decoder_charge(std::move(charge)),spool(original),spool_identity(original.get()),facade(&spool_original),
+        :terminal_raw_tail_(this,this,5),decoder_charge(std::move(charge)),spool(original),spool_identity(original.get()),facade(&spool_original),
          connection_identity(original->connection_identity),receiver_identity(original->receiver_identity),shell(&actual),
          scope_identity(scope),output_identity(output),
          scope_pin(static_cast<const ordinary_target_staging_connection::database_scope*>(scope)->held_),
          generation(static_cast<const ordinary_target_staging_connection::database_scope*>(scope)->held_->generation),
-         span(coordinates),device(original->device),inode(original->inode),fd(original->fd){}
+         span(coordinates),device(original->device),inode(original->inode),fd(original->fd){terminal_raw_tail_.construction_returned_=true;}
 };
-ordinary_target_history_page_reader::ordinary_target_history_page_reader(std::shared_ptr<state> actual):state_(std::move(actual)){}
+ordinary_target_history_page_reader::ordinary_target_history_page_reader(std::shared_ptr<state> actual)
+    :terminal_raw_tail_(this,actual.get(),4),state_(std::move(actual)){terminal_raw_tail_.construction_returned_=true;}
 ordinary_target_history_page_reader::~ordinary_target_history_page_reader()=default; // No IO, retry or implied refund.
 std::size_t ordinary_target_history_page_reader::retained_bytes(std::uint64_t length) {
     // During first new capture the census retains one ended predecessor's

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +39,9 @@ public:
     ordinary_open_context(const ordinary_open_context&) = delete;
     ordinary_open_context& operator=(const ordinary_open_context&) = delete;
     std::string primary_path() const;
+    // Immutable receiver-issued WAL policy for this exact retained native path.
+    // Metadata only: no role/recovery grant, currentness wait or new deadline.
+    std::int64_t wal_extent_limit_bytes(const std::string& path) const;
     // Only an actual managed-history family may derive a view for one of its
     // registered physical stores. The returned view is bound to this exact
     // path; it is still only open custody, never source/recovery permission.
@@ -49,6 +53,11 @@ public:
     void validate_physical(std::uint64_t device, std::uint64_t inode) const;
 };
 using ordinary_context = std::shared_ptr<const ordinary_open_context>;
+// Policy selection only. Actual native opening must retain ordinary_before_open.
+// Null legacy context preserves its explicit optional policy. A managed file
+// writer receives the exact immutable cap or refuses a conflicting request.
+std::optional<std::int64_t> ordinary_select_wal_extent_limit(const std::string& path,
+    const ordinary_context&, std::optional<std::int64_t> requested);
 // Before the first SQLite open or a live/in-flight cache return. Unmanaged
 // native-open attempts permanently prevent later context installation. In a
 // managed process missing/different capabilities refuse before native open.

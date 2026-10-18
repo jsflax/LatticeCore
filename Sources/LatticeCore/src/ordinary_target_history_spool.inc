@@ -5,6 +5,7 @@
 // One private pending raw page may be ended before its SQL consumer exists.
 // This slice does not route legacy SQL page bytes or join/reuse a raw cursor.
 struct ordinary_target_history_spool::state {
+    ordinary_target_raw_object_tail terminal_raw_tail_; // First: post-member ending includes the actual target reference.
     static constexpr const char* leaf="history.raw.v1";
     const std::weak_ptr<ordinary_target_staging_connection> connection;
     const ordinary_target_staging_connection* const connection_identity;
@@ -72,9 +73,9 @@ struct ordinary_target_history_spool::state {
 #endif
     state(const std::shared_ptr<ordinary_target_staging_connection>& original,
         const std::shared_ptr<ordinary_group_target_receiving_owner>& owner)
-        :connection(original),connection_identity(original.get()),receiver(owner),receiver_identity(owner.get()),
+        :terminal_raw_tail_(this,this,1),connection(original),connection_identity(original.get()),receiver(owner),receiver_identity(owner.get()),
          target(original->state_->target),end(original->state_->end),member(original->state_->member_fd),
-         member_device(original->state_->member_device),member_inode(original->state_->member_inode){}
+         member_device(original->state_->member_device),member_inode(original->state_->member_inode){terminal_raw_tail_.construction_returned_=true;}
     bool creator_current()const noexcept {
         return ordinary_launch::current_process()==process&&std::this_thread::get_id()==thread;
     }
@@ -141,6 +142,7 @@ struct ordinary_target_history_spool::state {
 #endif
 };
 struct ordinary_target_history_page_append::state {
+    ordinary_target_raw_object_tail terminal_raw_tail_; // First, before input/charge and all fixed native banks.
     using spool_state=ordinary_target_history_spool::state;
     // Declared before the actual input alias so reservation destruction follows
     // real input destruction, including retained failed/unknown native debt.
@@ -185,11 +187,12 @@ struct ordinary_target_history_page_append::state {
     state(const std::shared_ptr<spool_state>& actual,const ordinary_target_history_spool& original,
         const ordinary_history_decoded_page& input,std::uint64_t before,
         std::shared_ptr<ordinary_resource_reservation<true>> charge,std::shared_ptr<const ordinary_history_decoded_page> pin)
-        :decoder_charge(std::move(charge)),input_pin(std::move(pin)),spool(actual),spool_identity(actual.get()),facade(&original),connection_identity(actual->connection_identity),
+        :terminal_raw_tail_(this,this,3),decoder_charge(std::move(charge)),input_pin(std::move(pin)),spool(actual),spool_identity(actual.get()),facade(&original),connection_identity(actual->connection_identity),
          receiver_identity(actual->receiver_identity),page_identity(&input),index(input.index),offset(before),length(input.raw.size()),
-         device(actual->device),inode(actual->inode),fd(actual->fd),previous(input.previous),digest(input.full_digest){}
+         device(actual->device),inode(actual->inode),fd(actual->fd),previous(input.previous),digest(input.full_digest){terminal_raw_tail_.construction_returned_=true;}
 };
-ordinary_target_history_page_append::ordinary_target_history_page_append(std::shared_ptr<state> value):state_(std::move(value)){}
+ordinary_target_history_page_append::ordinary_target_history_page_append(std::shared_ptr<state> value)
+    :terminal_raw_tail_(this,value.get(),2),state_(std::move(value)){terminal_raw_tail_.construction_returned_=true;}
 ordinary_target_history_page_append::~ordinary_target_history_page_append()=default; // No implicit native cleanup/refund.
 bool ordinary_target_history_page_append::release_input_after_cleanup()noexcept {
     const auto phase=state_;const auto data=phase?phase->spool.lock():nullptr;
@@ -283,7 +286,8 @@ std::pair<std::uint64_t,std::uint64_t> ordinary_target_history_page_append::requ
 #endif
     return {phase->offset,phase->length}; // Historical DATA only; no input or reader lease is renewed.
 }
-ordinary_target_history_spool::ordinary_target_history_spool(std::shared_ptr<state> value):state_(std::move(value)){}
+ordinary_target_history_spool::ordinary_target_history_spool(std::shared_ptr<state> value)
+    :terminal_raw_tail_(this,value.get(),0),state_(std::move(value)){terminal_raw_tail_.construction_returned_=true;}
 // No destructor syscall, implicit cleanup, fallback, retry or quota refund.
 ordinary_target_history_spool::~ordinary_target_history_spool()=default;
 void ordinary_target_history_spool::require_current(ordinary_launch::deadline end)const {

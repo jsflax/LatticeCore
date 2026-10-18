@@ -66,8 +66,10 @@ struct namespace_retirement_observation {
     bool preserved_unadopted = false;
 };
 
-// Private installer-owned filesystem transition. It does not open SQLite or
-// change its bytes. Old paths remain denied permanently; no rollback, symlink
+// Private installer-owned filesystem transition. Its generic filesystem API
+// grants no SQLite access. Only the retained-generation issuers may invoke the
+// separate checkpoint-only engine after genuine controller retirement and
+// before any child launch. Old paths remain denied permanently; no rollback,
 // redirect, chmod repair of an old path or delete-and-recreate operation exists.
 class engram_namespace_retirement final {
     friend class retained_engram_upgrade_session;

@@ -15,6 +15,7 @@ class target_staging_open_ledger final : public detail::database_open_ledger {
 public:
     ~target_staging_open_ledger() = default;
 };
+static_assert(sizeof(target_staging_open_ledger)==sizeof(detail::database_open_ledger));
 std::shared_ptr<detail::database_open_ledger> target_staging_ledger() {
     auto* actual=new target_staging_open_ledger;
     return std::shared_ptr<detail::database_open_ledger>(actual,[](auto* owner) noexcept {
@@ -25,6 +26,7 @@ std::shared_ptr<detail::database_open_ledger> target_staging_ledger() {
 }
 
 struct database::target_staging_state {
+    detail::ordinary_target_scope_root_tail terminal_receiving_tail_{this,7}; // First: ALL actual Native first banks end before this tail.
     const uint64_t creator=detail::database_native_process();
     const std::thread::id thread=std::this_thread::get_id();
     const detail::ordinary_launch::deadline end;
@@ -52,6 +54,24 @@ struct database::target_staging_state {
     bool terminal_scope_ending_attempted=false,terminal_scope_ending_returned=false;
     detail::ordinary_target_staging_connection::terminal_scope_retirement_result terminal_scope_result=
         detail::ordinary_target_staging_connection::terminal_scope_retirement_result::retained_debt;
+    struct terminal_native_static_record;
+    struct terminal_native_static_tail;
+    struct terminal_native_static_ending;
+    bool terminal_native_statics_attempted=false,terminal_native_statics_allocation_returned=false,terminal_native_statics_allocation_exception_returned=false;
+    std::exception_ptr terminal_native_statics_first_failure;
+    std::shared_ptr<terminal_native_static_ending> terminal_native_statics_original;
+    struct terminal_native_page_record;
+    struct terminal_native_page_tail;
+    struct terminal_native_page_ending;
+    bool terminal_native_pages_attempted=false,terminal_native_pages_allocation_returned=false,terminal_native_pages_allocation_exception_returned=false;
+    std::exception_ptr terminal_native_pages_first_failure;
+    std::shared_ptr<terminal_native_page_ending> terminal_native_pages_original;
+    struct terminal_native_outer_record;
+    struct terminal_native_outer_tail;
+    struct terminal_native_outer_ending;
+    bool terminal_native_outer_attempted=false,terminal_native_outer_allocation_returned=false,terminal_native_outer_allocation_exception_returned=false;
+    std::exception_ptr terminal_native_outer_first_failure;
+    std::shared_ptr<terminal_native_outer_ending> terminal_native_outer_original;
     struct terminal_native_phase_record;
     struct terminal_native_phase_tail;
     struct terminal_native_phase_ending;
@@ -178,26 +198,26 @@ struct database::target_staging_state {
                 index=11+original->udf_queries++;query=&original->schema_statements[index];
                 auto& prepare=original->reserve_schema(schema_native_kind::prepare,index,false);
                 original->require_schema_work(*held->shell);query->prepare_attempted=true;prepare.entered=true;
-                query->prepare_rc=sqlite3_prepare_v2(held->native,"SELECT disabled FROM _SyncControl WHERE id=1",-1,&query->held,nullptr);
+                query->prepare_rc=::lattice::detail::store_physical_prepare_v2(held->native,"SELECT disabled FROM _SyncControl WHERE id=1",-1,&query->held,nullptr);
                 query->prepared_identity=query->held;
                 query->prepare_returned=true;returned_schema(prepare,query->prepare_rc);
                 if(query->prepare_rc!=SQLITE_OK||!query->held)throw db_error("target UDF read preparation failed");
                 original->require_schema_work(*held->shell);
                 auto& step=original->reserve_schema(schema_native_kind::step,index,false);
                 original->require_schema_work(*held->shell);query->step_attempted=true;step.entered=true;
-                query->step_rc=sqlite3_step(query->held);query->step_returned=true;returned_schema(step,query->step_rc);
+                query->step_rc=::lattice::detail::store_physical_step(query->held);query->step_returned=true;returned_schema(step,query->step_rc);
                 if(query->step_rc!=SQLITE_ROW)throw db_error("target UDF actual control row unavailable");
                 const auto value=original->read_fixed_control_integer(*held->shell,*query,index);
                 if(value!=0&&value!=1)throw db_error("target UDF actual control value malformed");
                 original->require_schema_work(*held->shell);
                 auto& done=original->reserve_schema(schema_native_kind::step,index,false);
                 original->require_schema_work(*held->shell);done.entered=true;
-                const int terminal=sqlite3_step(query->held);returned_schema(done,terminal);
+                const int terminal=::lattice::detail::store_physical_step(query->held);returned_schema(done,terminal);
                 if(terminal!=SQLITE_DONE)throw db_error("target UDF control row not unique/complete");
                 original->require_schema_work(*held->shell);
                 auto& finalize=original->reserve_schema(schema_native_kind::finalize,index,false);
                 original->require_schema_work(*held->shell);query->finalized_identity=query->held;query->finalize_attempted=true;finalize.entered=true;
-                query->finalize_rc=sqlite3_finalize(query->held);query->finalize_returned=true;
+                query->finalize_rc=::lattice::detail::store_physical_finalize(query->held);query->finalize_returned=true;
                 returned_schema(finalize,query->finalize_rc);
                 query->finalize_destruction_known=(query->finalize_rc&0xff)!=SQLITE_MISUSE;
                 if(query->finalize_destruction_known)query->held=nullptr;
@@ -210,7 +230,7 @@ struct database::target_staging_state {
                     if(query&&query->held&&!query->finalize_attempted) {
                         auto& finalize=original->reserve_schema(schema_native_kind::finalize,index,true);
                         query->finalized_identity=query->held;query->finalize_attempted=true;finalize.entered=true;
-                        query->finalize_rc=sqlite3_finalize(query->held);query->finalize_returned=true;
+                        query->finalize_rc=::lattice::detail::store_physical_finalize(query->held);query->finalize_returned=true;
                         returned_schema(finalize,query->finalize_rc);
                         query->finalize_destruction_known=(query->finalize_rc&0xff)!=SQLITE_MISUSE;
                         if(query->finalize_destruction_known)query->held=nullptr;
@@ -228,7 +248,7 @@ struct database::target_staging_state {
     target_staging_state(const std::shared_ptr<detail::ordinary_target_staging_connection>& owner,
         const std::shared_ptr<detail::ordinary_target_staging_io>& original,
         const std::shared_ptr<detail::database_open_ledger>& custody,size_t n,uint64_t sequence)
-        :end(owner->original_deadline()),connection(owner),io(original),ledger(custody),slot(n),serial(sequence) {}
+        :end(owner->original_deadline()),connection(owner),io(original),ledger(custody),slot(n),serial(sequence) {terminal_receiving_tail_.construction_returned_=true;}
     bool current_creator()const noexcept {
         return creator==detail::database_native_process()&&thread==std::this_thread::get_id();
     }
@@ -294,6 +314,7 @@ database::database(initialization_key key,target_staging_deferred_t)
     suppress_destructor_optimize_=true;
     // No public query/CRUD/raw route is created by fixed initialization.
     closed_.store(true,std::memory_order_release);
+    target_terminal_shell_tail_.construction_returned_=true;
 }
 
 void database::initialize_target_staging_() {
@@ -328,15 +349,22 @@ void database::initialize_target_staging_() {
 #endif
         // MAIN was born exclusively by the genuine connection. No CREATE,
         // URI, legacy path, ordinary WAL fallback or caller-supplied VFS exists.
-        state->require_constructor_current(*this); // After fallible preparation, immediately before open.
+        state->require_constructor_current(*this);
+        // Issue from this already-admitted target constructor BEFORE actual
+        // open. Normal Host/resource acquisition has no authority over it.
+        if(!physical_open_original_.issue_exclusive_target_(state->creator))
+            throw db_error("target constructor physical-open original already issued or inherited");
+        state->require_constructor_current(*this);
         state->ledger->native_open_entered(state->slot,state->serial);
         state->native_open_attempted=true;
-        state->first_open_result=sqlite3_open_v2(path_.c_str(),&db_,flags,vfs);
+        state->first_open_result=physical_open_original_.open_exclusive_target_(path_.c_str(),&db_,flags,vfs,state->end);
         state->native_open_returned=true; // Immediate nonthrowing first-result capture.
         state->constructor_scope->record_sqlite_open(*this,db_,state->first_open_result);
         if(!db_)retirement_->record_close(SQLITE_OK,detail::database_retirement_state::not_attempted);
         if(state->first_open_result!=SQLITE_OK)throw db_error("target native SQLite open failed");
         if(!db_)throw db_error("target native SQLite returned no connection");
+        if(!physical_open_original_.matches_open_(db_))
+            throw db_error("target fixed sqlite open lost its issued actual original");
         state->require_constructor_current(*this); // Postchecks cannot erase native rcOK.
         struct echo {
             const char* expected;size_t rows=0;bool exact=true;
@@ -352,7 +380,7 @@ void database::initialize_target_staging_() {
             state->require_constructor_current(*this);
             auto& call=state->begin_configuration_call();
             echo result{expected};
-            call.result=sqlite3_exec(db_,sql,expected?&echo::row:nullptr,expected?&result:nullptr,nullptr);
+            call.result=::lattice::detail::store_physical_exec(db_,sql,expected?&echo::row:nullptr,expected?&result:nullptr,nullptr);
             call.returned=true; // First native terminal result precedes current/error conversion.
             state->constructor_scope->record_configuration_result(*this,call.result);
             if(call.result!=SQLITE_OK||(expected&&(!result.exact||result.rows!=1)))
@@ -436,11 +464,11 @@ void database::retire_target_staging_()noexcept {
     // SQLite invokes its genuine xDestroy; no user/model observer is mounted.
     // Real SQLite close and fallback have independent immutable first results.
     auto* actual=std::exchange(db_,nullptr);
-    state->first_close_result=sqlite3_close(actual);
+    state->first_close_result=::lattice::detail::store_physical_close_owned(physical_open_original_,actual);
     state->close_returned=true;
     state->cleanup_scope->record_sqlite_close(*this,state->first_close_result);
     if(state->first_close_result!=SQLITE_OK){
-        state->first_fallback_result=sqlite3_close_v2(actual);
+        state->first_fallback_result=::lattice::detail::store_physical_close_v2_owned(physical_open_original_,actual);
         state->fallback_returned=true;
     }
     if(retirement_)retirement_->record_close(state->first_close_result,state->first_fallback_result);
@@ -506,7 +534,8 @@ void database::require_target_fixed_constructor_(const detail::ordinary_target_s
     if(!state||!state->current_creator()||state->connection.lock().get()!=&original||!db_||
        !retirement_||retirement_->owning_wrapper_moved()||retirement_->raw_handle_escaped()||
        !state->initialization_attempted||!state->native_open_attempted||!state->native_open_returned||
-       state->first_open_result!=SQLITE_OK||!state->configured||!state->constructor_left||
+       state->first_open_result!=SQLITE_OK||!physical_open_original_.exclusive_target_||!physical_open_original_.matches_open_(db_)||
+       !state->configured||!state->constructor_left||
        !state->constructor_scope||!state->constructor_scope->leave(*this)||state->retirement_requested||
        state->cleanup_attempted||state->configuration_attempts!=18)
         throw db_error("target schema requires actual fixed constructor ending");
@@ -528,7 +557,7 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
         if(ending)state->require_schema_current(*this);else state->require_schema_work(*this);
         auto& call=state->reserve_schema(target_staging_state::schema_native_kind::finalize,index,ending);
         if(ending)state->require_schema_current(*this);else state->require_schema_work(*this);statement.finalized_identity=statement.held;statement.finalize_attempted=true;call.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;
         target_staging_state::returned_schema(call,statement.finalize_rc);
         statement.finalize_destruction_known=(statement.finalize_rc&0xff)!=SQLITE_MISUSE;
         if(statement.finalize_destruction_known)statement.held=nullptr;
@@ -544,7 +573,7 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
         auto& prepare=state->reserve_schema(target_staging_state::schema_native_kind::prepare,index,ending);
         if(ending)state->require_schema_current(*this);else state->require_schema_work(*this);statement.prepare_attempted=true;prepare.entered=true;
         const char* tail=nullptr;
-        statement.prepare_rc=sqlite3_prepare_v2(db_,sql,-1,&statement.held,&tail);statement.prepare_returned=true;
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(db_,sql,-1,&statement.held,&tail);statement.prepare_returned=true;
         statement.prepared_identity=statement.held;
         target_staging_state::returned_schema(prepare,statement.prepare_rc);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held)throw db_error("target generated statement preparation failed");
@@ -553,7 +582,7 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
         if(ending)state->require_schema_current(*this);else state->require_schema_work(*this);
         auto& step=state->reserve_schema(target_staging_state::schema_native_kind::step,index,ending);
         if(ending)state->require_schema_current(*this);else state->require_schema_work(*this);statement.step_attempted=true;step.entered=true;
-        statement.step_rc=sqlite3_step(statement.held);statement.step_returned=true;
+        statement.step_rc=::lattice::detail::store_physical_step(statement.held);statement.step_returned=true;
         target_staging_state::returned_schema(step,statement.step_rc);
         if(index==0)state->schema_scope->record_schema_begin(*this,statement.step_rc);
         if(index==8)state->schema_scope->record_schema_commit(*this,statement.step_rc);
@@ -566,14 +595,14 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
         state->require_schema_work(*this);
         auto& prepare=state->reserve_schema(target_staging_state::schema_native_kind::prepare,index,false);
         state->require_schema_work(*this);statement.prepare_attempted=true;prepare.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(db_,"SELECT sync_disabled()",-1,&statement.held,nullptr);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(db_,"SELECT sync_disabled()",-1,&statement.held,nullptr);
         statement.prepared_identity=statement.held;
         statement.prepare_returned=true;target_staging_state::returned_schema(prepare,statement.prepare_rc);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held)throw db_error("target actual UDF probe preparation failed");
         state->require_schema_work(*this);
         auto& step=state->reserve_schema(target_staging_state::schema_native_kind::step,index,false);
         state->require_schema_work(*this);statement.step_attempted=true;step.entered=true;
-        statement.step_rc=sqlite3_step(statement.held);statement.step_returned=true;
+        statement.step_rc=::lattice::detail::store_physical_step(statement.held);statement.step_returned=true;
         target_staging_state::returned_schema(step,statement.step_rc);
         if(statement.step_rc!=SQLITE_ROW)throw db_error("target actual UDF/control result unavailable");
         if(state->read_fixed_control_integer(*this,statement,index)!=0)
@@ -581,7 +610,7 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
         state->require_schema_work(*this);
         auto& done=state->reserve_schema(target_staging_state::schema_native_kind::step,index,false);
         state->require_schema_work(*this);done.entered=true;
-        const int terminal=sqlite3_step(statement.held);target_staging_state::returned_schema(done,terminal);
+        const int terminal=::lattice::detail::store_physical_step(statement.held);target_staging_state::returned_schema(done,terminal);
         if(terminal!=SQLITE_DONE)throw db_error("target actual UDF probe did not complete uniquely");
         state->require_schema_work(*this);finalize(index,false);
     };
@@ -593,7 +622,7 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
         state->require_schema_work(*this);
         state->userdata_original=userdata.get(); // SAME owned object before native ownership transfer.
         state->udf_registration_attempted=true;auto* actual=userdata.release();registration.entered=true;
-        state->first_udf_registration_result=sqlite3_create_function_v2(db_,"sync_disabled",0,SQLITE_UTF8,actual,
+        state->first_udf_registration_result=::lattice::detail::store_physical_create_function_v2(db_,"sync_disabled",0,SQLITE_UTF8,actual,
             &target_staging_state::sync_control_userdata::invoke,nullptr,nullptr,
             &target_staging_state::sync_control_userdata::destroy);
         state->udf_registration_returned=true;
@@ -642,15 +671,18 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
 }
 } // namespace lattice
 
+#include "ordinary_target_terminal_static_tail_database.inc"
 #include "ordinary_target_catalog_database.inc"
 
 #include "ordinary_target_history_header_database.inc"
 
+#include "ordinary_target_terminal_page_tail_database.inc"
 #include "ordinary_target_history_page_database.inc"
 
 #include "ordinary_target_history_projection_database.inc"
 
 #include "ordinary_target_terminal_phase_tail_database.inc"
+#include "ordinary_target_terminal_outer_tail_database.inc"
 #include "ordinary_target_history_chain_database.inc"
 #include "ordinary_target_import_suspension_database.inc"
 #include "ordinary_target_history_row_import_database.inc"
@@ -658,3 +690,10 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
 #include "ordinary_target_abandonment_database.inc"
 #include "ordinary_target_terminal_decoder_database.inc"
 #include "ordinary_target_terminal_phase_database.inc"
+#include "ordinary_target_terminal_outer_database.inc"
+#include "ordinary_target_terminal_page_database.inc"
+#include "ordinary_target_terminal_static_database.inc"
+#include "ordinary_target_terminal_programme_database.inc"
+
+#include "ordinary_target_terminal_scope_roots_database.inc"
+#include "ordinary_target_terminal_shell_database.inc"

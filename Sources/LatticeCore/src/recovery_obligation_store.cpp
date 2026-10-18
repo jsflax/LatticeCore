@@ -1,4 +1,9 @@
 #include "recovery_obligation_store.hpp"
+#include "recovery_obligation_bootstrap_statement.hpp"
+#include "ordinary_schema_projection.hpp"
+#include <cstring>
+#include <cstddef>
+#include <new>
 #include "recovery_producer_continuity.hpp"
 #include <string_view>
 #include "recovery_obligation_producer.hpp"
@@ -18,6 +23,7 @@ using mode=recovery_obligation_mode;
 using stage=recovery_obligation_stage;
 using origin=recovery_obligation_origin;
 using row=database::row_t;
+using bootstrap_kind=recovery_obligation_bootstrap_statement::kind;
 using blob=std::vector<uint8_t>;
 constexpr int64_t maximum=std::numeric_limits<int64_t>::max();
 [[noreturn]] void fail(code c,const char* m) { throw recovery_obligation_error(c,m); }
@@ -120,23 +126,25 @@ constexpr schema_definition definitions[]={
     {"_lattice_obligation_audit","CREATE INDEX main._lattice_obligation_audit ON _lattice_obligation_entry(audit_id,channel)"},
     {"_lattice_obligation_original","CREATE INDEX main._lattice_obligation_original ON _lattice_obligation_entry(original,audit_id)"},
 };
-std::string definition_sql(const schema_definition& definition,bool shared_domains) {
-    std::string value=definition.sql;
+template<class Text>Text definition_sql_storage(const schema_definition& definition,bool shared_domains) {
+    Text value=definition.sql;
     if(shared_domains&&(std::string_view(definition.name)=="_lattice_obligation_scope"||std::string_view(definition.name)=="_lattice_install_channel")) {
         const auto position=value.find(",UNIQUE(authority,scope)");
-        if(position==std::string::npos)fail(code::corrupt_state,"shared domain compiled schema unavailable");value.erase(position,24);
+        if(position==Text::npos)fail(code::corrupt_state,"shared domain compiled schema unavailable");value.erase(position,24);
     }
     return value;
 }
+std::string definition_sql(const schema_definition& definition,bool shared_domains) {return definition_sql_storage<std::string>(definition,shared_domains);}
 constexpr schema_definition domain_index{"_lattice_obligation_domain","CREATE INDEX main._lattice_obligation_domain ON _lattice_obligation_scope(authority,scope)"};
-void exact_definition(database&,const schema_definition&,bool shared_domains=false);
+void exact_definition(database&,const schema_definition&,bool shared_domains=false,recovery_obligation_bootstrap_reader* bootstrap=nullptr);
 struct backend {
     database& db;
     const recovery_obligation_limits& l;
     bool shared_domains=false;
+    recovery_obligation_bootstrap_reader* bootstrap=nullptr;
     global config() const {
-        auto rows=db.query("SELECT "+ints({"id","version","max_scopes","max_records","max_field","max_bytes","scopes","records","bytes","incarnation","record_sequence","export_sequence"})+
-            " FROM main._lattice_obligation_store LIMIT 2");
+        auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::obligation_config,{}):db.query("SELECT "+ints({"id","version","max_scopes","max_records","max_field","max_bytes","scopes","records","bytes","incarnation","record_sequence","export_sequence"})+
+            " FROM main._lattice_obligation_store LIMIT 2"));
         if (rows.size()!=1 || number(rows[0],"id")!=1 || number(rows[0],"version")!=(shared_domains?2:1)) fail(code::corrupt_state,"obligation missing/unsupported fixed metadata");
         const auto& r=rows[0];
         if (recovery_obligation_limits{number(r,"max_scopes"),number(r,"max_records"),number(r,"max_field"),number(r,"max_bytes")}!=l)
@@ -158,9 +166,9 @@ struct backend {
     }
     std::optional<scope_t> scope(const std::string& channel) const {
         field(channel,l);
-        auto rows=db.query("SELECT "+ints({"incarnation","generation","revision","last_attempt","freeze_revision","freeze_record","freeze_export","mode","installed_sequence","installed_revision","installed_head","bytes"})+
+        auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::scope,{bytes(channel)}):db.query("SELECT "+ints({"incarnation","generation","revision","last_attempt","freeze_revision","freeze_record","freeze_export","mode","installed_sequence","installed_revision","installed_head","bytes"})+
             blobs({"channel","authority","source","epoch","scope","schema_digest","profile_digest","receipt_namespace","installed_manifest"},l)+
-            " FROM main._lattice_obligation_scope WHERE channel=? LIMIT 2",{bytes(channel)});
+            " FROM main._lattice_obligation_scope WHERE channel=? LIMIT 2",{bytes(channel)}));
         if (rows.empty()) return {};
         if (rows.size()!=1) fail(code::corrupt_state,"obligation duplicate channel");
         const auto& r=rows[0]; scope_t s;
@@ -207,10 +215,10 @@ struct backend {
         if (scope(b.channel)!=s || config()!=expected_global) fail(code::corrupt_state,"obligation scope/counter write postimage differs");
     }
     std::optional<entry_t> entry(const scope_t& s,const std::string& key) const {
-        auto rows=db.query("SELECT "+ints({"audit_id","origin","record_sequence","first_export","stage","ack_position","ack_outcome","settled_sequence","bytes"})+
+        auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::entry,{bytes(s.address.channel),bytes(key)}):db.query("SELECT "+ints({"audit_id","origin","record_sequence","first_export","stage","ack_position","ack_outcome","settled_sequence","bytes"})+
             ",first_export IS NULL AS first_export_null,ack_position IS NULL AS ack_position_null,ack_outcome IS NULL AS ack_outcome_null"+
             blobs({"original","actual_original","table_name","target","actual_target"},l)+
-            " FROM main._lattice_obligation_entry WHERE channel=? AND original=? LIMIT 2",{bytes(s.address.channel),bytes(key)});
+            " FROM main._lattice_obligation_entry WHERE channel=? AND original=? LIMIT 2",{bytes(s.address.channel),bytes(key)}));
         if (rows.empty()) return {};
         if (rows.size()!=1) fail(code::corrupt_state,"obligation duplicate original identity");
         const auto& r=rows[0]; entry_t e;
@@ -231,12 +239,15 @@ struct backend {
             entry_size(e,l,s.address.channel,code::corrupt_state)!=number(r,"bytes")) fail(code::corrupt_state,"obligation contradictory identity state");
         return e;
     }
+    void require_entry_covered(const scope_t& s,const entry_t& e) const {
+        const auto g=config();
+        if (g.usage.records<1 || g.usage.encoded_bytes<entry_size(e,l,s.address.channel) || g.record<e.sequence ||
+            (e.first_export_claim && g.export_claim<*e.first_export_claim)) fail(code::corrupt_state,"obligation counters do not cover addressed identity");
+    }
     entry_t required(const scope_t& s,const std::string& id) const {
         auto e=entry(s,uuid(id));
         if (!e) fail(code::conflict,"obligation original is not recorded for this scope");
-        const auto g=config();
-        if (g.usage.records<1 || g.usage.encoded_bytes<entry_size(*e,l,s.address.channel) || g.record<e->sequence ||
-            (e->first_export_claim && g.export_claim<*e->first_export_claim)) fail(code::corrupt_state,"obligation counters do not cover addressed identity");
+        require_entry_covered(s,*e);
         return *e;
     }
     recovery_obligation_record actual(const recovery_obligation_record& input) const {
@@ -249,8 +260,8 @@ struct backend {
         const auto project=[&](const char* n) { return "CASE WHEN typeof("+std::string(n)+")='text' AND length(CAST("+n+
             " AS BLOB)) BETWEEN 1 AND "+std::to_string(l.field_bytes)+" AND ("+total+")<="+std::to_string(l.encoded_bytes)+
             " THEN CAST("+n+" AS BLOB) ELSE NULL END AS "+n; };
-        auto rows=db.query("SELECT "+project("globalId")+","+project("tableName")+","+project("globalRowId")+","+
-            ints({"isFromRemote","synthesized"})+" FROM main.AuditLog WHERE id=? LIMIT 2",{input.audit_id});
+        auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::actual_audit,{input.audit_id}):db.query("SELECT "+project("globalId")+","+project("tableName")+","+project("globalRowId")+","+
+            ints({"isFromRemote","synthesized"})+" FROM main.AuditLog WHERE id=? LIMIT 2",{input.audit_id}));
         if (rows.size()!=1) fail(code::audit_mismatch,"obligation required original AuditLog row is absent");
         const auto& r=rows[0]; const auto remote=number(r,"isFromRemote"),synthetic=number(r,"synthesized");
         recovery_obligation_record a{input.audit_id,string(r,"globalId"),string(r,"tableName"),string(r,"globalRowId"),input.origin};
@@ -279,8 +290,8 @@ struct backend {
     std::vector<entry_t> entries(const scope_t& s,bool active_only,bool check_bodies) const {
         std::vector<entry_t> result; int64_t after=0,total=0;
         for (;;) {
-            auto rows=db.query("SELECT "+ints({"audit_id"})+blobs({"original"},l)+
-                " FROM main._lattice_obligation_entry WHERE channel=? AND audit_id>? ORDER BY audit_id LIMIT 1",{bytes(s.address.channel),after});
+            auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::entry_page,{bytes(s.address.channel),after}):db.query("SELECT "+ints({"audit_id"})+blobs({"original"},l)+
+                " FROM main._lattice_obligation_entry WHERE channel=? AND audit_id>? ORDER BY audit_id LIMIT 1",{bytes(s.address.channel),after}));
             if (rows.empty()) break;
             if (result.size()>=static_cast<uint64_t>(l.records)) fail(code::corrupt_state,"obligation record count exceeds explicit cap");
             auto e=required(s,string(rows[0],"original"));
@@ -301,16 +312,16 @@ struct backend {
         for (const auto& definition:definitions) {
             std::string expected=definition_sql(definition,shared_domains);
             expected.erase(expected.find("main."),5);
-            const auto rows=db.query("SELECT CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))=? THEN CAST(sql AS BLOB) ELSE NULL END AS definition "
-                "FROM main.sqlite_schema WHERE name=? LIMIT 2",{static_cast<int64_t>(expected.size()),std::string(definition.name)});
+            const auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::definition_else_null,{static_cast<int64_t>(expected.size()),std::string(definition.name)}):db.query("SELECT CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))=? THEN CAST(sql AS BLOB) ELSE NULL END AS definition "
+                "FROM main.sqlite_schema WHERE name=? LIMIT 2",{static_cast<int64_t>(expected.size()),std::string(definition.name)}));
             if (rows.size()!=1 || string(rows[0],"definition")!=expected) fail(code::corrupt_state,"obligation required table/index definition differs");
         }
-        if(shared_domains)exact_definition(db,domain_index);
+        if(shared_domains)exact_definition(db,domain_index,true,bootstrap);
         // Fixed-shape checks are explicit integrity work, never per-identity
         // settlement scans. WITHOUT ROWID also avoids generic row-hook queues.
         for (const auto& [name,columns]:std::initializer_list<std::pair<const char*,int64_t>>{
             {"_lattice_obligation_store",12},{"_lattice_obligation_scope",21},{"_lattice_obligation_entry",15}}) {
-            const auto shape=db.query("SELECT ncol,wr FROM pragma_table_list WHERE schema='main' AND type='table' AND name=? LIMIT 2",{std::string(name)});
+            const auto shape=(bootstrap?bootstrap->query_(bootstrap_kind::obligation_shape,{std::string(name)}):db.query("SELECT ncol,wr FROM pragma_table_list WHERE schema='main' AND type='table' AND name=? LIMIT 2",{std::string(name)}));
             if (shape.size()!=1 || number(shape[0],"wr")!=1 || number(shape[0],"ncol")!=columns)
                 fail(code::corrupt_state,"obligation internal table shape differs");
         }
@@ -318,8 +329,8 @@ struct backend {
         if(preserved){preserved->store=g;preserved->scopes.clear();}
         std::string after; bool first=true;
         for (;;) {
-            auto rows=db.query("SELECT "+blobs({"channel"},l).substr(1)+" FROM main._lattice_obligation_scope "+
-                (first ? "" : "WHERE channel>? ")+"ORDER BY channel LIMIT 1",first ? std::vector<column_value_t>{}:std::vector<column_value_t>{bytes(after)});
+            auto rows=(bootstrap?bootstrap->query_(first?bootstrap_kind::scope_page_first:bootstrap_kind::scope_page_after,first ? std::vector<column_value_t>{}:std::vector<column_value_t>{bytes(after)}):db.query("SELECT "+blobs({"channel"},l).substr(1)+" FROM main._lattice_obligation_scope "+
+                (first ? "" : "WHERE channel>? ")+"ORDER BY channel LIMIT 1",first ? std::vector<column_value_t>{}:std::vector<column_value_t>{bytes(after)}));
             if (rows.empty()) break;
             if (observed.scopes>=l.scopes) fail(code::corrupt_state,"obligation scope count exceeds explicit cap");
             after=string(rows[0],"channel"); first=false;
@@ -338,20 +349,20 @@ struct backend {
         // INT64_MAX boundary rather than overflow cap+1 or silently undercount.
         const auto record_limit=l.records==maximum ? maximum:l.records+1;
         const auto scope_limit=l.scopes==maximum ? maximum:l.scopes+1;
-        const auto count=db.query("SELECT COUNT(*) AS n FROM (SELECT 1 FROM main._lattice_obligation_entry LIMIT ?)",{record_limit});
-        const auto scopes=db.query("SELECT COUNT(*) AS n FROM (SELECT 1 FROM main._lattice_obligation_scope LIMIT ?)",{scope_limit});
+        const auto count=(bootstrap?bootstrap->query_(bootstrap_kind::record_count,{record_limit}):db.query("SELECT COUNT(*) AS n FROM (SELECT 1 FROM main._lattice_obligation_entry LIMIT ?)",{record_limit}));
+        const auto scopes=(bootstrap?bootstrap->query_(bootstrap_kind::scope_count,{scope_limit}):db.query("SELECT COUNT(*) AS n FROM (SELECT 1 FROM main._lattice_obligation_scope LIMIT ?)",{scope_limit}));
         const auto actual_records=number(count.at(0),"n"),actual_scopes=number(scopes.at(0),"n");
         if (actual_records==record_limit || actual_scopes==scope_limit || observed!=g.usage || actual_records!=observed.records || actual_scopes!=observed.scopes)
             fail(code::corrupt_state,"obligation durable counters disagree or audit work cap reached");
         // Overflow has already refused; DISTINCT cannot sort unbounded orphan
         // input even if a future damaged file somehow violates uniqueness.
-        const auto distinct_scopes=db.query("SELECT COUNT(DISTINCT incarnation) AS n FROM (SELECT incarnation FROM main._lattice_obligation_scope LIMIT ?)",{scope_limit});
-        const auto distinct_entries=db.query("SELECT COUNT(DISTINCT record_sequence) AS n FROM (SELECT record_sequence FROM main._lattice_obligation_entry LIMIT ?)",{record_limit});
+        const auto distinct_scopes=(bootstrap?bootstrap->query_(bootstrap_kind::distinct_scopes,{scope_limit}):db.query("SELECT COUNT(DISTINCT incarnation) AS n FROM (SELECT incarnation FROM main._lattice_obligation_scope LIMIT ?)",{scope_limit}));
+        const auto distinct_entries=(bootstrap?bootstrap->query_(bootstrap_kind::distinct_entries,{record_limit}):db.query("SELECT COUNT(DISTINCT record_sequence) AS n FROM (SELECT record_sequence FROM main._lattice_obligation_entry LIMIT ?)",{record_limit}));
         if (number(distinct_scopes.at(0),"n")!=observed.scopes || number(distinct_entries.at(0),"n")!=observed.records)
             fail(code::corrupt_state,"obligation committed identities were reused");
     }
     void verify_aliases(const receive_install_binding& binding)const {
-        const auto keys=db.query("SELECT "+blobs({"channel"},l).substr(1)+" FROM main._lattice_obligation_scope WHERE authority=? AND scope=? ORDER BY channel LIMIT 17",{bytes(binding.authority),bytes(binding.scope)});
+        const auto keys=(bootstrap?bootstrap->query_(bootstrap_kind::alias_channels,{bytes(binding.authority),bytes(binding.scope)}):db.query("SELECT "+blobs({"channel"},l).substr(1)+" FROM main._lattice_obligation_scope WHERE authority=? AND scope=? ORDER BY channel LIMIT 17",{bytes(binding.authority),bytes(binding.scope)}));
         if(keys.size()>16)fail(code::capacity,"obligation shared domain channel capacity");
         for(const auto& key:keys){const auto existing=scope(string(key,"channel"));
             if(!existing||existing->profile.binding.authority!=binding.authority||existing->profile.binding.source!=binding.source||existing->profile.binding.epoch!=binding.epoch||
@@ -446,7 +457,10 @@ entry_t recovery_obligation_store::record(const recovery_obligation_address& a,c
 }
 std::optional<entry_t> recovery_obligation_store::find(const recovery_obligation_address& a,const std::string& id) const {
     backend b{writer(),limits_,shared_domains_}; auto s=b.current(a); auto result=b.entry(s,uuid(id));
-    if (result) b.required(s,id); return result;
+    // The addressed entry is already decoded and checked in this exact owned
+    // transaction. Reuse it while retaining the original later config/counter
+    // coverage check; do not issue and discard a second identical entry read.
+    if (result) b.require_entry_covered(s,*result); return result;
 }
 recovery_obligation_export_ticket recovery_obligation_store::claim_export(const recovery_obligation_address& a,const std::vector<std::string>& ids) {
     backend b{writer(),limits_,shared_domains_};
@@ -656,10 +670,10 @@ constexpr schema_definition install_definitions[]={
  {"_lattice_install_store","CREATE TABLE main._lattice_install_store(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,max_channels INTEGER NOT NULL,max_field_bytes INTEGER NOT NULL,max_bytes INTEGER NOT NULL,channels INTEGER NOT NULL,bytes INTEGER NOT NULL) WITHOUT ROWID"},
  {"_lattice_install_channel","CREATE TABLE main._lattice_install_channel(channel BLOB PRIMARY KEY NOT NULL,authority BLOB NOT NULL,source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_digest BLOB NOT NULL,frontier_kind INTEGER NOT NULL,frontier INTEGER,revision INTEGER NOT NULL,last_sequence INTEGER NOT NULL,active BLOB,last_install BLOB,bytes INTEGER NOT NULL,UNIQUE(authority,scope)) WITHOUT ROWID"}
 };
-void exact_definition(database& db,const schema_definition& d,bool shared_domains) {
+void exact_definition(database& db,const schema_definition& d,bool shared_domains,recovery_obligation_bootstrap_reader* bootstrap) {
     std::string expected=definition_sql(d,shared_domains); expected.erase(expected.find("main."),5);
-    auto rows=db.query("SELECT CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))=? THEN CAST(sql AS BLOB) END AS definition FROM main.sqlite_schema WHERE name=? LIMIT 2",
-        {static_cast<int64_t>(expected.size()),std::string(d.name)});
+    auto rows=(bootstrap?bootstrap->query_(bootstrap_kind::definition,{static_cast<int64_t>(expected.size()),std::string(d.name)}):db.query("SELECT CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))=? THEN CAST(sql AS BLOB) END AS definition FROM main.sqlite_schema WHERE name=? LIMIT 2",
+        {static_cast<int64_t>(expected.size()),std::string(d.name)}));
     if (rows.size()!=1 || string(rows[0],"definition")!=expected) fail(code::corrupt_state,"producer required schema/index differs");
 }
 void producer_policy(const producer_limits& l) {
@@ -688,7 +702,7 @@ struct producer_backend {
     backend base;
     const producer_limits& l;
     producer_usage config()const {
-        auto rows=base.db.query("SELECT "+ints({"id","version","max_profiles","max_stamps","max_field","max_manifest","max_bytes","profiles","stamps","bytes"})+" FROM main._lattice_obligation_producer_store LIMIT 2");
+        auto rows=(base.bootstrap?base.bootstrap->query_(bootstrap_kind::producer_config,{}):base.db.query("SELECT "+ints({"id","version","max_profiles","max_stamps","max_field","max_manifest","max_bytes","profiles","stamps","bytes"})+" FROM main._lattice_obligation_producer_store LIMIT 2"));
         if(rows.size()!=1 || number(rows[0],"id")!=1 || number(rows[0],"version")!=1)fail(code::corrupt_state,"producer missing/unsupported fixed metadata");
         const auto& r=rows[0];
         if(producer_limits{number(r,"max_profiles"),number(r,"max_stamps"),number(r,"max_field"),number(r,"max_manifest"),number(r,"max_bytes")}!=l)
@@ -704,11 +718,11 @@ struct producer_backend {
     }
     std::optional<producer_profile> profile(const std::string& channel)const {
         field(channel,base.l);producer_field(channel,l);
-        const auto rows=base.db.query("SELECT "+ints({"incarnation","program_revision","bytes"})+
+        const auto rows=(base.bootstrap?base.bootstrap->query_(bootstrap_kind::producer_profile,{l.field_bytes,l.encoded_bytes,l.manifest_bytes,l.encoded_bytes,bytes(channel)}):base.db.query("SELECT "+ints({"incarnation","program_revision","bytes"})+
             ",CASE WHEN typeof(program_digest)='blob' AND length(program_digest) BETWEEN 1 AND ? AND length(program_digest)+length(manifest)+length(channel)<=? THEN program_digest END AS program_digest,"
             "CASE WHEN typeof(manifest)='blob' AND length(manifest) BETWEEN 1 AND ? AND length(program_digest)+length(manifest)+length(channel)<=? THEN manifest END AS manifest "
             "FROM main._lattice_obligation_producer_profile WHERE channel=? LIMIT 2",
-            {l.field_bytes,l.encoded_bytes,l.manifest_bytes,l.encoded_bytes,bytes(channel)});
+            {l.field_bytes,l.encoded_bytes,l.manifest_bytes,l.encoded_bytes,bytes(channel)}));
         if(rows.empty())return {};if(rows.size()!=1)fail(code::corrupt_state,"producer duplicate profile");
         auto s=base.scope(channel);if(!s)fail(code::corrupt_state,"producer profile has no contribution");base.current(s->address);
         producer_profile p{s->profile,number(rows[0],"incarnation"),number(rows[0],"program_revision"),string(rows[0],"program_digest"),bytes(string(rows[0],"manifest"))};
@@ -717,8 +731,8 @@ struct producer_backend {
             fail(code::corrupt_state,"producer profile identity/charge differs");return p;
     }
     std::optional<recovery_obligation_producer_stamp> stamp(const scope_t& s,const std::string& key)const {
-        const auto rows=base.db.query("SELECT "+ints({"incarnation","program_revision","audit_id","record_sequence","generation","scope_revision","base_scopes","base_records","base_bytes","base_incarnation","base_export","producer_profiles","producer_stamps","producer_bytes","bytes"})+
-            " FROM main._lattice_obligation_producer_stamp WHERE channel=? AND original=? LIMIT 2",{bytes(s.address.channel),bytes(key)});
+        const auto rows=(base.bootstrap?base.bootstrap->query_(bootstrap_kind::producer_stamp,{bytes(s.address.channel),bytes(key)}):base.db.query("SELECT "+ints({"incarnation","program_revision","audit_id","record_sequence","generation","scope_revision","base_scopes","base_records","base_bytes","base_incarnation","base_export","producer_profiles","producer_stamps","producer_bytes","bytes"})+
+            " FROM main._lattice_obligation_producer_stamp WHERE channel=? AND original=? LIMIT 2",{bytes(s.address.channel),bytes(key)}));
         if(rows.empty())return {};if(rows.size()!=1)fail(code::corrupt_state,"producer duplicate original stamp");
         const auto p=profile(s.address.channel);if(!p)fail(code::corrupt_state,"producer stamp has no profile");
         const auto e=base.required(s,key);const auto& r=rows[0];
@@ -734,12 +748,12 @@ struct producer_backend {
         if(e.stage!=stage::settled)base.check_actual(e);return result;
     }
     std::vector<producer_profile> audit()const {
-        for(const auto& d:producer_definitions)exact_definition(base.db,d);
+        for(const auto& d:producer_definitions)exact_definition(base.db,d,false,base.bootstrap);
         const auto expected=config();producer_usage observed;std::vector<producer_profile> result;
         bool first=true;std::string after;
         for(;;) {
-            auto rows=base.db.query("SELECT CASE WHEN typeof(channel)='blob' AND length(channel) BETWEEN 1 AND ? THEN channel END AS channel FROM main._lattice_obligation_producer_profile "+
-                std::string(first?"":"WHERE channel>? ")+"ORDER BY channel LIMIT 1",first?std::vector<column_value_t>{l.field_bytes}:std::vector<column_value_t>{l.field_bytes,bytes(after)});
+            auto rows=(base.bootstrap?base.bootstrap->query_(first?bootstrap_kind::profile_page_first:bootstrap_kind::profile_page_after,first?std::vector<column_value_t>{l.field_bytes}:std::vector<column_value_t>{l.field_bytes,bytes(after)}):base.db.query("SELECT CASE WHEN typeof(channel)='blob' AND length(channel) BETWEEN 1 AND ? THEN channel END AS channel FROM main._lattice_obligation_producer_profile "+
+                std::string(first?"":"WHERE channel>? ")+"ORDER BY channel LIMIT 1",first?std::vector<column_value_t>{l.field_bytes}:std::vector<column_value_t>{l.field_bytes,bytes(after)}));
             if(rows.empty())break;if(observed.profiles>=l.profiles)fail(code::corrupt_state,"producer profile audit exceeds count cap");
             after=string(rows[0],"channel");first=false;auto p=profile(after);if(!p)fail(code::corrupt_state,"producer profile disappeared");
             ++observed.profiles;observed.bytes=add(observed.bytes,profile_charge(*p,base.l,l));
@@ -747,9 +761,9 @@ struct producer_backend {
         }
         first=true;std::string after_channel,after_original;
         for(;;) {
-            auto rows=base.db.query("SELECT CASE WHEN typeof(channel)='blob' AND length(channel) BETWEEN 1 AND ? THEN channel END AS channel,"
+            auto rows=(base.bootstrap?base.bootstrap->query_(first?bootstrap_kind::stamp_page_first:bootstrap_kind::stamp_page_after,first?std::vector<column_value_t>{l.field_bytes}:std::vector<column_value_t>{l.field_bytes,bytes(after_channel),bytes(after_original)}):base.db.query("SELECT CASE WHEN typeof(channel)='blob' AND length(channel) BETWEEN 1 AND ? THEN channel END AS channel,"
                 "CASE WHEN typeof(original)='blob' AND length(original)=36 THEN original END AS original FROM main._lattice_obligation_producer_stamp "+
-                std::string(first?"":"WHERE (channel,original)>(?,?) ")+"ORDER BY channel,original LIMIT 1",first?std::vector<column_value_t>{l.field_bytes}:std::vector<column_value_t>{l.field_bytes,bytes(after_channel),bytes(after_original)});
+                std::string(first?"":"WHERE (channel,original)>(?,?) ")+"ORDER BY channel,original LIMIT 1",first?std::vector<column_value_t>{l.field_bytes}:std::vector<column_value_t>{l.field_bytes,bytes(after_channel),bytes(after_original)}));
             if(rows.empty())break;if(observed.stamps>=l.stamps)fail(code::corrupt_state,"producer stamp audit exceeds count cap");
             after_channel=string(rows[0],"channel");after_original=string(rows[0],"original");first=false;
             if(uuid(after_original,code::corrupt_state)!=after_original)fail(code::corrupt_state,"producer stamp key is not canonical UUID");
@@ -928,39 +942,57 @@ std::string recovery_obligation_producer_program::emit_tail(const std::string& r
     return result.finish();
 }
 recovery_obligation_producer_inventory recovery_obligation_producer_store::bootstrap_profiles(std::shared_ptr<database> physical,const recovery_obligation_producer_discovery_limits& caps,
-    const std::function<void(database&,const recovery_obligation_producer_inventory&)>& validate,bool shared_domains){
+    const std::function<void(database&,const recovery_obligation_producer_inventory&)>& validate,bool shared_domains,recovery_obligation_bootstrap_reader* initialization){
+    if(!physical)fail(code::invalid_argument,"producer bootstrap requires retained physical connection");
+    physical->require_creator_();const auto issuer=database_native_process();
+    const auto current=[&]{if(issuer!=database_native_process())throw db_error("inherited producer bootstrap return");physical->require_creator_();};
     obligation_policy(caps.obligations);producer_policy(caps.producers);
     if(caps.installations.channels<0 || caps.installations.field_bytes<=0 || caps.installations.field_bytes>std::numeric_limits<int>::max() || caps.installations.encoded_bytes<0)
         fail(code::invalid_argument,"producer bootstrap invalid independent receiver caps");
     if(!physical)fail(code::invalid_argument,"producer bootstrap requires retained physical connection");
+    if(initialization)initialization->require_owner_(*physical);
+    store_physical_native_scope physical_call(*physical);
+    if(!physical_call.entered())fail(code::transaction_required,"resource Native caller original unavailable");
+    current();
     auto* handle=physical->internal_handle();auto* mutex=handle?sqlite3_db_mutex(handle):nullptr;
 #ifndef __EMSCRIPTEN__
     if(!mutex)fail(code::transaction_required,"producer bootstrap requires serialized physical connection");
 #endif
-    if(!handle || sqlite3_mutex_try(mutex)!=SQLITE_OK)fail(code::transaction_required,"producer bootstrap physical connection is busy");
-    struct release_mutex{sqlite3_mutex* mutex;~release_mutex(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    if(!handle)fail(code::transaction_required,"producer bootstrap physical connection is absent");
+    const auto mutex_rc=sqlite3_mutex_try(mutex);current();
+    if(mutex_rc!=SQLITE_OK)fail(code::transaction_required,"producer bootstrap physical connection is busy");
+    struct release_mutex {sqlite3_mutex* mutex;std::uint64_t issuer;
+        ~release_mutex(){if(issuer==database_native_process())sqlite3_mutex_leave(mutex);}
+    } release{mutex,issuer};
+    const auto autocommit=[&]{current();const auto value=sqlite3_get_autocommit(handle);current();return value;};
+    const auto transaction_state=[&]{current();const auto value=sqlite3_txn_state(handle,nullptr);current();return value;};
+    const auto total_changes=[&]{current();const auto value=sqlite3_total_changes64(handle);current();return value;};
+    const auto next_statement=[&](sqlite3_stmt* previous){current();auto* value=sqlite3_next_stmt(handle,previous);current();return value;};
+    const auto statement_busy=[&](sqlite3_stmt* statement){current();const auto value=sqlite3_stmt_busy(statement);current();return value;};
     if(!database::maintenance_scope::idle(*physical))fail(code::transaction_required,"producer bootstrap requires idle physical connection");
     database::maintenance_scope admission(*physical); // recursive level; first level was try-only
-    physical->execute("BEGIN");
+    if(!initialization)physical->execute("BEGIN");
     try {
-        if(sqlite3_get_autocommit(handle)!=0)fail(code::transaction_required,"producer bootstrap did not own read snapshot");
+        if(initialization)initialization->begin_();
+        if(autocommit()!=0)fail(code::transaction_required,"producer bootstrap did not own read snapshot");
         recovery_obligation_producer_inventory result;
-        auto family=physical->query("SELECT name FROM main.sqlite_schema WHERE name IN ('_lattice_obligation_producer_store','_lattice_obligation_producer_profile','_lattice_obligation_producer_stamp') LIMIT 4");
+        auto family=initialization?initialization->query_(bootstrap_kind::family):physical->query("SELECT name FROM main.sqlite_schema WHERE name IN ('_lattice_obligation_producer_store','_lattice_obligation_producer_profile','_lattice_obligation_producer_stamp') LIMIT 4");
         if(!family.empty()){
             if(family.size()!=3)fail(code::corrupt_state,"producer bootstrap partial family; migration refused");
-            for(const auto& d:producer_definitions)exact_definition(*physical,d);
-            for(const auto& d:definitions)exact_definition(*physical,d,shared_domains);
-            if(shared_domains)exact_definition(*physical,domain_index);
-            for(const auto& d:install_definitions)exact_definition(*physical,d,shared_domains);
-            if(shared_domains)exact_definition(*physical,{"_lattice_install_domain","CREATE INDEX main._lattice_install_domain ON _lattice_install_channel(authority,scope)"});
+            for(const auto& d:producer_definitions)exact_definition(*physical,d,false,initialization);
+            for(const auto& d:definitions)exact_definition(*physical,d,shared_domains,initialization);
+            if(shared_domains)exact_definition(*physical,domain_index,false,initialization);
+            for(const auto& d:install_definitions)exact_definition(*physical,d,shared_domains,initialization);
+            if(shared_domains)exact_definition(*physical,{"_lattice_install_domain","CREATE INDEX main._lattice_install_domain ON _lattice_install_channel(authority,scope)"},false,initialization);
+            if(initialization)initialization->validated_family_();
             // Read fixed scalar policy before any stored byte field. Every stored
             // limit must fit the independent adapter's discovery policy.
-            auto read_fixed=[&](const std::string& query,int64_t version=1){auto rows=physical->query(query);if(rows.size()!=1 || number(rows[0],"id")!=1 || number(rows[0],"version")!=version)fail(code::corrupt_state,"producer bootstrap fixed policy is missing/unknown");return rows[0];};
-            auto o=read_fixed("SELECT "+ints({"id","version","max_scopes","max_records","max_field","max_bytes"})+" FROM main._lattice_obligation_store LIMIT 2",shared_domains?2:1);
+            auto read_fixed=[&](bootstrap_kind recipe,const std::string& query,int64_t version=1){auto rows=initialization?initialization->query_(recipe):physical->query(query);if(rows.size()!=1 || number(rows[0],"id")!=1 || number(rows[0],"version")!=version)fail(code::corrupt_state,"producer bootstrap fixed policy is missing/unknown");return rows[0];};
+            auto o=read_fixed(bootstrap_kind::obligation_policy,"SELECT "+ints({"id","version","max_scopes","max_records","max_field","max_bytes"})+" FROM main._lattice_obligation_store LIMIT 2",shared_domains?2:1);
             result.stored_obligation_limits={number(o,"max_scopes"),number(o,"max_records"),number(o,"max_field"),number(o,"max_bytes")};
-            auto i=read_fixed("SELECT "+ints({"id","version","max_channels","max_field_bytes","max_bytes","channels","bytes"})+" FROM main._lattice_install_store LIMIT 2",shared_domains?2:1);
+            auto i=read_fixed(bootstrap_kind::installation_policy,"SELECT "+ints({"id","version","max_channels","max_field_bytes","max_bytes","channels","bytes"})+" FROM main._lattice_install_store LIMIT 2",shared_domains?2:1);
             result.stored_installation_limits={number(i,"max_channels"),number(i,"max_field_bytes"),number(i,"max_bytes")};
-            auto p=read_fixed("SELECT "+ints({"id","version","max_profiles","max_stamps","max_field","max_manifest","max_bytes"})+" FROM main._lattice_obligation_producer_store LIMIT 2");
+            auto p=read_fixed(bootstrap_kind::producer_policy,"SELECT "+ints({"id","version","max_profiles","max_stamps","max_field","max_manifest","max_bytes"})+" FROM main._lattice_obligation_producer_store LIMIT 2");
             result.stored_producer_limits={number(p,"max_profiles"),number(p,"max_stamps"),number(p,"max_field"),number(p,"max_manifest"),number(p,"max_bytes")};
             const auto& ol=result.stored_obligation_limits;const auto& il=result.stored_installation_limits;const auto& pl=result.stored_producer_limits;
             obligation_policy(ol);producer_policy(pl);
@@ -969,20 +1001,194 @@ recovery_obligation_producer_inventory recovery_obligation_producer_store::boots
                 pl.profiles>caps.producers.profiles || pl.stamps>caps.producers.stamps || pl.field_bytes>caps.producers.field_bytes || pl.manifest_bytes>caps.producers.manifest_bytes || pl.encoded_bytes>caps.producers.encoded_bytes ||
                 !fits(number(i,"channels"),0,il.channels) || !fits(number(i,"bytes"),0,il.encoded_bytes))
                 fail(code::capacity,"producer stored policy exceeds independent bootstrap admission");
-            producer_backend b{{*physical,ol,shared_domains},pl};b.base.full_audit();result.profiles=b.audit();result.initialized=true;
+            if(initialization)initialization->stored_limits_({ol,il,pl});
+            producer_backend b{{*physical,ol,shared_domains,initialization},pl};b.base.full_audit();result.profiles=b.audit();result.initialized=true;
         }
-        const auto before_validation=sqlite3_total_changes64(handle);
+        const auto before_validation=total_changes();
         if(validate)validate(*physical,result);
-        if(sqlite3_get_autocommit(handle)!=0 || sqlite3_txn_state(handle,nullptr)==SQLITE_TXN_WRITE || sqlite3_total_changes64(handle)!=before_validation)
+        current();
+        if(autocommit()!=0 || transaction_state()==SQLITE_TXN_WRITE || total_changes()!=before_validation)
             fail(code::transaction_required,"producer bootstrap validator changed its read-only snapshot");
-        for(auto* statement=sqlite3_next_stmt(handle,nullptr);statement;statement=sqlite3_next_stmt(handle,statement))
-            if(sqlite3_stmt_busy(statement))fail(code::transaction_required,"producer bootstrap validator left a live statement");
-        physical->execute("ROLLBACK");if(sqlite3_get_autocommit(handle)==0)fail(code::cleanup_failed,"producer bootstrap read snapshot did not settle");return result;
+        for(auto* statement=next_statement(nullptr);statement;statement=next_statement(statement))
+            if(statement_busy(statement))fail(code::transaction_required,"producer bootstrap validator left a live statement");
+        if(initialization)initialization->rollback_();else physical->execute("ROLLBACK");if(autocommit()==0)fail(code::cleanup_failed,"producer bootstrap read snapshot did not settle");return result;
     }catch(...){
-        auto primary=std::current_exception();
-        if(sqlite3_get_autocommit(handle)==0){try{physical->execute("ROLLBACK");if(sqlite3_get_autocommit(handle)==0)throw db_error("producer bootstrap remains in transaction");}
-            catch(...){throw recovery_obligation_error(code::cleanup_failed,"producer bootstrap rollback failed; retained physical connection must be discarded",primary,std::current_exception());}}
-        std::rethrow_exception(primary);
+        // Process-only fence precedes any inherited reader/writer/error DATA.
+        // Parent exceptions cannot be inspected/refcounted in this process.
+        if(issuer!=database_native_process())
+            throw recovery_obligation_error(code::cleanup_failed,
+                "inherited producer bootstrap cleanup has unknown ending; parent primary is inaccessible");
+        struct primary_custody {
+            using payload=std::exception_ptr;
+            const std::uint64_t issuer;
+            alignas(payload) std::byte storage[sizeof(payload)];
+            explicit primary_custody(std::uint64_t creator)noexcept:issuer(creator) {
+                ::new(static_cast<void*>(storage)) payload{};
+            }
+            payload& get()noexcept{return *std::launder(reinterpret_cast<payload*>(storage));}
+            ~primary_custody(){if(issuer==database_native_process())get().~payload();}
+            primary_custody(const primary_custody&)=delete;
+        } primary(issuer);
+        primary.get()=std::current_exception();
+        try {
+            // Fail the same budget monotonically BEFORE a health check can
+            // throw. All currentness/autocommit/rollback observations belong
+            // to this one guarded cleanup; refusal means real unknown debt.
+            if(initialization)initialization->fail_();
+            current();
+            if(autocommit()==0){
+                if(initialization)initialization->rollback_();else physical->execute("ROLLBACK");
+                if(autocommit()==0)throw db_error("producer bootstrap remains in transaction");
+            }
+        }catch(...){
+            if(issuer!=database_native_process())
+                throw recovery_obligation_error(code::cleanup_failed,
+                    "inherited producer bootstrap cleanup has unknown ending; parent errors are inaccessible");
+            throw recovery_obligation_error(code::cleanup_failed,
+                "producer bootstrap cleanup/ending observation failed; retained physical connection must be discarded",
+                primary.get(),std::current_exception());
+        }
+        if(issuer!=database_native_process())
+            throw recovery_obligation_error(code::cleanup_failed,
+                "inherited producer bootstrap cleanup return has unknown ending; parent primary is inaccessible");
+        std::rethrow_exception(primary.get());
     }
+}
+
+std::string recovery_obligation_bootstrap_reader::enrollment_schema_sql_(kind id)const {
+    require_enrollment_current_();const bool shared=shared_domains_();
+    switch(id) {
+    case kind::enrollment_install_store_create:return definition_sql(install_definitions[0],shared);
+    case kind::enrollment_install_channel_create:return definition_sql(install_definitions[1],shared);
+    case kind::enrollment_install_domain_create:
+        if(!shared)fail(code::corrupt_state,"unissued shared install index");
+        return "CREATE INDEX main._lattice_install_domain ON _lattice_install_channel(authority,scope)";
+    case kind::enrollment_obligation_store_create:return definition_sql(definitions[0],shared);
+    case kind::enrollment_obligation_scope_create:return definition_sql(definitions[1],shared);
+    case kind::enrollment_obligation_entry_create:return definition_sql(definitions[2],shared);
+    case kind::enrollment_obligation_audit_create:return definition_sql(definitions[3],shared);
+    case kind::enrollment_obligation_original_create:return definition_sql(definitions[4],shared);
+    case kind::enrollment_obligation_domain_create:
+        if(!shared)fail(code::corrupt_state,"unissued shared obligation index");
+        return definition_sql(domain_index,shared);
+    case kind::enrollment_producer_store_create:return producer_definitions[0].sql;
+    case kind::enrollment_producer_profile_create:return producer_definitions[1].sql;
+    case kind::enrollment_producer_stamp_create:return producer_definitions[2].sql;
+    case kind::enrollment_install_seed:return shared?"INSERT INTO main._lattice_install_store VALUES(1,2,?,?,?,0,0)":
+        "INSERT INTO main._lattice_install_store VALUES(1,1,?,?,?,0,0)";
+    case kind::enrollment_obligation_seed:return shared?"INSERT INTO main._lattice_obligation_store VALUES(1,2,?,?,?,?,0,0,0,0,0,0)":
+        "INSERT INTO main._lattice_obligation_store VALUES(1,1,?,?,?,?,0,0,0,0,0,0)";
+    case kind::enrollment_producer_seed:return "INSERT INTO main._lattice_obligation_producer_store VALUES(1,1,?,?,?,?,?,0,0,0)";
+    default:fail(code::corrupt_state,"unissued compiled enrollment ledger operator");
+    }
+}
+const char* recovery_obligation_bootstrap_reader::enrollment_schema_table_(kind id)const {
+    require_enrollment_current_();
+    switch(id) {
+    case kind::enrollment_install_store_create:case kind::enrollment_install_seed:return install_definitions[0].name;
+    case kind::enrollment_install_channel_create:case kind::enrollment_install_domain_create:return install_definitions[1].name;
+    case kind::enrollment_obligation_store_create:case kind::enrollment_obligation_seed:return definitions[0].name;
+    case kind::enrollment_obligation_scope_create:case kind::enrollment_obligation_domain_create:return definitions[1].name;
+    case kind::enrollment_obligation_entry_create:case kind::enrollment_obligation_audit_create:
+    case kind::enrollment_obligation_original_create:return definitions[2].name;
+    case kind::enrollment_producer_store_create:case kind::enrollment_producer_seed:return producer_definitions[0].name;
+    case kind::enrollment_producer_profile_create:return producer_definitions[1].name;
+    case kind::enrollment_producer_stamp_create:return producer_definitions[2].name;
+    default:return nullptr;
+    }
+}
+const char* recovery_obligation_bootstrap_reader::enrollment_schema_index_(kind id)const {
+    require_enrollment_current_();
+    switch(id) {
+    case kind::enrollment_install_domain_create:return "_lattice_install_domain";
+    case kind::enrollment_obligation_audit_create:return definitions[3].name;
+    case kind::enrollment_obligation_original_create:return definitions[4].name;
+    case kind::enrollment_obligation_domain_create:return domain_index.name;
+    default:return nullptr;
+    }
+}
+void recovery_obligation_bootstrap_reader::append_enrollment_ledger_tables_(ordinary_schema_projection& result)const {
+    require_enrollment_current_();
+    append_preimage_tables_(result);
+    require_enrollment_current_(); // actual allocator/producer return, before retained payload access
+    // The current closed schema family completes the eight ledger tables.
+    // Continuity row/guards are a separate subsequent real family; never
+    // declare their absent table present by using a weakened final validator.
+    const auto found=result.tables.find("_lattice_producer_continuity");
+    if(found==result.tables.end())fail(code::corrupt_state,"compiled continuity family unavailable");
+    const auto& table=found->second;std::size_t bytes=table.name.size()+table.create_sql.size();
+    for(const auto& column:table.columns)bytes+=column.name.size();
+    for(const auto& program:table.other_programs)bytes+=program.size();
+    if(bytes>result.logical_bytes||table.columns.size()>result.columns)
+        fail(code::corrupt_state,"compiled ledger projection accounting differs");
+    result.logical_bytes-=bytes;result.columns-=table.columns.size();result.tables.erase(found);
+}
+void recovery_obligation_bootstrap_reader::verify_seeded_enrollment_ledgers_() {
+    require_enrollment_current_();const auto& caps=enrollment_declaration_();const bool shared=shared_domains_();
+    // Reuse the actual strict row parsers/full audit on this SAME private
+    // WRITE, without starting a nested bootstrap READ or public SQL channel.
+    backend journal{*state_owner_(),caps.obligations,shared,this};
+    journal.full_audit();
+    if(journal.config()!=global{})fail(code::corrupt_state,"fresh journal policy counters were altered");
+    producer_backend producer{journal,caps.producers};
+    if(!producer.audit().empty()||producer.config()!=producer_usage{})
+        fail(code::corrupt_state,"fresh producer policy counters were altered");
+    const auto receiver=query_(kind::installation_policy);
+    if(receiver.size()!=1)fail(code::corrupt_state,"fresh receiver policy row count differs");
+    const auto& row=receiver[0];
+    if(number(row,"id")!=1||number(row,"version")!=(shared?2:1)||
+       number(row,"max_channels")!=caps.installations.channels||number(row,"max_field_bytes")!=caps.installations.field_bytes||
+       number(row,"max_bytes")!=caps.installations.encoded_bytes||number(row,"channels")||number(row,"bytes")||
+       !query_(kind::enrollment_install_channel_presence).empty())
+        fail(code::corrupt_state,"fresh receiver policy/rows differ from actual declaration");
+}
+
+void recovery_obligation_bootstrap_reader::append_preimage_tables_(ordinary_schema_projection& result)const {
+    const bool shared=shared_domains_();
+    // Claim this fixed compiled supplier BEFORE owning strings/columns.
+    std::uint64_t charge=32768;
+    for(const auto& d:definitions)charge+=std::strlen(d.sql)+std::strlen(d.name);
+    for(const auto& d:producer_definitions)charge+=std::strlen(d.sql)+std::strlen(d.name);
+    for(const auto& d:install_definitions)charge+=std::strlen(d.sql)+std::strlen(d.name);
+    claim_workspace_(charge);
+    struct column {const char* name;column_type type;bool nullable;};
+    const auto normalized=[&](const schema_definition& d) {
+        auto sql=definition_sql_storage<ordinary_initialization_text>(d,shared);const auto at=sql.find("main.");
+        if(at==std::string::npos)throw db_error("compiled bootstrap schema qualifier is absent");
+        sql.erase(at,5);return sql;
+    };
+    const auto append=[&](const schema_definition& d,std::initializer_list<column> columns) {
+        ordinary_projection_table table;table.name=d.name;table.create_sql=normalized(d);
+        table.role=ordinary_projection_role::link;table.local_id=false;
+        table.columns.reserve(columns.size());
+        for(const auto& c:columns)table.columns.push_back({c.name,c.type,c.nullable,false,{}});
+        if(table.name=="_lattice_obligation_entry") {
+            table.index_programs.push_back(normalized(definitions[3]));
+            table.index_programs.push_back(normalized(definitions[4]));
+        }
+        if(shared&&table.name=="_lattice_obligation_scope")table.index_programs.push_back(normalized(domain_index));
+        if(shared&&table.name=="_lattice_install_channel") {
+            constexpr schema_definition domain{"_lattice_install_domain","CREATE INDEX main._lattice_install_domain ON _lattice_install_channel(authority,scope)"};
+            table.index_programs.push_back(normalized(domain));
+        }
+        if(table.columns.size()>std::numeric_limits<size_t>::max()-result.columns)
+            throw db_error("bootstrap projection column overflow");
+        result.columns+=table.columns.size();
+        const auto bytes=table.create_sql.size()+table.name.size();
+        if(bytes>std::numeric_limits<size_t>::max()-result.logical_bytes)
+            throw db_error("bootstrap projection byte overflow");
+        result.logical_bytes+=bytes;
+        if(!result.tables.emplace(table.name,std::move(table)).second)
+            throw db_error("bootstrap compiled table overlaps selected catalog");
+    };
+    append(definitions[0],{{"id",column_type::integer,false},{"version",column_type::integer,false},{"max_scopes",column_type::integer,false},{"max_records",column_type::integer,false},{"max_field",column_type::integer,false},{"max_bytes",column_type::integer,false},{"scopes",column_type::integer,false},{"records",column_type::integer,false},{"bytes",column_type::integer,false},{"incarnation",column_type::integer,false},{"record_sequence",column_type::integer,false},{"export_sequence",column_type::integer,false}});
+    append(definitions[1],{{"channel",column_type::blob,false},{"authority",column_type::blob,false},{"source",column_type::blob,false},{"epoch",column_type::blob,false},{"scope",column_type::blob,false},{"schema_digest",column_type::blob,false},{"profile_digest",column_type::blob,false},{"receipt_namespace",column_type::blob,false},{"incarnation",column_type::integer,false},{"generation",column_type::integer,false},{"revision",column_type::integer,false},{"last_attempt",column_type::integer,false},{"freeze_revision",column_type::integer,false},{"freeze_record",column_type::integer,false},{"freeze_export",column_type::integer,false},{"mode",column_type::integer,false},{"installed_sequence",column_type::integer,false},{"installed_revision",column_type::integer,false},{"installed_head",column_type::integer,false},{"installed_manifest",column_type::blob,false},{"bytes",column_type::integer,false}});
+    append(definitions[2],{{"channel",column_type::blob,false},{"original",column_type::blob,false},{"audit_id",column_type::integer,false},{"actual_original",column_type::blob,false},{"table_name",column_type::blob,false},{"target",column_type::blob,false},{"actual_target",column_type::blob,false},{"origin",column_type::integer,false},{"record_sequence",column_type::integer,false},{"first_export",column_type::integer,true},{"stage",column_type::integer,false},{"ack_position",column_type::integer,true},{"ack_outcome",column_type::integer,true},{"settled_sequence",column_type::integer,false},{"bytes",column_type::integer,false}});
+    append(producer_definitions[0],{{"id",column_type::integer,false},{"version",column_type::integer,false},{"max_profiles",column_type::integer,false},{"max_stamps",column_type::integer,false},{"max_field",column_type::integer,false},{"max_manifest",column_type::integer,false},{"max_bytes",column_type::integer,false},{"profiles",column_type::integer,false},{"stamps",column_type::integer,false},{"bytes",column_type::integer,false}});
+    append(producer_definitions[1],{{"channel",column_type::blob,false},{"incarnation",column_type::integer,false},{"program_revision",column_type::integer,false},{"program_digest",column_type::blob,false},{"manifest",column_type::blob,false},{"bytes",column_type::integer,false}});
+    append(producer_definitions[2],{{"channel",column_type::blob,false},{"original",column_type::blob,false},{"incarnation",column_type::integer,false},{"program_revision",column_type::integer,false},{"audit_id",column_type::integer,false},{"record_sequence",column_type::integer,false},{"generation",column_type::integer,false},{"scope_revision",column_type::integer,false},{"base_scopes",column_type::integer,false},{"base_records",column_type::integer,false},{"base_bytes",column_type::integer,false},{"base_incarnation",column_type::integer,false},{"base_export",column_type::integer,false},{"producer_profiles",column_type::integer,false},{"producer_stamps",column_type::integer,false},{"producer_bytes",column_type::integer,false},{"bytes",column_type::integer,false}});
+    append(install_definitions[0],{{"id",column_type::integer,false},{"version",column_type::integer,false},{"max_channels",column_type::integer,false},{"max_field_bytes",column_type::integer,false},{"max_bytes",column_type::integer,false},{"channels",column_type::integer,false},{"bytes",column_type::integer,false}});
+    append(install_definitions[1],{{"channel",column_type::blob,false},{"authority",column_type::blob,false},{"source",column_type::blob,false},{"epoch",column_type::blob,false},{"scope",column_type::blob,false},{"schema_digest",column_type::blob,false},{"frontier_kind",column_type::integer,false},{"frontier",column_type::integer,true},{"revision",column_type::integer,false},{"last_sequence",column_type::integer,false},{"active",column_type::blob,true},{"last_install",column_type::blob,true},{"bytes",column_type::integer,false}});
+    recovery_continuous_producer::append_initialization_projection_(result,*this);
 }
 } // namespace lattice::detail

@@ -1,4 +1,7 @@
+#include <lattice/store_physical_api.hpp>
 #include "recovery_writer_access.hpp"
+#include "recovery_obligation_bootstrap_statement.hpp"
+#include "recovery_resume_commit_publication.hpp"
 #include "ordinary_history_final_install.hpp"
 #include "receive_delivery_guard.hpp"
 #include "recovery_admission_test_probe.hpp"
@@ -72,11 +75,27 @@ database* recovery_writer_access::active_writer(lattice_db& owner) {
     }
     // Refuse another thread before any SQLite call: the admitted maintenance
     // frame may hold that connection while waiting for this caller to finish.
-    if (owner.is_closed() || owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
-        !owner.owns_write_transaction()) return nullptr;
+    if (owner.is_closed() || owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id())
+        return nullptr;
     auto& writer = owner.db();
+    store_physical_native_scope physical_call(writer);
+    if(!physical_call.entered())return nullptr;
     auto* h = writer.internal_handle();
-    if (writer.is_closed() || writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
+    if (!h || writer.is_closed()) return nullptr;
+    auto* mutex = sqlite3_db_mutex(h);
+#ifndef __EMSCRIPTEN__
+    if (!mutex) return nullptr;
+#endif
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK) return nullptr;
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    // The old routing stamp is only a necessary check. Actual database
+    // settlement retires physical Core origin; a raw successor cannot inherit
+    // it. A recycled thread id must also match this live TLS original. Public
+    // native escape prevents proving any later external settlement sequence.
+    if (writer.is_closed() || writer.raw_handle_escaped_.load(std::memory_order_acquire) ||
+        writer.core_transaction_thread_ != std::this_thread::get_id() ||
+        !writer.core_transaction_origin_current_locked_() || !owner.owns_write_transaction() ||
+        writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
         sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE) return nullptr;
     return &writer;
 }
@@ -114,6 +133,8 @@ void recovery_writer_access::legacy_sync_write(lattice_db& owner,const std::func
         writer=owner.db_;
     }
     if(!writer)throw db_error("legacy sync: no writer");
+    store_physical_native_scope physical_call(*writer);
+    if(!physical_call.entered())throw db_error("resource Native caller original unavailable");
     if(legacy_sync_write_test_hooks::after_writer_capture)legacy_sync_write_test_hooks::after_writer_capture();
     // Probe before the shared-cache gate without requiring idle: exact
     // caller-owned transactions are admitted below under the physical mutex.
@@ -137,6 +158,8 @@ void recovery_writer_access::legacy_sync_write(database& writer,const std::funct
 void recovery_writer_access::legacy_sync_write_impl(database& writer,lattice_db* expected_owner,
     const std::function<void(database&)>& body) {
     using phase=database::sync_apply_chunk_state::phase;
+    store_physical_native_scope physical_call(writer);
+    if(!physical_call.entered())throw db_error("resource Native caller original unavailable");
     auto* h=writer.internal_handle();auto* mutex=h?sqlite3_db_mutex(h):nullptr;
 #ifndef __EMSCRIPTEN__
     if(!mutex)throw db_error("legacy sync requires a serialized connection");
@@ -197,9 +220,9 @@ void recovery_writer_access::legacy_sync_write_impl(database& writer,lattice_db*
     // logically closes its owner after this unit has been admitted.
     const auto run=[&](const char* sql) {
         database::record_statement();sqlite3_stmt* raw=nullptr;
-        const int prepared=sqlite3_prepare_v2(h,sql,-1,&raw,nullptr);
-        std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
-        if(prepared!=SQLITE_OK||!raw||sqlite3_step(raw)!=SQLITE_DONE)
+        const int prepared=::lattice::detail::store_physical_prepare_v2(h,sql,-1,&raw,nullptr);
+        std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
+        if(prepared!=SQLITE_OK||!raw||::lattice::detail::store_physical_step(raw)!=SQLITE_DONE)
             throw db_error(std::string("SQL execution failed: ")+sqlite3_errmsg(h)+" (SQL: "+sql+")");
     };
     // The physical mutex, not a new busy-statement policy, owns this unit.
@@ -274,6 +297,8 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
         writer=owner.db_;
     }
     if(!writer)throw db_error("channel reset: no actual writer");
+    store_physical_native_scope physical_call(*writer);
+    if(!physical_call.entered())throw db_error("resource Native caller original unavailable");
     if(recovery_channel_reset_test_hooks::after_writer_capture)recovery_channel_reset_test_hooks::after_writer_capture();
     using phase=database::sync_apply_chunk_state::phase;
     if(writer->channel_reset_unsettled_.load(std::memory_order_acquire))throw db_error("channel reset unsettled; explicit rollback required");
@@ -282,8 +307,8 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
     // Checked native execution avoids database::execute's post-close no-op.
     const auto prepare=[&](const char* sql,const std::string* parameter=nullptr) {
         database::record_statement();sqlite3_stmt* raw=nullptr;
-        const int prepared=sqlite3_prepare_v2(writer->internal_handle(),sql,-1,&raw,nullptr);
-        std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+        const int prepared=::lattice::detail::store_physical_prepare_v2(writer->internal_handle(),sql,-1,&raw,nullptr);
+        std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
         if(prepared!=SQLITE_OK||!raw)throw db_error(std::string("channel reset prepare failed: ")+sqlite3_errmsg(writer->internal_handle()));
         if(parameter&&(parameter->size()>static_cast<size_t>(std::numeric_limits<int>::max())||
            sqlite3_bind_text(raw,1,parameter->data(),static_cast<int>(parameter->size()),SQLITE_TRANSIENT)!=SQLITE_OK))
@@ -292,12 +317,12 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
     };
     const auto run=[&](const char* sql,const std::string* parameter=nullptr) {
         auto statement=prepare(sql,parameter);
-        if(sqlite3_step(statement.get())!=SQLITE_DONE)throw db_error(std::string("channel reset step failed: ")+sqlite3_errmsg(writer->internal_handle()));
+        if(::lattice::detail::store_physical_step(statement.get())!=SQLITE_DONE)throw db_error(std::string("channel reset step failed: ")+sqlite3_errmsg(writer->internal_handle()));
     };
     const auto exists=[&](const char* sql) {
-        auto statement=prepare(sql,&channel);const int rc=sqlite3_step(statement.get());
+        auto statement=prepare(sql,&channel);const int rc=::lattice::detail::store_physical_step(statement.get());
         if(rc==SQLITE_DONE)return false;
-        if(rc!=SQLITE_ROW||sqlite3_step(statement.get())!=SQLITE_DONE)
+        if(rc!=SQLITE_ROW||::lattice::detail::store_physical_step(statement.get())!=SQLITE_DONE)
             throw db_error("channel reset addressed read failed or was ambiguous");
         return true;
     };
@@ -312,11 +337,11 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
            exists("SELECT 1 FROM _lattice_sync_set WHERE sync_id=? LIMIT 1"))
             throw db_error("channel reset postimage mismatch: retained channel state");
         auto slot=prepare("SELECT CASE WHEN typeof(confirmed_audit_id)='integer' THEN confirmed_audit_id END,CASE WHEN typeof(upload_floor)='integer' THEN upload_floor END FROM _lattice_replication_slots WHERE sync_id=? LIMIT 2",&channel);
-        const int rc=sqlite3_step(slot.get());
+        const int rc=::lattice::detail::store_physical_step(slot.get());
         if(retire||!had_slot) {
             if(rc!=SQLITE_DONE)throw db_error("channel reset postimage mismatch: unexpected slot");
         } else if(rc!=SQLITE_ROW||sqlite3_column_type(slot.get(),0)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),0)!=0||
-                  sqlite3_column_type(slot.get(),1)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),1)!=0||sqlite3_step(slot.get())!=SQLITE_DONE)
+                  sqlite3_column_type(slot.get(),1)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),1)!=0||::lattice::detail::store_physical_step(slot.get())!=SQLITE_DONE)
             throw db_error("channel reset postimage mismatch: slot floors not zero integers");
         const auto receive_after = retire
             ? receive_delivery_guard_access::retire(owner,*writer,receive_before) : receive_before;
@@ -459,11 +484,30 @@ struct recovery_writer_access::install_owner {
     explicit operator bool()const noexcept{return pointer!=nullptr;}
 };
 
+thread_local recovery_writer_access::controller_admission_intent::turn* recovery_writer_access::controller_admission_intent::turn::current_=nullptr;
+void recovery_writer_access::controller_admission_intent::begin(const std::shared_ptr<lattice_db>& owner,std::chrono::steady_clock::time_point deadline) {
+    if(!owner)throw db_error("controller admission intent requires current owner");
+    owner->require_creator_process();std::shared_ptr<database> writer;
+    {std::lock_guard lock(owner->connection_ownership_mutex_);
+        if(owner->closed_.load()||!owner->db_)throw db_error("controller admission intent owner closed");
+        writer=owner->db_;
+    }
+    writer->require_creator_();
+    retired_custody retired;
+    {std::lock_guard lock(mutex_);
+        if(writer_==writer&&waiting_.active()){waiting_.tighten_until(deadline);return;}
+        waiting_.release();retired={std::move(writer_),waiting_.take_retired_original()};
+        writer_=std::move(writer);waiting_.begin_until(*writer_,deadline);
+    } // old strong writer destruction is outside the intent metadata leaf
+
+}
+
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
-    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try) {
+    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try,
+    recovery_obligation_bootstrap_reader* initialization) {
     return install_owned_impl(install_owner{std::move(owner)},body,after_unlock,after_writer_capture,
-                              initial_admission_busy,controller_try);
+                              initial_admission_busy,controller_try,nullptr,initialization);
 }
 
 recovery_install_result recovery_writer_access::ordinary_owned_write(lattice_db& owner,
@@ -479,7 +523,8 @@ recovery_install_result recovery_writer_access::ordinary_owned_history_write(lat
 
 recovery_install_result recovery_writer_access::install_owned_impl(install_owner owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
-    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try, const ordinary_history_final_install_guard* final_guard) {
+    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try,
+    const ordinary_history_final_install_guard* final_guard,recovery_obligation_bootstrap_reader* initialization) {
     recovery_install_result result;
     if (initial_admission_busy) *initial_admission_busy = false;
     std::shared_ptr<database> writer;
@@ -488,6 +533,7 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
     database::sync_apply_chunk_state settlement;
     settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_body;
     bool own_commit_started = false;
+    bool initialization_begin_returned = false,initialization_unsettled = false;
     try {
         if (!owner || !body) throw db_error("recovery install requires an owning store and body");
         {
@@ -496,6 +542,10 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
             writer = owner->db_;
         }
         if (!writer) throw db_error("recovery install: no published writer");
+        if(initialization) {
+            if(controller_try||final_guard)throw db_error("enrollment initialization cannot borrow a different installer admission");
+            initialization->require_continuous_enrollment_(*owner,*writer);
+        }
         // Private deterministic test rendezvous only; no owner/store/SQLite
         // lock is held here. Production supplies no callback.
         if (after_writer_capture) after_writer_capture();
@@ -512,11 +562,13 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
         };
         using admission = database::maintenance_scope::admission;
         const auto deferred_reason = [](admission value) {
-            return value == admission::mutex_busy ? recovery_install_deferred::connection_mutex
-                                                  : recovery_install_deferred::engine_read;
+            if (value == admission::mutex_busy) return recovery_install_deferred::connection_mutex;
+            if (value == admission::core_write_busy) return recovery_install_deferred::core_write;
+            if (value == admission::schema_registry_busy) return recovery_install_deferred::schema_registry;
+            return recovery_install_deferred::engine_read;
         };
         if (controller_try) {
-            const auto initial = database::maintenance_scope::controller_probe(*writer);
+            const auto initial = database::maintenance_scope::controller_probe(*writer, &owner->txn_owner_thread_);
             if (initial != admission::ready) { defer(deferred_reason(initial)); return result; }
             if (recovery_admission_test_hooks::after_initial_probe) recovery_admission_test_hooks::after_initial_probe();
         } else if (initial_admission_busy) {
@@ -545,7 +597,8 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                 } else memory_gate = std::unique_lock<std::recursive_timed_mutex>(owner->vec0_memory_maintenance_gate_);
             }
             admission admitted = admission::ready;
-            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr);
+            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr,
+                controller_try ? &owner->txn_owner_thread_ : nullptr);
             if (admitted != admission::ready) { defer(deferred_reason(admitted)); return result; }
             auto* context = writer->lattice_update_hook_context_.get();
             {
@@ -604,7 +657,11 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                     sqlite3_txn_state(writer->internal_handle(), "main") == SQLITE_TXN_WRITE;
             };
             try {
-                writer->begin_transaction();
+                if(initialization) {
+                    initialization->require_continuous_enrollment_(*owner,*writer);
+                    initialization->begin_continuous_enrollment_(result.cleanup_error);
+                    initialization_begin_returned=true;
+                }else writer->begin_transaction();
                 settlement.state = phase::active;
                 body(*writer);
                 if (!current_body())
@@ -614,8 +671,11 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                 // before checking for escaped caller statements. Do not reset
                 // arbitrary statements, exempt SQL-less blobs, or commit early.
                 // This nested savepoint cannot commit the owned outer BEGIN.
-                writer->execute("SAVEPOINT _lattice_recovery_body_settled");
-                writer->execute("RELEASE _lattice_recovery_body_settled");
+                if(initialization)initialization->settle_continuous_enrollment_body_();
+                else {
+                    writer->execute("SAVEPOINT _lattice_recovery_body_settled");
+                    writer->execute("RELEASE _lattice_recovery_body_settled");
+                }
                 if (!current_body()) throw db_error("recovery install lost ownership at body settlement");
                 for (auto* stmt = sqlite3_next_stmt(writer->internal_handle(), nullptr); stmt;
                      stmt = sqlite3_next_stmt(writer->internal_handle(), stmt)) {
@@ -635,7 +695,8 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                 }
                 settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_finalizing;
                 own_commit_started = true;
-                writer->commit();
+                if(initialization)initialization->commit_continuous_enrollment_();
+                else writer->commit();
                 // Memory / DELETE-journal paths have no WAL callback. Their
                 // successful COMMIT return is still before any deferred observer.
                 if (settlement.state == phase::active && context->sync_chunk == &settlement &&
@@ -644,22 +705,46 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                     throw db_error("recovery install commit did not settle the owned transaction");
             } catch (...) {
                 result.primary_error = std::current_exception();
-                if (settlement.state == phase::active && context->sync_chunk == &settlement &&
-                    (!settlement.commit_attempted || own_commit_started)) {
+                const bool unreturned_initialization=initialization&&!initialization_begin_returned;
+                // The exact private episode owns its prepaid rollback even if
+                // an invalid body lost its install frame. It cannot follow a
+                // raw successor; actual ending admission revalidates receipt.
+                const bool actual_ending_owner=initialization&&initialization->enrollment_transaction_live_();
+                if ((settlement.state == phase::active && context->sync_chunk == &settlement &&
+                    (!settlement.commit_attempted || own_commit_started))||actual_ending_owner) {
                     try {
-                        writer->rollback();
+                        if(initialization)initialization->rollback_continuous_enrollment_();
+                        else writer->rollback();
                         if (settlement.state != phase::rolled_back)
                             throw db_error("recovery install rollback did not settle the owned transaction");
                     } catch (...) {
-                        result.cleanup_error = std::current_exception();
+                        if(!result.cleanup_error)result.cleanup_error = std::current_exception();
+                        // Failed exact rollback was already consumed. Retire
+                        // that custody without a destructor's Native retry;
+                        // actual episode/ending debt remains, never success.
+                        if(initialization)initialization->retire_failed_enrollment_rollback_();
                         // Do not publish this still-active transaction to new
                         // ordinary operations. Raw-handle repair is not promised.
                         writer->closed_.store(true, std::memory_order_release);
                     }
+                }else if(unreturned_initialization&&initialization->enrollment_begin_debt_()) {
+                    // No returned ending owner exists. The constructor already
+                    // attempted its ONE actual prepaid cleanup if it owned a
+                    // genuine BEGIN. Do not infer a second rollback from Native
+                    // autocommit; retain actual unsettled evidence and fence.
+                    initialization_unsettled=true;writer->closed_.store(true,std::memory_order_release);
                 }
             }
             if (settlement.state == phase::committed && own_commit_started) {
                 result.state = recovery_install_state::committed;
+                // This closed producer helper can consume only the exact
+                // controller resume armed in this owned WRITE. Publish after
+                // successful known COMMIT, before any fresh Native admission
+                // or synchronous invalidation/observer callback can run.
+                if (!result.primary_error && !result.cleanup_error) {
+                    try { publish_controller_resume_after_owned_commit(*owner,*writer); }
+                    catch (...) { result.postcommit_error=std::current_exception(); }
+                }
                 if (batch.audit_frontier) {
                     const auto frontier = *batch.audit_frontier;
                     auto advance = [frontier](lattice_db* target) {
@@ -675,7 +760,7 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                 result.state = recovery_install_state::ownership_lost;
                 result.unexpected_commit_observed = true;
             } else if (settlement.state == phase::rolled_back) result.state = recovery_install_state::rolled_back;
-            else if (settlement.state == phase::active) result.state = recovery_install_state::unsettled;
+            else if (settlement.state == phase::active||initialization_unsettled) result.state = recovery_install_state::unsettled;
         }
     } catch (...) {
         if (!result.primary_error) result.primary_error = std::current_exception();
@@ -690,7 +775,12 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
         try {
             if (after_unlock) after_unlock(); // private committed publication/test boundary, before delivery
             deliver(*owner, batch);
-        } catch (...) { result.postcommit_error = std::current_exception(); }
+        } catch (...) {
+            // Retain the first committed-publication failure as primary tail
+            // evidence; an additional actual delivery failure is distinct.
+            if (!result.postcommit_error) result.postcommit_error=std::current_exception();
+            else if (!result.notification_error) result.notification_error=std::current_exception();
+        }
     } else if (writer && settlement.state != phase::not_started) {
         // This belongs to a possible ordinary successor, never to the failed
         // install. Preserve both failures and never run its activation tail.

@@ -21,11 +21,16 @@ void recovery_local_producer_adapter::compile_continuous(lattice_db& owner,conte
         // Every contribution tail follows the SAME genuine AuditLog insert.
         // WITHOUT ROWID metadata preserves last_insert_rowid across tails.
         if(continuous_receiver_enabled(*admitted.continuous->state)) {
-            // Count actual distinct unresolved originals after every generated
-            // contribution has been inserted, in this same model transaction.
-            // The 8,193-row result is bounded; SQLite may scan the admitted
-            // journal's full finite raw-record cap (at most 100,000 records).
-            tail+=require("(SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192");
+            // Every unresolved original owns at least one actual journal row.
+            // A small physical row count therefore proves this same hard cap
+            // without enumerating distinct originals. For larger journals use
+            // the exact original test, including settled/shared-row semantics.
+            // Both branches read this transaction's post-tail SQLite state;
+            // no cached counter, memory flag, metadata claim or extra write.
+            if(admitted.legacy_distinct_count_programs)
+                tail+=require("(SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192");
+            else
+                tail+=require("CASE WHEN (SELECT COUNT(*) FROM _lattice_obligation_entry)<=8192 THEN 1 ELSE (SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192 END");
         }
         std::vector<std::string> emitted;
         if(first.link)owner.create_link_table_triggers(name,tail,&emitted);
@@ -67,8 +72,15 @@ void recovery_continuous_producer::classify_open(database& writer,bool admitted,
     // There is NO online enrollment/upgrade of existing files, so an ordinary
     // legacy writer cannot acquire this profile later. Preserve its hot-path
     // mutex and transaction behavior; this state is denial-only, never proof.
-    discovery_statement query(writer.internal_handle(),"SELECT 1 FROM main.sqlite_schema WHERE name='_lattice_producer_continuity' LIMIT 1");
-    const bool present=query.row();
+    bool present=false;
+    if(writer.delivery_startup_) {
+        auto statement=observer_delivery_initialization_sql::fixed_(*writer.delivery_startup_,writer,
+            observer_delivery_initialization_sql::recipe::continuous_schema_discovery);
+        present=!writer.query_initialization_(statement).empty();
+    }else {
+        discovery_statement query(writer.internal_handle(),"SELECT 1 FROM main.sqlite_schema WHERE name='_lattice_producer_continuity' LIMIT 1");
+        present=query.row();
+    }
     bool reserved=false;
     try {require_continuous_path_unowned(writer.path_);}catch(const db_error&){reserved=true;}
     const bool protected_file=admitted||present||reserved;
@@ -80,6 +92,8 @@ void recovery_continuous_producer::classify_open(database& writer,bool admitted,
     if(writable&&protected_file&&!admitted)refuse("continuous file requires retained constructor custody");
 }
 void recovery_continuous_producer::require_no_continuous_export(database& writer) {
+    store_physical_native_scope physical_call(writer);
+    if(!physical_call.entered())refuse("resource Native caller original unavailable");
     using classification=database::continuous_classification;
     auto known=writer.continuous_file_.load(std::memory_order_acquire);
     if(known==classification::unknown) {
@@ -103,10 +117,266 @@ void recovery_continuous_producer::require_no_continuous_route(lattice_db& owner
     if(owner.recovery_continuous_)refuse("continuous unsupported route before publication");
     require_no_continuous_export(*owner.db_);
 }
-std::shared_ptr<database> recovery_continuous_producer::open_writer(const configuration& config,const std::shared_ptr<recovery_continuous_admission>& admission) {
+void recovery_continuous_producer::append_initialization_projection_(ordinary_schema_projection& result,
+    const recovery_obligation_bootstrap_reader& initialization) {
+    // This is the SAME compiled durable table and guards used by enrollment,
+    // not decoded stored SQL, observed names, a grant digest or caller recipe.
+    // SELECT-only bootstrap evidence confers NO trigger-origin/DML authority.
+    initialization.claim_workspace_(32768); // before any strings/columns/programs
+    ordinary_projection_table table;table.name=continuous_table;table.create_sql=continuous_ddl;
+    table.role=ordinary_projection_role::link;table.local_id=false;
+    constexpr const char* columns[]={"id","version","manifest","digest","main_device","main_inode",
+        "parent_device","parent_inode","container_device","container_inode","incarnation","barrier","attempt","phase"};
+    table.columns.reserve(sizeof(columns)/sizeof(columns[0]));
+    for(const auto* name:columns)table.columns.push_back({name,
+        std::strcmp(name,"manifest")==0||std::strcmp(name,"digest")==0?column_type::blob:column_type::integer,false,false,{}});
+    for(const auto& [name,program]:continuous_guards_storage<ordinary_initialization_text,ordinary_initialization_text_map<ordinary_initialization_text>>())table.other_programs.push_back(program);
+    std::size_t bytes=table.name.size()+table.create_sql.size();
+    for(const auto& column:table.columns)bytes+=column.name.size();
+    for(const auto& program:table.other_programs)bytes+=program.size();
+    if(bytes>32768||result.logical_bytes>std::numeric_limits<std::size_t>::max()-bytes||
+       result.columns>std::numeric_limits<std::size_t>::max()-table.columns.size())
+        refuse("continuous compiled bootstrap projection bound");
+    result.logical_bytes+=bytes;result.columns+=table.columns.size();
+    if(!result.tables.emplace(table.name,std::move(table)).second)
+        refuse("continuous compiled bootstrap table overlaps actual catalog");
+}
+void recovery_continuous_producer::verify_initializing_lineage_(database& writer,recovery_continuous_state& state) {
+    const auto issuer=database_native_process();
+    writer.require_creator_();
+    if(!writer.delivery_startup_)refuse("continuous private lineage read requires its actual pending Open");
+    auto initialization=recovery_obligation_bootstrap_reader::create_(writer,discovery_caps,continuous_receiver_enabled(state));
+    const auto current=[&]{writer.require_creator_();if(issuer!=database_native_process())refuse("inherited continuous lineage read return");};
+    const auto autocommit=[&]{current();database::catalog_native_admission_ leaf(writer);return sqlite3_get_autocommit(writer.db_)!=0;};
+    try {
+        initialization->begin_();current();
+        initialization->validated_family_();current();
+        // Actual inventory, all fourteen typed durable cells, physical/policy
+        // lineage, WAL and FULL checks stay in the original verifier. This
+        // reader pins ONE genuine private raw snapshot through every read.
+        continuous_verify_row(writer,state,false,initialization.get());current();
+        initialization->rollback_();current();
+        if(!autocommit())refuse("continuous lineage read snapshot did not settle");
+    }catch(...) {
+        // A process-only fence must precede ANY access/refcount of a parent's
+        // error/reader/writer DATA. Foreign cleanup cannot inspect or preserve
+        // the inaccessible parent primary locally, or infer an actual ending.
+        if(issuer!=database_native_process())
+            throw recovery_obligation_error(recovery_obligation_error_code::cleanup_failed,
+                "inherited continuous lineage cleanup has unknown ending; parent primary is inaccessible");
+        // Capture the real same-process primary BEFORE any throwing health or
+        // Native ending observation. No recovery allocation is required here.
+        struct primary_custody {
+            using payload=std::exception_ptr;const std::uint64_t creator;
+            alignas(payload) std::byte storage[sizeof(payload)];
+            explicit primary_custody(std::uint64_t value)noexcept:creator(value){::new(static_cast<void*>(storage)) payload{};}
+            payload& get()noexcept{return *std::launder(reinterpret_cast<payload*>(storage));}
+            ~primary_custody(){if(creator==database_native_process())get().~payload();}
+            primary_custody(const primary_custody&)=delete;
+        } primary(issuer);
+        primary.get()=std::current_exception();
+        try {
+            // ALL same-process health checks and actual Native observations
+            // belong to this guarded cleanup attempt. A refused observation
+            // is real secondary debt/unknown ending, never false autocommit.
+            initialization->fail_();current();
+            if(!autocommit()) {
+                initialization->rollback_();current();
+                if(!autocommit())refuse("continuous lineage read rollback remains live");
+            }
+        }catch(...) {
+            // No throwing writer health check may replace either actual error.
+            // If a cleanup return crossed processes, touch neither inherited
+            // payload; the fixed stack holder and reader remain quarantined.
+            if(issuer!=database_native_process())
+                throw recovery_obligation_error(recovery_obligation_error_code::cleanup_failed,
+                    "inherited continuous lineage cleanup has unknown ending; parent errors are inaccessible");
+            throw recovery_obligation_error(recovery_obligation_error_code::cleanup_failed,
+                "continuous lineage cleanup/ending observation failed; retained connection must be discarded",
+                primary.get(),std::current_exception());
+        }
+        if(issuer!=database_native_process())
+            throw recovery_obligation_error(recovery_obligation_error_code::cleanup_failed,
+                "inherited continuous lineage cleanup return has unknown ending; parent primary is inaccessible");
+        std::rethrow_exception(primary.get());
+    }
+}
+void recovery_continuous_producer::initialize_connection_durability_(database& writer) {
+    if(!writer.delivery_startup_) {writer.execute("PRAGMA synchronous=FULL");return;}
+    using sql=observer_delivery_initialization_sql;using recipe=sql::recipe;
+    auto set=sql::fixed_(*writer.delivery_startup_,writer,recipe::continuous_synchronous_full);
+    writer.execute_initialization_(set);
+    auto get=sql::fixed_(*writer.delivery_startup_,writer,recipe::continuous_synchronous_getter);
+    const auto rows=writer.query_initialization_(get);
+    if(rows.size()!=1||rows.front().size()!=1||integer(rows.front(),"synchronous")<2)
+        refuse("continuous startup FULL durability unavailable");
+}
+bool recovery_continuous_producer::fresh_schema_present_(database& writer) {
+    if(!writer.delivery_startup_)
+        return !writer.query("SELECT 1 FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1").empty();
+    auto statement=observer_delivery_initialization_sql::fixed_(*writer.delivery_startup_,writer,
+        observer_delivery_initialization_sql::recipe::continuous_fresh_schema_presence);
+    return !writer.query_initialization_(statement).empty();
+}
+std::shared_ptr<observer_delivery_startup> recovery_continuous_producer::select_startup_(
+    const configuration& config,const recovery_owner_schema& catalog,
+    const std::shared_ptr<recovery_continuous_admission>& admission) {
+    if(!admission||!admission->state||admission->state->path!=config.path||
+       admission->pending_startup.creator!=database_native_process()||
+       admission->pending_startup.builder!=std::this_thread::get_id()||admission->pending_startup.attempted||
+       !admission->pending_startup.resource_startup)
+        refuse("continuous startup selection lacks its actual pre-resource original");
+    return observer_delivery_startup::select_with_deadline_(config,catalog,admission->pending_startup.resource_end);
+}
+std::shared_ptr<observer_delivery_startup> select_continuous_startup(const configuration& config,
+    const recovery_owner_schema& catalog,const std::shared_ptr<recovery_continuous_admission>& admission) {
+    return recovery_continuous_producer::select_startup_(config,catalog,admission);
+}
+bool recovery_continuous_producer::pending_startup_matches_(const lattice_db& owner,
+    const observer_delivery_startup& startup)noexcept {
+    if(!owner.owns_creator_process()||!owner.recovery_continuous_||!owner.db_||
+       !owner.db_->creator_current_()||owner.db_->is_closed())return false;
+    const auto& admission=*owner.recovery_continuous_;
+    const auto& held=admission.pending_startup;
+    if(held.creator!=database_native_process()||held.builder!=std::this_thread::get_id()||
+       !held.attempted||held.resource_startup||held.catalog!=&owner.recovery_schemas_||
+       held.startup.get()!=&startup||held.startup.get()!=owner.delivery_startup_.get()||
+       held.startup.owner_before(owner.delivery_startup_)||owner.delivery_startup_.owner_before(held.startup)||
+       !held.writer_open||held.writer_open.get()!=owner.db_->delivery_startup_.get()||
+       admission.writer!=owner.db_.get()||admission.owner||!admission.retained_owner.expired()||
+       !admission.recipe||!admission.state||admission.state->path!=owner.config_.path)return false;
+    const auto& actual=owner.db_->delivery_startup_.shared_();
+    return !actual.owner_before(held.writer_open)&&!held.writer_open.owner_before(actual);
+}
+namespace {
+class fresh_catalog_identity_error final:public std::exception {
+    int code_,error_;
+public:
+    fresh_catalog_identity_error(int code,int error)noexcept:code_(code),error_(error){}
+    const char* what()const noexcept override{return "actual fresh catalog filesystem observation failed";}
+    int actual_code()const noexcept{return code_;}int actual_errno()const noexcept{return error_;}
+};
+}
+const recovery_continuous_admission* recovery_continuous_producer::pending_fresh_catalog_original_(
+    const lattice_db& owner,database& actual,const observer_delivery_startup& startup) {
+    if(!owner.owns_creator_process()||!actual.creator_current_())refuse("inherited fresh catalog provenance");
+    if(!owner.recovery_continuous_)return nullptr;
+    if(owner.db_.get()!=&actual||!pending_startup_matches_(owner,startup))
+        refuse("fresh catalog lost its actual pre-enrollment owner/startup/writer");
+    const auto* admission=owner.recovery_continuous_.get();const auto& state=*admission->state;
+    if(!state.fresh||state.initialized)return nullptr;
+    if(!state.opening||!state.identity||
+       admission->pending_startup.resource_end==std::chrono::steady_clock::time_point::max()||
+       std::chrono::steady_clock::now()>=admission->pending_startup.resource_end)
+        refuse("fresh catalog original is not its same finite first-start container");
+#if defined(__APPLE__) || defined(__linux__)
+    using identity_custody=native_retirement_storage<std::shared_ptr<const physical_store_identity>>;
+    actual.delivery_startup_->claim_workspace_(actual,identity_custody::allocation_bytes());identity_custody identity;
+    if(admission->pending_startup.creator!=database_native_process())refuse("inherited fresh identity custody");
+    identity.get<0>()=std::atomic_load(&actual.main_physical_identity_);
+    if(admission->pending_startup.creator!=database_native_process())refuse("inherited fresh identity return");
+    const auto& current=identity.get<0>();
+    if(!current||!(*current==*state.identity)||current->filename!=state.path||state.identity->filename!=state.path)
+        refuse("fresh catalog Native physical identity differs from its actual creation");
+    if(!state.locked||state.parent_fd<0||state.container_fd<0)refuse("fresh catalog lost its actual directory custody");
+    struct observation {struct stat parent{},container{},main{},named_parent{},named_container{};std::array<char,4097> path{};};
+    actual.delivery_startup_->claim_workspace_(actual,sizeof(observation));observation observed;
+    auto& parent=observed.parent;auto& container=observed.container;auto& main=observed.main;
+    auto& named_parent=observed.named_parent;auto& named_container=observed.named_container;
+    const auto observe=[](int rc){const int error=errno;if(rc)throw fresh_catalog_identity_error(rc,error);};
+    observe(::fstat(state.parent_fd,&parent));observe(::fstat(state.container_fd,&container));
+    observe(::fstatat(state.container_fd,"store.sqlite",&main,AT_SYMLINK_NOFOLLOW));
+    observe(::lstat(state.parent.c_str(),&named_parent));
+    const auto slash=std::string_view(state.path).rfind('/');
+    if(slash==std::string_view::npos||slash>4096)refuse("fresh catalog retained container path bound");
+    auto& path=observed.path;std::copy_n(state.path.data(),slash,path.data());
+    observe(::lstat(path.data(),&named_container));
+    if(!S_ISDIR(parent.st_mode)||!S_ISDIR(named_parent.st_mode)||!S_ISDIR(container.st_mode)||!S_ISDIR(named_container.st_mode)||
+       !S_ISREG(main.st_mode)||main.st_nlink!=1||(main.st_mode&07777)!=0600||
+       container.st_uid!=::geteuid()||(container.st_mode&07777)!=0700||main.st_uid!=::geteuid()||
+       parent.st_dev!=named_parent.st_dev||parent.st_ino!=named_parent.st_ino||
+       container.st_dev!=named_container.st_dev||container.st_ino!=named_container.st_ino||
+       state.bounded(parent.st_dev)!=state.parent_device||state.bounded(parent.st_ino)!=state.parent_inode||
+       state.bounded(container.st_dev)!=state.container_device||state.bounded(container.st_ino)!=state.container_inode||
+       state.bounded(main.st_dev)!=state.bounded(current->device)||state.bounded(main.st_ino)!=state.bounded(current->inode)||
+       std::chrono::steady_clock::now()>=admission->pending_startup.resource_end)
+        refuse("fresh catalog actual parent/container/MAIN original changed");
+    return admission; // comparison only; actual owner retains this original
+#else
+    refuse("fresh catalog original platform unsupported");
+#endif
+}
+bool recovery_continuous_producer::enrollment_startup_matches_(const lattice_db& owner,
+    const observer_delivery_startup& startup)noexcept {
+    if(!owner.owns_creator_process()||!owner.recovery_continuous_||!owner.db_||
+       !owner.db_->creator_current_()||owner.db_->is_closed()||owner.is_closed())return false;
+    const auto& admission=*owner.recovery_continuous_;
+    const auto& held=admission.pending_startup;
+    if(held.creator!=database_native_process()||held.builder!=std::this_thread::get_id()||
+       !held.attempted||held.resource_startup||held.catalog!=&owner.recovery_schemas_||
+       held.startup.get()!=&startup||held.startup.get()!=owner.delivery_startup_.get()||
+       held.startup.owner_before(owner.delivery_startup_)||owner.delivery_startup_.owner_before(held.startup)||
+       !held.writer_open||held.writer_open.get()!=owner.db_->delivery_startup_.get()||
+       admission.writer!=owner.db_.get()||admission.owner!=&owner||!admission.counted||
+       !admission.recipe||!admission.state||admission.state->path!=owner.config_.path||
+       held.resource_end==std::chrono::steady_clock::time_point::max()||
+       std::chrono::steady_clock::now()>=held.resource_end)return false;
+    const auto retained=admission.retained_owner.lock();
+    if(retained.get()!=&owner)return false;
+    const auto& actual=owner.db_->delivery_startup_.shared_();
+    return !actual.owner_before(held.writer_open)&&!held.writer_open.owner_before(actual);
+}
+const recovery_continuous_admission* recovery_continuous_producer::enrollment_reader_binding_(
+    const lattice_db& owner,const database& actual,recovery_obligation_producer_discovery_limits* caps,
+    bool* shared)noexcept {
+    // Fence process ownership BEFORE reading process_resources_ references or
+    // any retained admission/shared_ptr payload, including the first factory call.
+    if(!owner.owns_creator_process()||!actual.creator_current_())return nullptr;
+    if(!owner.delivery_startup_||owner.db_.get()!=&actual||
+       !enrollment_startup_matches_(owner,*owner.delivery_startup_))return nullptr;
+    const auto* admission=owner.recovery_continuous_.get();
+    if(caps)*caps=admission->state->policy.limits;
+    if(shared)*shared=continuous_receiver_enabled(*admission->state);
+    return admission;
+}
+bool recovery_continuous_producer::enrollment_reader_fresh_(const lattice_db& owner,const database& actual,
+    const recovery_continuous_admission* original)noexcept {
+    const auto* admission=enrollment_reader_binding_(owner,actual);
+    return admission&&admission==original&&admission->state->fresh&&!admission->state->initialized;
+}
+const receive_install_binding& recovery_continuous_producer::enrollment_receiver_binding_(
+    const lattice_db& owner,const database& actual,const recovery_continuous_admission* original,std::size_t index) {
+    // Process-first before any process_resources/shared ownership payload.
+    if(!owner.owns_creator_process()||!actual.creator_current_())refuse("inherited enrollment receiver binding");
+    const auto* admission=enrollment_reader_binding_(owner,actual);
+    if(!admission||admission!=original||index>=admission->state->policy.contributions.size())
+        refuse("receiver binding is not the original actual enrollment contribution");
+    return admission->state->policy.contributions[index].profile.binding;
+}
+std::shared_ptr<database> recovery_continuous_producer::open_writer(const configuration& config,
+    const std::shared_ptr<recovery_continuous_admission>& admission,
+    const std::shared_ptr<observer_delivery_startup>& startup,const recovery_owner_schema& catalog) {
     if(!admission||!admission->state||admission->state->path!=config.path)refuse("continuous writer lacks exact container custody");
+    auto& held=admission->pending_startup;
+    if(held.creator!=database_native_process()||held.builder!=std::this_thread::get_id()||
+       held.attempted||held.startup||held.writer_open||held.catalog||admission->owner||admission->writer||
+       !admission->recipe||!catalog.valid())refuse("continuous writer lost its unique pre-open constructor family");
+    static_assert(sizeof(recovery_continuous_admission::pending_startup_handoff)+sizeof(void*)+
+        sizeof(observer_delivery_startup_test_probe::continuous_handoff_observation)<=
+        observer_delivery_startup::continuous_custody_charge_);
+    held.attempted=true;held.catalog=&catalog;held.startup=startup;
+    // Empty only on the existing genuinely uninstalled/profile-free route.
+    // A present startup issues its actual one-use writer token NOW, before the
+    // real constructor; both subsequent readers retain this same common state.
+    if(startup)held.writer_open=startup->make_continuous_writer_(admission.get(),catalog,config.path);
+    if(held.creator!=database_native_process())refuse("inherited continuous pre-open handoff");
+    if(const auto hook=observer_delivery_startup_test_probe::after_continuous_handoff)
+        hook({admission.get(),&catalog,held.startup.get(),held.writer_open.get()});
+    if(held.creator!=database_native_process())refuse("inherited continuous handoff observation return");
+    if(!held.resource_startup)refuse("continuous writer lost actual pre-open resource custody");
+    held.resource_startup->before_native_open_();
     auto writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
-        std::shared_ptr<database_read_control>{},database::initialization_key(admission),config.ordinary_context);
+        std::shared_ptr<database_read_control>{},database::initialization_key(admission,held.writer_open),config.ordinary_context,config.wal_extent_limit_bytes);
     writer->suppress_destructor_optimize_=true; // Immutable profile: refusal/close must not run optional ANALYZE.
     auto& state=*admission->state;
     const auto identity=writer->physical_identity("main",{},true);
@@ -115,15 +385,30 @@ std::shared_ptr<database> recovery_continuous_producer::open_writer(const config
      if(state.identity&&(!(*state.identity==*identity)||state.identity->filename!=identity->filename))refuse("continuous facade file identity differs");
      if(!state.identity)state.identity=identity;}
     state.verify_file(*writer);
-    writer->execute("PRAGMA synchronous=FULL");
-    if(!state.fresh||state.initialized)continuous_verify_row(*writer,state,false);
-    else if(!writer->query("SELECT 1 FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1").empty())
+    // The actual Native/VFS writer now has its independently retained physical
+    // original. End the genuine pre-open entry/physical guards only AFTER this
+    // exact returned file/container identity has been proved.
+    const bool managed_resources=held.resource_startup->managed_();
+    held.resource_startup->finish_native_open_(config.path,identity->device,identity->inode);
+    held.resource_startup.reset();
+    if(const auto hook=observer_delivery_startup_test_probe::after_continuous_native_open)
+        hook({admission.get(),held.startup.get(),held.writer_open.get(),identity->device,identity->inode,
+            held.resource_end,managed_resources,state.fresh});
+    if(held.creator!=database_native_process())refuse("inherited continuous Native observation return");
+    initialize_connection_durability_(*writer);
+    if(!state.fresh||state.initialized) {
+        if(writer->delivery_startup_)verify_initializing_lineage_(*writer,state);
+        else continuous_verify_row(*writer,state,false);
+    }
+    else if(fresh_schema_present_(*writer))
         refuse("continuous fresh container already has a durable schema");
     admission->writer=writer.get();
     return writer;
 }
-std::shared_ptr<database> open_continuous_writer(const configuration& config,const std::shared_ptr<recovery_continuous_admission>& admission) {
-    return recovery_continuous_producer::open_writer(config,admission);
+std::shared_ptr<database> open_continuous_writer(const configuration& config,
+    const std::shared_ptr<recovery_continuous_admission>& admission,
+    const std::shared_ptr<observer_delivery_startup>& startup,const recovery_owner_schema& catalog) {
+    return recovery_continuous_producer::open_writer(config,admission,startup,catalog);
 }
 recovery_continuous_open_result recovery_continuous_producer::open(const configuration& requested,const recovery_continuous_policy& policy) {
     try {
@@ -139,12 +424,19 @@ recovery_continuous_open_result recovery_continuous_producer::open_owned(const c
     recovery_continuous_open_result output;
     std::shared_ptr<lattice_db> owner;
     try {
+        const auto resource_end=std::chrono::steady_clock::now()+std::chrono::seconds(30);
         if(!recipe||!recipe->construct)refuse("continuous retained owner recipe unavailable");
         if(requested.path.empty()||requested.path.starts_with("file:")||configuration::path_is_memory(requested.path))refuse("continuous factory requires an explicit native file path");
         configuration config=requested;
+        // Preserve original pure config/policy refusal BEFORE physical issuer
+        // effects. acquire_ repeats validation on the final actual path; neither
+        // preflight allocates a profile, token, authority or replacement clock.
+        (void)continuous_request_preflight(config,policy);
         const auto lexical=std::filesystem::absolute(config.path).lexically_normal();
         config.path=(std::filesystem::canonical(lexical.parent_path().parent_path())/lexical.parent_path().filename()/lexical.filename()).string();
-        auto admission=continuous_acquire(config,policy);
+        auto resources=store_resource_continuous_startup::acquire_(config.path,resource_end);
+        if(resources.managed_())config.path=resources.actual_path_();
+        auto admission=acquire_(config,policy,std::move(resources),resource_end);
         admission->recipe=recipe;
         owner=recipe->construct(config,admission);
         if(!owner||owner->recovery_continuous_!=admission||owner->db_.get()!=admission->writer)
@@ -153,9 +445,17 @@ recovery_continuous_open_result recovery_continuous_producer::open_owned(const c
         admission->retained_owner=owner;
         output.settlement=enroll(owner);
         if(output.settlement.state!=recovery_install_state::committed||output.settlement.postcommit_error){
-            try{owner->close();}catch(...){output.settlement.cleanup_error=std::current_exception();}
+            try{owner->close();}catch(...){
+                const auto actual_close_error=std::current_exception();
+                if(!output.owner_close_error)output.owner_close_error=actual_close_error;
+                if(!output.settlement.cleanup_error)output.settlement.cleanup_error=actual_close_error;
+            }
             return output;
         }
+        // The base constructor must NOT finish before genuine continuous
+        // enrollment. Pending custody alone is no final schema/ledger proof;
+        // publication still requires the real private finishing implementation.
+        if(owner->delivery_startup_)owner->delivery_startup_->require_finished_(*owner);
         // A known enrollment COMMIT survives every later publication failure.
         // No callback, key-cache hit or borrowed pointer may grant admission.
         if(recipe->publish_pointer)recipe->publish_pointer(owner);
@@ -165,7 +465,11 @@ recovery_continuous_open_result recovery_continuous_producer::open_owned(const c
         output.owner=owner;
     } catch(...) {
         const auto error=std::current_exception();
-        if(owner){try{owner->close();}catch(...){output.settlement.cleanup_error=std::current_exception();}}
+        if(owner){try{owner->close();}catch(...){
+                const auto actual_close_error=std::current_exception();
+                if(!output.owner_close_error)output.owner_close_error=actual_close_error;
+                if(!output.settlement.cleanup_error)output.settlement.cleanup_error=actual_close_error;
+            }}
         output.owner.reset();
         if(output.settlement.state==recovery_install_state::committed)output.settlement.postcommit_error=error;
         else output.settlement.primary_error=error;
@@ -174,27 +478,45 @@ recovery_continuous_open_result recovery_continuous_producer::open_owned(const c
 }
 recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lattice_db> owner) {
     const auto admission=owner->recovery_continuous_;auto state=admission->state;
+    if(owner->delivery_startup_) {
+        if(!enrollment_startup_matches_(*owner,*owner->delivery_startup_))
+            refuse("continuous enrollment lost its exact retained pending owner/startup family");
+        owner->delivery_startup_->require_continuous_enrollment_owner_(*owner,admission.get(),admission->pending_startup.resource_end);
+    }
+    std::unique_ptr<recovery_obligation_bootstrap_reader> initialization;
+    if(owner->delivery_startup_)initialization=recovery_obligation_bootstrap_reader::create_continuous_enrollment_(*owner,*owner->db_);
     std::shared_ptr<recovery_local_producer_adapter::context> candidate;
     int64_t new_incarnation=0,phase=0,barrier=0,attempt=0;
     const auto result=recovery_writer_access::install_impl(owner,[&](database& db){
         state->verify_file(db);recovery_local_producer_adapter::validate_custody(*owner,db);
         recovery_local_producer_adapter::management management(db.internal_handle());continuous_frame changing(*state,db,1);
-        const bool existing=db.table_exists(continuous_table);
+        if(initialization)initialization->validated_family_();
+        const bool existing=initialization?!initialization->query_(recovery_obligation_bootstrap_reader::kind::continuous_presence,
+            {std::string(continuous_table)}).empty():db.table_exists(continuous_table);
         if(state->fresh&&!state->initialized&&existing)refuse("continuous fresh file cannot adopt an existing profile");
         if(!existing) {
             if(!state->fresh||state->initialized)refuse("continuous orphan or missing lineage cannot be adopted");
             // Fresh owned WRITE is authoritative. No legacy AuditLog, receiver,
             // journal or producer history may be relabeled into coverage.
-            if(!db.query("SELECT 1 FROM main.AuditLog LIMIT 1").empty()||
-               !db.query("SELECT 1 FROM main.sqlite_schema WHERE name GLOB '_lattice_obligation_*' OR name GLOB '_lattice_install_*' LIMIT 1").empty())
+            if(!(initialization?initialization->query_(recovery_obligation_bootstrap_reader::kind::enrollment_audit_presence):
+                    db.query("SELECT 1 FROM main.AuditLog LIMIT 1")).empty()||
+               !(initialization?initialization->query_(recovery_obligation_bootstrap_reader::kind::enrollment_ledger_presence):
+                    db.query("SELECT 1 FROM main.sqlite_schema WHERE name GLOB '_lattice_obligation_*' OR name GLOB '_lattice_install_*' LIMIT 1")).empty())
                 refuse("continuous fresh enrollment found prior history");
+            if(initialization)initialization->observe_continuous_enrollment_reads_(false);
             candidate=std::make_shared<recovery_local_producer_adapter::context>();candidate->connection=db.internal_handle();candidate->owner=owner.get();candidate->lifetime=owner->guard_;
             candidate->admitted_limits=state->policy.limits;candidate->continuous=admission;
-            receive_install_store receiver(owner,state->policy.limits.installations);receiver.initialize();
-            recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);journal.initialize();
-            recovery_obligation_producer_store producer(owner,state->policy.limits.obligations,state->policy.limits.installations,state->policy.limits.producers);producer.initialize();
+            if(initialization)initialization->initialize_enrollment_ledgers_();
+            receive_install_store receiver(owner,state->policy.limits.installations);if(!initialization)receiver.initialize();
+            recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);if(!initialization)journal.initialize();
+            recovery_obligation_producer_store producer(owner,state->policy.limits.obligations,state->policy.limits.installations,state->policy.limits.producers);if(!initialization)producer.initialize();
+            // The pending Reader completes its closed receiver family on this
+            // SAME unpublished WRITE before the distinct journal producers.
+            if(initialization)for(std::size_t index=0;index<state->policy.contributions.size();++index)
+                initialization->bind_enrollment_receiver_(index);
             for(const auto& contribution:state->policy.contributions){
-                receiver.bind(contribution.profile.binding);const auto scope=journal.bind(contribution.profile);
+                if(!initialization)receiver.bind(contribution.profile.binding);
+                const auto scope=journal.bind(contribution.profile);
                 recovery_local_producer_grant grant{scope.address,contribution.models,contribution.incoming_grant_claim};
                 auto description=recovery_local_producer_adapter::describe(*owner,db,grant,true);
                 if(continuous_receiver_enabled(*state))for(const auto& prior:candidate->profiles) {
@@ -227,8 +549,10 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
             if(continuous_receiver_enabled(*state))recovery_receiver_controller::initialize_owned(owner,state->policy);
             new_incarnation=1;owner->store_recovery_fingerprints();
         } else {
-            continuous_verify_row(db,*state,false);
-            const auto row=db.query(continuous_query).at(0);const auto old=integer(row,"incarnation");
+            continuous_verify_row(db,*state,false,initialization.get());
+            const auto row=(initialization?initialization->query_(recovery_obligation_bootstrap_reader::kind::continuous_row):
+                db.query(continuous_query)).at(0);const auto old=integer(row,"incarnation");
+            if(initialization)initialization->observe_continuous_enrollment_reads_(true);
             if(old==std::numeric_limits<int64_t>::max())refuse("continuous physical incarnation exhausted");
             new_incarnation=state->initialized?state->incarnation:old+1;
             if(state->initialized&&old!=new_incarnation)refuse("continuous facade incarnation changed");
@@ -242,6 +566,31 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
             recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);
             receive_install_store receiver(owner,state->policy.limits.installations);journal.audit();receiver.audit();
             if(journal.usage().scopes!=static_cast<int64_t>(state->policy.contributions.size())||receiver.usage().channels!=static_cast<int64_t>(state->policy.contributions.size()))refuse("continuous extra or missing journal/receiver contribution");
+            // Capture marker currentness before the existing audited receiver
+            // migration can legitimately perform DDL, under this same WRITE.
+            // No foreign DDL can interleave with these owned validations.
+            std::string upgrade_prior_cookie;
+            std::set<std::string> upgrade_marker_keys;
+            const auto schema_cookie=[&]() {
+                const auto rows=db.query("PRAGMA main.schema_version");
+                if(rows.size()!=1)refuse("continuous upgrade schema cookie unavailable");
+                const auto value=integer(rows[0],"schema_version");
+                if(value<0||value>std::numeric_limits<int32_t>::max())refuse("continuous upgrade schema cookie invalid");
+                return std::to_string(value);
+            };
+            const auto marker=[&](const std::string& key) {
+                const auto rows=db.query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=10 THEN value END AS value FROM main._lattice_meta WHERE key=? LIMIT 2",{key});
+                if(rows.size()!=1)refuse("continuous upgrade expected marker missing");
+                return text(rows[0],"value");
+            };
+            if(candidate->legacy_distinct_count_programs) {
+                if(!continuous_receiver_enabled(*state)||!candidate->matches_complete_programs(db))
+                    refuse("continuous historical bundle changed before upgrade");
+                upgrade_prior_cookie=schema_cookie();upgrade_marker_keys.insert(owner->compute_core_fingerprint_key());
+                if(!owner->recovery_schemas_.swift_fingerprint.empty())upgrade_marker_keys.insert(owner->recovery_schemas_.swift_fingerprint);
+                for(const auto& key:upgrade_marker_keys)if(marker(key)!=upgrade_prior_cookie)
+                    refuse("continuous upgrade expected marker stale or noncanonical");
+            }
             if(continuous_receiver_enabled(*state)) {
                 recovery_receiver_controller::validate_reopen_owned(owner,state->policy,phase,barrier,attempt);
             } else for(const auto& profile:candidate->profiles){
@@ -253,6 +602,41 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
                    scope->mode!=(phase==2?recovery_obligation_mode::frozen:recovery_obligation_mode::recording)||
                    scope->last_attempt!=(phase==2?attempt:prior_attempt))
                     refuse("continuous lineage/journal/receiver restart state differs");
+            }
+            if(candidate->legacy_distinct_count_programs) {
+                // Bootstrap was read-only. This existing owned enrollment WRITE
+                // has now validated the full lineage, every journal/receiver and
+                // the current physical file before any optional program upgrade.
+                if(!continuous_receiver_enabled(*state)||!candidate->matches_complete_programs(db))
+                    refuse("continuous historical bundle changed before upgrade");
+                if(recovery_local_producer_test_hooks::before_count_program_upgrade)
+                    recovery_local_producer_test_hooks::before_count_program_upgrade(owner.get());
+                // Retain the admitted descriptor unchanged. The replacement
+                // context is pending: its producer DML guard stays closed until
+                // the existing known-COMMIT tail activates it. Failed endings
+                // keep this unpublished owner fenced and follow normal cleanup.
+                auto upgraded=std::make_shared<recovery_local_producer_adapter::context>();
+                upgraded->connection=candidate->connection;upgraded->owner=candidate->owner;
+                upgraded->lifetime=candidate->lifetime;upgraded->admitted_limits=candidate->admitted_limits;
+                upgraded->continuous=candidate->continuous;upgraded->profiles=candidate->profiles;upgraded->previous=candidate;
+                recovery_local_producer_adapter::compile_continuous(*owner,*upgraded);
+                std::set<std::string> changed;
+                for(size_t i=0;i<candidate->profiles.size();++i)for(const auto& [name,table]:candidate->profiles[i].schema.tables)if(changed.insert(name).second) {
+                    for(const auto& [key,sql]:table.enrolled)db.execute("DROP TRIGGER "+key);
+                    const auto& replacement=upgraded->profiles[i].schema.tables.at(name);
+                    for(const auto& [key,sql]:replacement.enrolled)db.execute(sql);
+                }
+                if(!upgraded->matches_complete_programs(db))refuse("continuous upgrade complete postimage differs");
+                const auto current_cookie=schema_cookie();
+                for(const auto& key:upgrade_marker_keys) {
+                    db.execute("UPDATE main._lattice_meta SET value=? WHERE key=? AND typeof(value)='text' AND value=? COLLATE BINARY",{current_cookie,key,upgrade_prior_cookie});
+                    if(integer(db.query("SELECT changes() AS n").at(0),"n")!=1||marker(key)!=current_cookie)
+                        refuse("continuous upgrade marker postimage differs");
+                }
+                // Existing setup-only registration may throw; that is still
+                // inside this same transaction and follows ordinary rollback.
+                candidate=std::move(upgraded);
+                recovery_local_producer_adapter::register_context(db,candidate);
             }
             if(!state->initialized)db.execute("UPDATE _lattice_producer_continuity SET incarnation=? WHERE id=1 AND incarnation=?",{new_incarnation,old});
         }
@@ -269,7 +653,7 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
             state->incarnation=new_incarnation;state->barrier=barrier;state->attempt=attempt;
             state->initialized=true;state->opening=false;state->dml_open.store(phase==0,std::memory_order_release);
         }
-    });
+    },{},nullptr,false,initialization.get());
     if(candidate&&result.state!=recovery_install_state::committed)candidate->active->store(false,std::memory_order_release);
     return result;
 }
@@ -517,10 +901,12 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
         try{
             const auto path=owner.config_.path;const auto busy_timeout=owner.config_.busy_timeout_ms;
             const auto schema_version=owner.config_.target_schema_version;const auto recipe=admission->recipe;
+            const auto wal_extent_limit_bytes=owner.config_.wal_extent_limit_bytes;
             const auto policy=state->policy;
-            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy]{
+            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy,wal_extent_limit_bytes]{
                 configuration child(path,std::make_shared<std_thread_scheduler>());
                 child.busy_timeout_ms=busy_timeout;child.target_schema_version=schema_version;
+                child.wal_extent_limit_bytes=wal_extent_limit_bytes;
                 auto opened=open_owned(child,policy,recipe);
                 if(!opened.owner||opened.settlement.state!=recovery_install_state::committed||opened.settlement.postcommit_error){
                     if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);
@@ -544,6 +930,7 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     // never acquire an automatic replacement grant or a new registry charge.
     configuration child(owner.config_.path,std::make_shared<std_thread_scheduler>());
     child.busy_timeout_ms=owner.config_.busy_timeout_ms;child.target_schema_version=owner.config_.target_schema_version;
+    child.wal_extent_limit_bytes=owner.config_.wal_extent_limit_bytes;
     auto opened=open_owned(child,state->policy,owner.recovery_continuous_->recipe);
     if(!opened.owner||opened.settlement.state!=recovery_install_state::committed){if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);refuse("continuous dedicated facade open failed");}
     // This private facade was just given a dedicated scheduler. Public shared
@@ -558,21 +945,138 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
 #endif
 }
 
+#ifndef __EMSCRIPTEN__
+bool controller_publications_ended(const std::shared_ptr<recovery_continuous_state>& state,
+    std::chrono::steady_clock::time_point end) noexcept {
+    if(!state||state->controller_creator!=database_native_process())return false;
+    try {
+        std::unique_lock lock(state->mutex);
+        if(!state->controller_deletion_retiring)return false;
+        const bool observed=state->controller_publications_returned.wait_until(lock,end,[&]{
+            return state->controller_publication_builders==0||state->controller_publication_unknown.load(std::memory_order_acquire);
+        });
+        return observed&&state->controller_publication_builders==0&&
+            !state->controller_publication_unknown.load(std::memory_order_acquire);
+    }catch(...){return false;}
+}
+controller_store_ending recovery_continuous_producer::retire_controller_for_deletion(
+    const std::shared_ptr<lattice_db>& owner) {
+    if(!owner)refuse("controller deletion requires its actual Native owner");
+    owner->require_creator_process();
+    if(!owner->is_closed())refuse("controller deletion ending requires prior logical close");
+    controller_store_ending::owned_payload held(new controller_store_ending::payload); // before the producer leaf
+    native_retirement_storage<std::shared_ptr<recovery_continuous_state>,
+        std::shared_ptr<recovery_receiver_controller>> retiring; // admitted before effects
+    if(!retiring.in_creator_process())refuse("controller deletion changed process during ending admission");
+    owner->require_creator_process(); // allocation cannot authorize an inherited producer leaf
+    auto& state=retiring.get<0>();auto& controller=retiring.get<1>();
+    state=owner->recovery_continuous_?owner->recovery_continuous_->state:nullptr;
+    if(state){
+        if(state->controller_creator!=database_native_process())refuse("controller deletion producer belongs to another process");
+        {
+            std::lock_guard lock(state->mutex);
+            state->controller_deletion_retiring=true;
+            held->rows=state->controller_originals;
+            held->first_failed_original=state->first_failed_controller_original;
+            controller=state->controller.lock();
+        }
+        held->publication=state;
+        if(controller)controller->retire_for_deletion(); // no producer/Native/store leaf
+    }
+    owner->require_creator_process(); // final off-leaf proof/writer release may have forked
+    // Private successful freeze only. Empty is not inferred from weak expiry:
+    // all actual candidates reserved rows before launching, and builders are
+    // fenced/awaited separately, including unpublished/racing constructors.
+    return controller_store_ending(held.release());
+}
+#endif
 std::shared_ptr<recovery_receiver_route> recovery_continuous_producer::attach_receiver(
     const std::shared_ptr<recovery_continuous_route>& route,std::shared_ptr<lattice_db> owner,
     const std::shared_ptr<receiver_source_binding>& source,const std::shared_ptr<owned_platform_sync_transport>& transport,
     const std::shared_ptr<scheduler>& scheduler,const std::shared_ptr<sync_callback_lifetime>& lifetime) {
     if(!owner||!owner->recovery_continuous_)return {};
+    owner->require_creator_process();
     auto state=owner->recovery_continuous_->state;
     if(!continuous_receiver_enabled(*state))return {};
     if(!route||route->state_!=state||route->owner_.lock()!=owner||route->incarnation_!=state->incarnation||
        !source||!transport||!scheduler||!lifetime)refuse("continuous receiver requires its actual authenticated platform route");
-    // Construct outside the leaf: no destructor, allocator or platform callback
-    // runs while a producer registration lock is held.
-    auto candidate=std::shared_ptr<recovery_receiver_controller>(new recovery_receiver_controller(state->policy));
+#ifndef __EMSCRIPTEN__
+    if(state->controller_creator!=database_native_process())refuse("controller producer belongs to another process");
+    struct publication_tail {
+        const uint64_t creator=database_native_process();
+        std::shared_ptr<recovery_continuous_state>* held;
+        bool admitted=false;
+        explicit publication_tail(const std::shared_ptr<recovery_continuous_state>& actual)
+            :held(new std::shared_ptr<recovery_continuous_state>(actual)){}
+        publication_tail(const publication_tail&)=delete;
+        publication_tail& operator=(const publication_tail&)=delete;
+        ~publication_tail(){
+            if(creator!=database_native_process()){held=nullptr;return;}
+            if(admitted){
+                auto& state=**held;
+                try {std::lock_guard lock(state.mutex);--state.controller_publication_builders;}
+                catch(...) {state.controller_publication_unknown.store(true,std::memory_order_release);}
+                state.controller_publications_returned.notify_all();
+            }
+            delete held; // final producer/callback ownership release OFF its leaf
+        }
+    } publication(state); // allocation precedes the actual counted admission
+    {
+        std::lock_guard lock(state->mutex);
+        if(!state->controller_deletion_retiring&&state->controller_publication_builders!=SIZE_MAX){
+            ++state->controller_publication_builders;publication.admitted=true;
+        }
+    }
+    if(!publication.admitted)refuse("controller deletion retired publication admission");
+    // No destructor, allocator or platform callback runs under the producer
+    // leaf. Completed originals are observed first and retired outside it.
     std::shared_ptr<recovery_receiver_controller> controller;
-    {std::lock_guard<std::mutex> lock(state->mutex);controller=state->controller.lock();if(!controller){controller=candidate;state->controller=controller;}}
+    std::array<std::shared_ptr<controller_worker_original>,64> prior,retired;
+    {std::lock_guard lock(state->mutex);controller=state->controller.lock();prior=state->controller_originals;}
+    if(!controller){
+        auto candidate_original=std::make_shared<controller_worker_original>();
+        std::array<bool,64> joined{},failed{};
+        for(size_t at=0;at<prior.size();++at)if(prior[at]){
+            const auto observed=prior[at]->wait_until(std::chrono::steady_clock::now());
+            joined[at]=observed.constructor_complete&&observed.actual==recovery_controller_executor::ending::disposition::joined;
+            failed[at]=observed.constructor_failed;
+        }
+        size_t selected=prior.size();bool retiring=false;
+        {
+            std::lock_guard lock(state->mutex);
+            retiring=state->controller_deletion_retiring;
+            if(!retiring){
+                for(size_t at=0;at<prior.size();++at)if(joined[at]&&state->controller_originals[at]==prior[at]){
+                    if(failed[at]&&!state->first_failed_controller_original)
+                        state->first_failed_controller_original=prior[at];
+                    retired[at]=std::move(state->controller_originals[at]);
+                }
+                for(size_t at=0;at<prior.size();++at)if(!state->controller_originals[at]){
+                    selected=at;state->controller_originals[at]=candidate_original;break;
+                }
+            }
+        }
+        if(retiring)refuse("controller deletion retired candidate construction");
+        if(selected==prior.size())refuse("controller original ending custody capacity exhausted");
+        std::shared_ptr<recovery_receiver_controller> candidate;
+        try{candidate=std::shared_ptr<recovery_receiver_controller>(new recovery_receiver_controller(state->policy,candidate_original));}
+        catch(...){candidate_original->failed_constructor(std::current_exception());throw;}
+        if(state->controller_creator!=database_native_process())refuse("controller candidate belongs to another process");
+        candidate_original->succeeded_constructor(); // shared_ptr construction/assignment actually returned
+        {
+            std::lock_guard lock(state->mutex);
+            retiring=state->controller_deletion_retiring;
+            controller=state->controller.lock();
+            if(!retiring&&!controller){controller=candidate;state->controller=controller;}
+        }
+        if(retiring){candidate->retire_for_deletion();refuse("controller deletion refused late candidate publication");}
+        // A racing candidate's actual worker retires off the producer leaf;
+        // its independently reserved original remains until real reaper join.
+    }
     return controller->attach(std::move(owner),route,source,transport,scheduler,lifetime);
+#else
+    refuse("continuous browser controller ending unavailable");
+#endif
 }
 recovery_continuous_producer::cohort_admission recovery_continuous_producer::controller_cohort(
     const recovery_receiver_controller& controller,const std::shared_ptr<lattice_db>& owner,
@@ -598,8 +1102,49 @@ bool recovery_continuous_producer::reconciliation_work_current(
        work->state_!=owner->recovery_continuous_->state)refuse("restricted export lost counted descriptor custody");
     return recovery_receiver_controller::reconciliation_route_current(work->reconciliation_,work->restricted_route_,owner,work->physical_);
 }
+namespace {
+// One scoped producer context, never a callback or a generic publication hook.
+// The common install retains the actual owner/writer throughout this frame.
+struct controller_resume_commit_frame {
+    static thread_local controller_resume_commit_frame* current;
+    controller_resume_commit_frame* previous;
+    const recovery_receiver_controller* controller;
+    const lattice_db* owner;
+    std::shared_ptr<recovery_continuous_admission> admission;
+    std::shared_ptr<recovery_continuous_state> state;
+    database* writer=nullptr;
+    int64_t incarnation=0,barrier=0,attempt=0;
+    uint64_t gate_revision=0;
+    bool armed=false,published=false;
+    controller_resume_commit_frame(const recovery_receiver_controller& c,const lattice_db* o)noexcept
+        :previous(current),controller(&c),owner(o){current=this;}
+    ~controller_resume_commit_frame(){current=previous;}
+    controller_resume_commit_frame(const controller_resume_commit_frame&)=delete;
+};
+thread_local controller_resume_commit_frame* controller_resume_commit_frame::current=nullptr;
+}
+void publish_controller_resume_after_owned_commit(lattice_db& owner,database& writer) {
+    auto* pending=controller_resume_commit_frame::current;
+    if(!pending||pending->owner!=&owner||!pending->armed||pending->published)return;
+    const auto& state=pending->state;
+    if(pending->writer!=&writer||!state||!pending->admission||
+       pending->admission->owner!=&owner||pending->admission->writer!=&writer||
+       pending->admission->state!=state||owner.is_closed())
+        refuse("controller committed resume lost exact owner/writer custody");
+    // Same Native -> state-mutex order as controller_resume_owned. No SQL,
+    // arbitrary callback, user payload or clock; successful publication does
+    // not allocate. Refusal uses the existing bounded exception path.
+    std::lock_guard lock(state->mutex);
+    if(!state->initialized||state->controller.lock().get()!=pending->controller||
+       state->incarnation!=pending->incarnation||state->barrier!=pending->barrier||
+       state->attempt!=pending->attempt||state->gate_revision!=pending->gate_revision||
+       state->operations||state->dml_open.load(std::memory_order_acquire))
+        refuse("controller committed resume generation was revoked");
+    state->dml_open.store(true,std::memory_order_release);pending->published=true;
+}
 recovery_install_result recovery_continuous_producer::controller_owned(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,const std::function<void(database&)>& body,bool controller_try) {
+    controller_resume_commit_frame publication(controller,owner.get());
     return recovery_writer_access::install_impl(owner,[&](database& db){
         if(!owner->recovery_continuous_)refuse("controller lost actual continuous owner");
         auto state=owner->recovery_continuous_->state;
@@ -664,6 +1209,18 @@ void recovery_continuous_producer::controller_resume_owned(const recovery_receiv
     writer->execute("UPDATE _lattice_producer_continuity SET phase=0 WHERE id=1 AND phase=3 AND barrier=? AND attempt=?",{barrier,attempt});
     const auto after=writer->query(continuous_query).at(0);
     if(integer(after,"phase")!=0||integer(after,"barrier")!=barrier||integer(after,"attempt")!=attempt)refuse("controller resume transition changed");
+    // Arm only after the actual resumed journals and exact phase-0 postimage.
+    // A body failure/rollback/failed COMMIT discards this frame without opening.
+    auto* publication=controller_resume_commit_frame::current;
+    if(!publication||publication->owner!=owner.get()||publication->controller!=&controller||publication->armed)
+        refuse("controller resume lacks exact scoped publication custody");
+    std::lock_guard lock(state->mutex);
+    if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load()||
+       state->barrier!=barrier||state->attempt!=attempt||!state->initialized)
+        refuse("controller resume publication generation changed");
+    publication->admission=owner->recovery_continuous_;publication->state=state;publication->writer=writer;
+    publication->incarnation=state->incarnation;publication->barrier=barrier;publication->attempt=attempt;
+    publication->gate_revision=state->gate_revision;publication->armed=true;
 }
 void recovery_continuous_producer::controller_restart_terminal_owned(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,int64_t physical_incarnation,int64_t barrier,int64_t attempt) {
@@ -711,6 +1268,9 @@ void recovery_continuous_producer::controller_publish_resume(const recovery_rece
     if(!owner||owner->is_closed()||!owner->recovery_continuous_)return;
     const auto state=owner->recovery_continuous_->state;
     std::lock_guard<std::mutex> lock(state->mutex);
-    if(state->controller.lock().get()==&controller&&state->barrier==barrier&&state->attempt==attempt&&!state->operations)
-        state->dml_open.store(true,std::memory_order_release);
+    // Offlock acknowledgement only. Opening authority was consumed at known
+    // COMMIT under Native admission; this old tail cannot reopen a new barrier.
+    if(state->controller.lock().get()==&controller&&state->barrier==barrier&&state->attempt==attempt&&
+       !state->operations&&!state->dml_open.load(std::memory_order_acquire))
+        refuse("controller resume was not published with known COMMIT");
 }

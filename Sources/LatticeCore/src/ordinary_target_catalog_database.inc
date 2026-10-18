@@ -5,6 +5,7 @@
 namespace lattice {
 struct database::target_staging_state::catalog_native {
     using program=detail::ordinary_group_target_schema_original::catalog_program;
+    terminal_native_static_tail terminal_static; // FIRST: real member tail follows payload/scope destruction.
     database* const shell;
     const std::weak_ptr<detail::ordinary_group_target_schema_original> original;
     const std::shared_ptr<program> generated;
@@ -35,11 +36,12 @@ struct database::target_staging_state::catalog_native {
     std::exception_ptr first_failure;
     catalog_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_schema_original>& source,
         std::shared_ptr<program> input)
-        :shell(&actual),original(source),generated(std::move(input)),commit_index(generated->operations.size()+1),
+        :terminal_static(actual,this,source.get(),0),shell(&actual),original(source),generated(std::move(input)),commit_index(generated->operations.size()+1),
          rollback_index(commit_index+1),probe_index(commit_index+2),udf_first_index(commit_index+3) {
         if(generated->operations.empty()||generated->operations.size()>program::maximum_operations||
            udf_first_index+maximum_udf_queries>maximum_statements)
             throw db_error("target catalog fixed native capacity unavailable");
+        terminal_static.constructor_returned();
     }
     void require(database& actual,bool unwind=false)const {
         const auto state=actual.target_staging_;
@@ -64,7 +66,7 @@ struct database::target_staging_state::catalog_native {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)return;
         require(actual,unwind);auto& record=reserve(kind::finalize,index,unwind);require(actual,unwind);
         statement.finalized_identity=statement.held;statement.finalize_entered=true;record.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;
         returned(record,statement.finalize_rc);
         // SQLITE_MISUSE can return before sqlite3VdbeDelete. Preserve the SAME
         // outstanding VM and first identities; never retry an unknown ending.
@@ -79,7 +81,7 @@ struct database::target_staging_state::catalog_native {
             throw db_error("target catalog generated native statement unavailable");
         require(actual,unwind);auto& record=reserve(kind::prepare,index,unwind);require(actual,unwind);
         const char* tail=nullptr;statement.prepare_entered=true;record.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(actual.db_,sql.c_str(),static_cast<int>(sql.size()+1),&statement.held,&tail);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(actual.db_,sql.c_str(),static_cast<int>(sql.size()+1),&statement.held,&tail);
         statement.prepared_identity=statement.held;statement.prepare_returned=true;returned(record,statement.prepare_rc);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held)throw db_error("target catalog native preparation failed");
         require(actual,unwind);
@@ -90,7 +92,7 @@ struct database::target_staging_state::catalog_native {
     int step(database& actual,std::size_t index,bool unwind=false) {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)throw db_error("target catalog native statement not active");
         require(actual,unwind);auto& record=reserve(kind::step,index,unwind);require(actual,unwind);
-        statement.step_entered=true;record.entered=true;const int rc=sqlite3_step(statement.held);returned(record,rc);
+        statement.step_entered=true;record.entered=true;const int rc=::lattice::detail::store_physical_step(statement.held);returned(record,rc);
         if(!statement.first_step_returned){statement.first_step_rc=rc;statement.first_step_returned=true;}
         if(rc!=SQLITE_ROW){if(statement.terminal_returned)throw db_error("target catalog native terminal already observed");statement.terminal_rc=rc;statement.terminal_returned=true;}
         if(index==0)scope->record_schema_begin(actual,rc);
@@ -216,7 +218,7 @@ void database::target_staging_state::invoke_catalog_control(sync_control_userdat
 bool database::target_catalog_native_ending_()const noexcept {
     try {
         const auto state=target_staging_;const auto actual=state?state->catalog:nullptr;
-        if(!state||!state->current_creator()||!actual||actual->shell!=this||!actual->scope||actual->ending||
+        if(!state||!state->current_creator()||state->terminal_native_statics_attempted||!actual||actual->shell!=this||!actual->scope||actual->ending||
            actual->first_failure||!actual->module_entered||!actual->module_returned||actual->first_module_rc!=SQLITE_OK||
            !actual->cookie_observed||actual->first_cookie<0||actual->cookie_text.empty()||
            actual->completed_operations!=actual->generated->operations.size()||!actual->udf_queries)

@@ -46,14 +46,14 @@ std::string managed_baseline_rows(sqlite3* handle,ordinary_export_frame& image,b
     const auto total=static_cast<std::size_t>(integer(count[0][0]));
     fingerprint digest;digest.bytes(image.scope);digest.number(total);
     database::record_statement();sqlite3_stmt* raw=nullptr;
-    const auto rc=sqlite3_prepare_v2(handle,"SELECT model,gid,value FROM main._lattice_ordered_receiver_baseline_v1 WHERE scope=? ORDER BY model,gid",-1,&raw,nullptr);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const auto rc=::lattice::detail::store_physical_prepare_v2(handle,"SELECT model,gid,value FROM main._lattice_ordered_receiver_baseline_v1 WHERE scope=? ORDER BY model,gid",-1,&raw,nullptr);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(rc!=SQLITE_OK||!raw||sqlite3_bind_parameter_count(raw)!=1||sqlite3_column_count(raw)!=3||!sqlite3_stmt_readonly(raw)||
        sqlite3_bind_text(raw,1,image.scope.data(),static_cast<int>(image.scope.size()),SQLITE_STATIC)!=SQLITE_OK)
         refuse("managed baseline retained statement refused");
     int step=SQLITE_OK;std::size_t seen=0;
     for(;;) {
-        managed_pair_deadline(end);step=sqlite3_step(raw);if(step!=SQLITE_ROW)break;
+        managed_pair_deadline(end);step=::lattice::detail::store_physical_step(raw);if(step!=SQLITE_ROW)break;
         if(seen==total)refuse("managed baseline gained a row inside retained view");
         if(sqlite3_column_type(raw,0)!=SQLITE_TEXT||sqlite3_column_type(raw,1)!=SQLITE_TEXT||sqlite3_column_type(raw,2)!=SQLITE_BLOB)
             refuse("managed baseline exact storage changed");
@@ -78,7 +78,7 @@ std::string managed_baseline_rows(sqlite3* handle,ordinary_export_frame& image,b
         found->rows.push_back(std::move(decoded));++seen;
     }
     if(step!=SQLITE_DONE||seen!=total)refuse("managed baseline scan did not settle exactly");
-    if(sqlite3_finalize(statement.release())!=SQLITE_OK)refuse("managed baseline statement finalization failed");
+    if(::lattice::detail::store_physical_finalize(statement.release())!=SQLITE_OK)refuse("managed baseline statement finalization failed");
     managed_pair_deadline(end);
     image.rows=total;charged.add(64);return digest.finish();
 }

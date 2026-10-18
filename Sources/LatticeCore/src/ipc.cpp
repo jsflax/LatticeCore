@@ -1,5 +1,6 @@
 #include "lattice/ipc.hpp"
 #include "lattice/log.hpp"
+#include "canonical_ready_sha256.hpp"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -17,12 +18,54 @@
 #endif
 
 namespace lattice {
+namespace {
+// Reject before any unlink, directory creation, socket or connect. Never let
+// the kernel name a truncated prefix while cleanup names the original path.
+sockaddr_un ipc_socket_address(const std::string& path) {
+    sockaddr_un address{};
+    if (path.empty() || path.find('\0') != std::string::npos ||
+            path.size() >= sizeof(address.sun_path)) {
+        throw std::invalid_argument("ipc: socket path is empty, contains NUL, or exceeds sun_path");
+    }
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path.data(), path.size());
+    return address; // Zero initialization supplies the one required terminator.
+}
+
+std::string compact_ipc_channel_basename(const std::string& channel) {
+    // Full SHA-256, domain separated by the fixed versioned prefix plus NUL.
+    // Unpadded base64url uses 43 bytes for all 256 bits. No `.sock` suffix:
+    // this namespace is disjoint from every unchanged short default basename.
+    constexpr char domain[] = "lattice-ipc-default-channel-v1";
+    detail::ready_sha256_state hash;
+    hash.process(std::string_view(domain, sizeof(domain)));
+    hash.process(channel);
+    constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string basename = "h-";
+    basename.reserve(45);
+    uint32_t pending = 0;
+    unsigned bits = 0;
+    for (const auto byte : hash.digest_bytes()) {
+        pending = (pending << 8) | byte;
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            basename.push_back(alphabet[(pending >> bits) & 63u]);
+        }
+    }
+    if (bits) basename.push_back(alphabet[(pending << (6 - bits)) & 63u]);
+    return basename;
+}
+} // namespace
 
 // ============================================================================
 // Channel → socket path resolution
 // ============================================================================
 
 std::string resolve_ipc_socket_path(const std::string& channel) {
+    if (channel.find('\0') != std::string::npos)
+        throw std::invalid_argument("ipc: channel contains NUL");
 #ifdef __APPLE__
     // macOS: ~/Library/Caches/Lattice/ipc/<channel>.sock
     const char* home = getenv("HOME");
@@ -42,8 +85,13 @@ std::string resolve_ipc_socket_path(const std::string& channel) {
         dir = "/tmp/lattice-" + std::to_string(getuid());
     }
 #endif
+    std::string path = dir + "/" + channel + ".sock";
+    sockaddr_un address{};
+    if (path.size() >= sizeof(address.sun_path))
+        path = dir + "/" + compact_ipc_channel_basename(channel);
+    (void)ipc_socket_address(path); // Even the compact name must fit this base.
     std::filesystem::create_directories(dir);
-    return dir + "/" + channel + ".sock";
+    return path;
 }
 
 // ============================================================================
@@ -169,6 +217,16 @@ void ipc_socket_client::connect(const std::string& /*url*/,
         return;
     }
 
+    // Validate before acquiring a descriptor; preserve the client's error callback.
+    sockaddr_un addr{};
+    try {
+        addr = ipc_socket_address(socket_path_);
+    } catch (const std::invalid_argument& error) {
+        state_ = transport_state::closed;
+        if (on_error_) on_error_(error.what());
+        return;
+    }
+
     // Client-side: connect to the server socket
     state_ = transport_state::connecting;
 
@@ -182,9 +240,6 @@ void ipc_socket_client::connect(const std::string& /*url*/,
     }
     suppress_sigpipe(sock);
 
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::string err = "ipc: connect() failed: " + std::string(strerror(errno));
@@ -329,6 +384,8 @@ ipc_server::~ipc_server() {
 void ipc_server::start(accept_callback callback) {
     if (is_listening_) return;
 
+    auto addr = ipc_socket_address(socket_path_);
+
     // Remove stale socket file if it exists
     ::unlink(socket_path_.c_str());
 
@@ -338,9 +395,6 @@ void ipc_server::start(accept_callback callback) {
     }
     suppress_sigpipe(listen_fd_);
 
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         int err = errno;
@@ -405,13 +459,16 @@ void ipc_server::stop() {
 ipc_endpoint::ipc_endpoint(const std::string& channel,
                            const std::optional<std::string>& socket_path)
     : channel_(channel)
-    , socket_path_(socket_path.value_or(resolve_ipc_socket_path(channel))) {}
+    , socket_path_(socket_path ? *socket_path : resolve_ipc_socket_path(channel)) {
+    (void)ipc_socket_address(socket_path_);
+}
 
 ipc_endpoint::~ipc_endpoint() {
     stop();
 }
 
 void ipc_endpoint::start(transport_ready_callback callback) {
+    auto addr = ipc_socket_address(socket_path_);
     // Ensure parent directory exists (needed for explicit socket paths)
     std::filesystem::create_directories(
         std::filesystem::path(socket_path_).parent_path());
@@ -422,9 +479,6 @@ void ipc_endpoint::start(transport_ready_callback callback) {
         throw std::runtime_error("ipc_endpoint: socket() failed: " + std::string(strerror(errno)));
     }
 
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
 
     // Don't unlink first — if bind fails with EADDRINUSE, we probe the socket
     // to distinguish a live server from a stale file left by a crashed process.

@@ -1,3 +1,5 @@
+#include <lattice/store_physical_api.hpp>
+#include "database_sql_dispatcher.hpp"
 #include "ordinary_cohort_attachment.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "canonical_receipt_coverage.hpp"
@@ -320,8 +322,6 @@ struct canonical_writer_adapter::context {
     }
     static int authorize(void* opaque,int action,const char* one,const char* two,const char* schema,const char* origin) noexcept {
         auto& self=*static_cast<context*>(opaque);
-        const int managed=ordinary_composed_attachment_authorize(self.connection,action,one,two);
-        if(managed!=SQLITE_OK)return managed;
         const auto normal=[&]() noexcept -> int {
         // Context is connection-owned; no SQLite/SQL, allocations or callbacks.
         if(self.administrative)return authorize_administration(self,action,one,two,schema,origin);
@@ -446,6 +446,9 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         validate_ready_profile(*ready,p,*retention,bool(namespaces->coverage));
     }
     writer_=owner.db_;
+    if(!writer_)refuse("canonical writer original unavailable");
+    store_physical_native_scope physical_call(*writer_);
+    if(!physical_call.entered())refuse("resource Native caller original unavailable");
     {
         auto* mutex=sqlite3_db_mutex(writer_->internal_handle());sqlite3_mutex_enter(mutex);
         struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
@@ -489,25 +492,25 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     if(retention)prepare_retention(owner,*retention);
     const auto register_shared=[&] {
         auto* held=new std::shared_ptr<context>(context_);
-        if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_guard_v1",4,SQLITE_UTF8,held,
+        if(::lattice::detail::store_physical_create_function_v2(context_->connection,"lattice_canonical_guard_v1",4,SQLITE_UTF8,held,
               context::admit,nullptr,nullptr,[](void* x){delete static_cast<std::shared_ptr<context>*>(x);})!=SQLITE_OK)
             refuse("canonical guard registration failed"); // SQLite owns/destructs userdata on failure.
-        if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_uuid_v1",1,SQLITE_UTF8|SQLITE_DETERMINISTIC,
+        if(::lattice::detail::store_physical_create_function_v2(context_->connection,"lattice_canonical_uuid_v1",1,SQLITE_UTF8|SQLITE_DETERMINISTIC,
               nullptr,uuid_sql,nullptr,nullptr,nullptr)!=SQLITE_OK)refuse("canonical UUID registration failed");
-        if(upstream && (sqlite3_create_function_v2(context_->connection,"lattice_canonical_require_v1",1,SQLITE_UTF8,
+        if(upstream && (::lattice::detail::store_physical_create_function_v2(context_->connection,"lattice_canonical_require_v1",1,SQLITE_UTF8,
                 nullptr,context::require,nullptr,nullptr,nullptr)!=SQLITE_OK ||
-            sqlite3_create_function_v2(context_->connection,"lattice_canonical_entry_v1",3,SQLITE_UTF8,
+            ::lattice::detail::store_physical_create_function_v2(context_->connection,"lattice_canonical_entry_v1",3,SQLITE_UTF8,
                 nullptr,context::admit_entry,nullptr,nullptr,nullptr)!=SQLITE_OK))
             refuse("canonical upstream guard registration failed");
     };
     bool began=false;
     try {
-        if(writer_->canonical_callback_custody_&&restore_ordinary_attachment_guard(writer_->internal_handle())!=SQLITE_OK)
+        if(writer_->canonical_callback_custody_&&writer_->clear_sql_authorizer_(database_authorizer_slot::canonical,writer_->canonical_callback_custody_.get())!=SQLITE_OK)
             refuse("canonical temporary managed gate restoration failed");
         register_shared();
         if(retention) {
             auto* held=new std::shared_ptr<context>(context_);
-            if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_retention_guard_v1",0,SQLITE_UTF8,
+            if(::lattice::detail::store_physical_create_function_v2(context_->connection,"lattice_canonical_retention_guard_v1",0,SQLITE_UTF8,
                 held,context::admit_retention,nullptr,nullptr,[](void* value){delete static_cast<std::shared_ptr<context>*>(value);})!=SQLITE_OK)
                 refuse("canonical retention guard registration failed");
         }
@@ -844,7 +847,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         // A migrated source has finished all schema work. Restore normal
         // protection before COMMIT and its reentrant notification tail; test
         // restrictions can deny this genuine COMMIT without replacing hooks.
-        if(migration_from_ready&&sqlite3_set_authorizer(context_->connection,context::authorize,context_.get())!=SQLITE_OK)
+        if(migration_from_ready&&writer_->set_sql_authorizer_(database_authorizer_slot::canonical,context::authorize,context_.get())!=SQLITE_OK)
             refuse("receipt migration settlement authorizer registration failed");
         };
         if(adoption) {
@@ -853,7 +856,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             writer_->canonical_trigger_only_=true;
             writer_->canonical_callback_custody_=context_;
             writer_->canonical_write_allowed_=context_->active;
-            if(sqlite3_set_authorizer(context_->connection,context::authorize,context_.get())!=SQLITE_OK)
+            if(writer_->set_sql_authorizer_(database_authorizer_slot::canonical,context::authorize,context_.get())!=SQLITE_OK)
                 refuse("canonical adoption authorizer registration failed");
             adoption->result.settlement=recovery_writer_access::install(adoption->owner,[&](database& db) {
                 if(&db!=writer_.get())refuse("canonical adoption writer changed");
@@ -884,7 +887,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         writer_->canonical_callback_custody_=context_;
         writer_->canonical_write_allowed_=context_->active;
         context_->active->store(true,std::memory_order_release);
-        if(sqlite3_set_authorizer(context_->connection,context::authorize,context_.get())!=SQLITE_OK)
+        if(writer_->set_sql_authorizer_(database_authorizer_slot::canonical,context::authorize,context_.get())!=SQLITE_OK)
             refuse("canonical writer authorizer registration failed");
     } catch(...) {
         context_->active->store(false,std::memory_order_release);
@@ -896,7 +899,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
         writer_->canonical_callback_custody_=context_;
         writer_->canonical_write_allowed_=context_->active;
-        sqlite3_set_authorizer(context_->connection,context::authorize,context_.get());
+        writer_->set_sql_authorizer_(database_authorizer_slot::canonical,context::authorize,context_.get());
         if(cleanup)throw canonical_store_error(canonical_store_error_code::cleanup_failed,
             "canonical attachment rollback failed; writer remains refused",primary,cleanup);
         std::rethrow_exception(primary);
@@ -1034,10 +1037,10 @@ size_t scalar_bytes(const any_property::value_type& value) {
 }
 struct checked_statement {
     sqlite3_stmt* value=nullptr;
-    ~checked_statement(){if(value)sqlite3_finalize(value);}
+    ~checked_statement(){if(value)::lattice::detail::store_physical_finalize(value);}
     void finish() {
         auto* statement=std::exchange(value,nullptr);
-        if(sqlite3_finalize(statement)!=SQLITE_OK)refuse("canonical upstream statement finalization failed");
+        if(::lattice::detail::store_physical_finalize(statement)!=SQLITE_OK)refuse("canonical upstream statement finalization failed");
     }
 };
 void bind_checked(sqlite3_stmt* stmt,int index,const column_value_t& value) {
@@ -1323,7 +1326,7 @@ void canonical_upstream_delivery::execute(const std::string& sql,const std::vect
         refuse("canonical upstream SQL/parameter budget exceeded");
     checked_statement statement;const char* tail=nullptr;
     database::record_statement();
-    if(sqlite3_prepare_v2(context_->connection,sql.data(),static_cast<int>(sql.size()),&statement.value,&tail)!=SQLITE_OK || !statement.value)
+    if(::lattice::detail::store_physical_prepare_v2(context_->connection,sql.data(),static_cast<int>(sql.size()),&statement.value,&tail)!=SQLITE_OK || !statement.value)
         refuse("canonical upstream statement preparation failed");
     for(const char* p=tail;p<sql.data()+sql.size();++p)if(*p!=' '&&*p!='\t'&&*p!='\r'&&*p!='\n')
         refuse("canonical upstream executor requires one statement");
@@ -1338,7 +1341,7 @@ void canonical_upstream_delivery::execute(const std::string& sql,const std::vect
             if constexpr(std::is_same_v<T,std::string>||std::is_same_v<T,blob>)return v.size();else return 8;},params[i]);
         bounded_add(used,size,limit);bind_checked(statement.value,static_cast<int>(i+1),params[i]);
     }
-    if(sqlite3_step(statement.value)!=SQLITE_DONE)refuse("canonical upstream statement execution failed");
+    if(::lattice::detail::store_physical_step(statement.value)!=SQLITE_DONE)refuse("canonical upstream statement execution failed");
     statement.finish();
 }
 std::vector<database::row_t> canonical_upstream_delivery::query(const std::string& sql,const std::vector<column_value_t>& params) {
@@ -1346,7 +1349,7 @@ std::vector<database::row_t> canonical_upstream_delivery::query(const std::strin
         refuse("canonical upstream query budget exceeded");
     checked_statement statement;const char* tail=nullptr;
     database::record_statement();
-    if(sqlite3_prepare_v2(context_->connection,sql.data(),static_cast<int>(sql.size()),&statement.value,&tail)!=SQLITE_OK || !statement.value)
+    if(::lattice::detail::store_physical_prepare_v2(context_->connection,sql.data(),static_cast<int>(sql.size()),&statement.value,&tail)!=SQLITE_OK || !statement.value)
         refuse("canonical upstream query preparation failed");
     for(const char* p=tail;p<sql.data()+sql.size();++p)if(*p!=' '&&*p!='\t'&&*p!='\r'&&*p!='\n')
         refuse("canonical upstream query requires one statement");
@@ -1362,7 +1365,7 @@ std::vector<database::row_t> canonical_upstream_delivery::query(const std::strin
     if(columns<1 || columns>static_cast<int>(max_columns))refuse("canonical upstream query column budget exceeded");
     std::vector<database::row_t> rows;
     for(;;) {
-        const int rc=sqlite3_step(statement.value);
+        const int rc=::lattice::detail::store_physical_step(statement.value);
         if(rc==SQLITE_DONE)break;
         if(rc!=SQLITE_ROW)refuse("canonical upstream query execution failed");
         if(rows.size()>=64)refuse("canonical upstream query row budget exceeded");
@@ -1408,10 +1411,10 @@ void canonical_upstream_delivery::script(const std::string& sql) {
     while(at<end) {
         checked_statement statement;const char* next=nullptr;
         database::record_statement();
-        if(sqlite3_prepare_v2(context_->connection,at,static_cast<int>(end-at),&statement.value,&next)!=SQLITE_OK || next<=at)
+        if(::lattice::detail::store_physical_prepare_v2(context_->connection,at,static_cast<int>(end-at),&statement.value,&next)!=SQLITE_OK || next<=at)
             refuse("canonical upstream kernel preparation failed");
         at=next;if(!statement.value)continue;
-        int rc;do {rc=sqlite3_step(statement.value);}while(rc==SQLITE_ROW);
+        int rc;do {rc=::lattice::detail::store_physical_step(statement.value);}while(rc==SQLITE_ROW);
         if(rc!=SQLITE_DONE)refuse("canonical upstream kernel condition or mutation failed");
         statement.finish();
     }

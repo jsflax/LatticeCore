@@ -1,3 +1,6 @@
+#include <lattice/store_physical_api.hpp>
+#include "database_sql_dispatcher.hpp"
+#include "database_sql_request.hpp"
 #include "ordinary_cohort_attachment.hpp"
 #include "projection_memory.hpp"
 #include "projection_capture_policy.hpp"
@@ -222,17 +225,24 @@ void database_projection_capture::inventory_functions() {
         "json_extract", "length", "like", "lower", "nullif", "round",
         "substr", "substring", "typeof", "unicode", "upper"
     };
+    detail::database_sql_read_limits declaration;
+    declaration.sql_bytes=128;declaration.parameter_bytes=0;declaration.columns=16;
+    declaration.rows=4096;declaration.result_bytes=1024*1024;declaration.deadline=control_->deadline;
+    detail::database_sql_request request(database_,detail::database_sql_read_kind::function_inventory,
+        "PRAGMA function_list",{},&declaration);
+    detail::database_sql_request::binding requested(&request);
     sqlite3_stmt* inventory = nullptr;
-    struct finish { sqlite3_stmt*& value; ~finish() { if (value) sqlite3_finalize(value); } } cleanup{inventory};
+    struct finish { sqlite3_stmt*& value; ~finish() { if (value) ::lattice::detail::store_physical_finalize(value); } } cleanup{inventory};
     database::record_statement();
-    if (sqlite3_prepare_v3(handle_, "PRAGMA function_list", -1, SQLITE_PREPARE_NO_VTAB,
+    if (::lattice::detail::store_physical_prepare_v3(handle_, "PRAGMA function_list", -1, SQLITE_PREPARE_NO_VTAB,
                            &inventory, nullptr) != SQLITE_OK)
         capture_fail(projection_status::unsupported, "memory capture function inventory is unavailable");
+    request.adopt(inventory);request.columns(inventory);
     std::unordered_set<std::string> overridden;
     size_t inspected = 0;
     int rc;
-    while ((rc = sqlite3_step(inventory)) == SQLITE_ROW) {
-        check();
+    while ((rc = ::lattice::detail::store_physical_step(inventory)) == SQLITE_ROW) {
+        check();request.row(inventory);
         if (++inspected > 4096)
             capture_fail(projection_status::unsupported, "memory capture function inventory exceeds bound");
         const auto* raw = reinterpret_cast<const char*>(sqlite3_column_text(inventory, 0));
@@ -251,8 +261,6 @@ void database_projection_capture::inventory_functions() {
 int database_projection_capture::authorize(void* context, int action, const char* first,
                                             const char* second, const char* schema, const char* trigger) noexcept {
     auto& capture = *static_cast<database_projection_capture*>(context);
-    const int managed=detail::ordinary_composed_attachment_authorize(capture.handle_,action,first,second);
-    if(managed!=SQLITE_OK)return managed;
     if (capture.policy_) return capture.policy_->authorize(action, first, second, schema, trigger);
     try {
         if (action == SQLITE_SELECT || action == SQLITE_READ || action == SQLITE_RECURSIVE)
@@ -271,7 +279,8 @@ int database_projection_capture::authorize(void* context, int action, const char
 
 database_projection_capture::database_projection_capture(
     database& database, const std::shared_ptr<database_read_control>& control, sqlite3_stmt*& statement)
-    : database_(database), control_(control), statement_(statement) {
+    : physical_call_(database), database_(database), control_(control), statement_(statement) {
+    if(!physical_call_.entered())capture_fail(projection_status::admission_rejected,"resource Native caller original unavailable");
     database_.require_creator_();
     if (!control_ || statement_)
         capture_fail(projection_status::invalid_request, "capture requires a control and empty statement slot");
@@ -310,27 +319,47 @@ database_projection_capture::database_projection_capture(
             if (sqlite3_stmt_busy(existing))
                 capture_fail(projection_status::admission_rejected, "memory writer has an active statement");
 
-        // No raw escape and no read_control means the current Core writer has
-        // no progress handler or authorizer. Its only busy policy is SQLite's
+        // This genuine memory writer has no file startup/profile installer.
+        // Bind the same actual open's owned dispatcher before this borrower's
+        // first finite metadata request. Keep the actual timeout read before
+        // capture handler mutation so a getter refusal restores no unknown value.
+        if(database_.install_sql_dispatcher_()!=SQLITE_OK)
+            throw db_error("memory capture dispatcher installation failed");
+
+        // The authorizer dispatcher preserves the existing independent gates.
+        // This borrower still refuses the other existing progress/busy owners;
+        // its only busy policy here is SQLite's
         // numeric timeout; read the actual PRAGMA, including user SQL changes.
-        sqlite3_stmt* timeout = nullptr;
-        struct finish { sqlite3_stmt*& value; ~finish() { if (value) sqlite3_finalize(value); } } cleanup{timeout};
-        database::record_statement();
-        if (sqlite3_prepare_v3(handle_, "PRAGMA busy_timeout", -1, SQLITE_PREPARE_NO_VTAB,
-                               &timeout, nullptr) != SQLITE_OK || sqlite3_step(timeout) != SQLITE_ROW)
-            throw db_error("memory capture busy policy is unavailable");
-        prior_busy_timeout_ = sqlite3_column_int(timeout, 0);
-        if (prior_busy_timeout_ < 0) throw db_error("memory capture busy policy is invalid");
-        sqlite3_finalize(timeout); timeout = nullptr;
+        {
+            detail::database_sql_read_limits declaration;
+            declaration.sql_bytes=128;declaration.parameter_bytes=0;declaration.columns=4;
+            declaration.rows=1;declaration.result_bytes=128;declaration.deadline=control_->deadline;
+            detail::database_sql_request request(database_,detail::database_sql_read_kind::busy_timeout_getter,
+                "PRAGMA busy_timeout",{},&declaration);
+            detail::database_sql_request::binding requested(&request);
+            sqlite3_stmt* timeout = nullptr;
+            struct finish { sqlite3_stmt*& value; ~finish() { if (value) ::lattice::detail::store_physical_finalize(value); } } cleanup{timeout};
+            database::record_statement();
+            if (::lattice::detail::store_physical_prepare_v3(handle_, "PRAGMA busy_timeout", -1, SQLITE_PREPARE_NO_VTAB,
+                                   &timeout, nullptr) != SQLITE_OK)
+                throw db_error("memory capture busy policy is unavailable");
+            request.adopt(timeout);request.columns(timeout);
+            if(::lattice::detail::store_physical_step(timeout)!=SQLITE_ROW)throw db_error("memory capture busy policy is unavailable");
+            request.row(timeout);
+            prior_busy_timeout_ = sqlite3_column_int(timeout, 0);
+            if (prior_busy_timeout_ < 0) throw db_error("memory capture busy policy is invalid");
+            ::lattice::detail::store_physical_finalize(timeout); timeout = nullptr;
+        }
 
         // Mark installed before the first policy mutation so constructor throws
         // restore all known policies. There is no BEGIN/ROLLBACK or settled drain.
         installed_ = true;
-        sqlite3_progress_handler(handle_, 1000, progress, this);
-        if (sqlite3_busy_handler(handle_, busy, this) != SQLITE_OK)
+        if(database_.set_sql_progress_(detail::database_handler_slot::projection_capture,progress,this)!=SQLITE_OK)
+            throw db_error("memory capture progress policy installation failed");
+        if (database_.set_sql_busy_(detail::database_handler_slot::projection_capture,busy,this) != SQLITE_OK)
             throw db_error("memory capture busy policy installation failed");
         inventory_functions();
-        if (sqlite3_set_authorizer(handle_, authorize, this) != SQLITE_OK)
+        if (database_.set_sql_authorizer_(detail::database_authorizer_slot::projection_capture,authorize,this) != SQLITE_OK)
             throw db_error("memory capture authorizer installation failed");
         previous_ = current_;
         current_ = this;
@@ -344,7 +373,7 @@ void database_projection_capture::prepare_read(const std::string& sql) {
         capture_fail(projection_status::invalid_request, "capture SQL exceeds admission bounds");
     const char* tail = nullptr;
     database::record_statement();
-    const int rc = sqlite3_prepare_v3(handle_, sql.c_str(), static_cast<int>(sql.size() + 1),
+    const int rc = ::lattice::detail::store_physical_prepare_v3(handle_, sql.c_str(), static_cast<int>(sql.size() + 1),
         SQLITE_PREPARE_NO_VTAB, &statement_, &tail);
     check();
     if (rc != SQLITE_OK) {
@@ -361,17 +390,18 @@ void database_projection_capture::restore() noexcept {
         if(current_==this)current_=previous_;return;}
     // Finalization and policy restoration happen under the same connection
     // ownership. No user callbacks are delivered, and no interrupt is issued.
-    if (statement_) { sqlite3_finalize(statement_); statement_ = nullptr; }
+    if (statement_) { ::lattice::detail::store_physical_finalize(statement_); statement_ = nullptr; }
     if (installed_) {
         // A failed restoration must never leave the permissive capture gate.
-        if(detail::restore_ordinary_attachment_guard(handle_)!=SQLITE_OK){
+        if(database_.clear_sql_authorizer_(detail::database_authorizer_slot::projection_capture,this)!=SQLITE_OK){
             installed_=false;
             if(current_==this)current_=previous_;
             if(locked_){sqlite3_mutex_leave(mutex_);locked_=false;}
             database_.close();database_.retire_connection_();return;
         }
-        sqlite3_progress_handler(handle_, 0, nullptr, nullptr);
-        sqlite3_busy_timeout(handle_, prior_busy_timeout_);
+        const int progress_restored=database_.clear_sql_progress_(detail::database_handler_slot::projection_capture,this);
+        const int busy_restored=database_.clear_sql_busy_(detail::database_handler_slot::projection_capture,this,prior_busy_timeout_);
+        if(progress_restored!=SQLITE_OK||busy_restored!=SQLITE_OK)database_.quarantine_catalog_locked_();
         installed_ = false;
     }
     if (current_ == this) current_ = previous_;

@@ -453,7 +453,8 @@ extern "C" lattice_object_t* lattice_db_create_object(lattice_db_t* db, const ch
         }
 
         // Create swift_dynamic_object with table name and schema
-        lattice::swift_dynamic_object swift_obj(table_str, *props);
+        const auto schema=db_ref->get()->copy_runtime_properties_(*props);
+        lattice::swift_dynamic_object swift_obj(table_str, schema);
 
         // Wrap in dynamic_object and then dynamic_object_ref
         auto dyn_obj = std::make_shared<lattice::dynamic_object>(swift_obj);

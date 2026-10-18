@@ -1,4 +1,5 @@
 #pragma once
+#include <lattice/store_physical_api.hpp>
 
 #include "exact_vector_selection.hpp"
 #include <algorithm>
@@ -185,11 +186,11 @@ inline std::vector<database::row_t> exact_vector_rows_access::collect(
     sqlite3_stmt* statement = nullptr;
     struct finalize {
         sqlite3_stmt*& value;
-        ~finalize() { if (value) sqlite3_finalize(value); }
+        ~finalize() { if (value) ::lattice::detail::store_physical_finalize(value); }
     } cleanup{statement};
     const char* tail = nullptr;
     database::record_statement();
-    if (sqlite3_prepare_v2(db.internal_handle(), plan.sql.c_str(), -1, &statement, &tail) != SQLITE_OK)
+    if (::lattice::detail::store_physical_prepare_v2(db.internal_handle(), plan.sql.c_str(), -1, &statement, &tail) != SQLITE_OK)
         throw db_error(sqlite3_errmsg(db.internal_handle()));
     while (tail && *tail && std::isspace(static_cast<unsigned char>(*tail))) ++tail;
     if (!statement || (tail && *tail) || !sqlite3_stmt_readonly(statement) ||
@@ -221,7 +222,7 @@ inline std::vector<database::row_t> exact_vector_rows_access::collect(
     }
     std::vector<database::row_t> rows;
     int result;
-    while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+    while ((result = ::lattice::detail::store_physical_step(statement)) == SQLITE_ROW) {
         database::row_t row;
         for (int i = 0; i < static_cast<int>(columns.size()); ++i) {
             column_value_t value;

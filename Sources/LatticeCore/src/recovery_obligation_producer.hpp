@@ -3,6 +3,7 @@
 #include <functional>
 
 namespace lattice::detail {
+class recovery_obligation_bootstrap_reader;
 class recovery_local_producer_adapter;
 struct recovery_obligation_producer_test_access;
 
@@ -75,6 +76,7 @@ class recovery_obligation_producer_store {
     friend class recovery_local_producer_adapter;
     friend class recovery_continuous_producer;
     friend struct recovery_obligation_producer_test_access;
+    friend struct recovery_obligation_bootstrap_test_access;
     std::shared_ptr<lattice_db> owner_;
     recovery_obligation_limits obligations_;
     receive_install_limits installations_;
@@ -103,7 +105,8 @@ class recovery_obligation_producer_store {
     // writes, owner-WRITE inference or activation capability is permitted.
     static recovery_obligation_producer_inventory bootstrap_profiles(
         std::shared_ptr<database>,const recovery_obligation_producer_discovery_limits&,
-        const std::function<void(database&,const recovery_obligation_producer_inventory&)>& validate = {},bool shared_domains=false);
+        const std::function<void(database&,const recovery_obligation_producer_inventory&)>& validate = {},bool shared_domains=false,
+        recovery_obligation_bootstrap_reader* initialization=nullptr);
 public:
     // Final assembler reads actual provenance in its retained owned transaction.
     // A returned value cannot be supplied back to record() to mint provenance.

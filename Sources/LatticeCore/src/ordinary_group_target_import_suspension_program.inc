@@ -14,7 +14,10 @@ ordinary_group_target_schema_original::require_import_suspension(const ordinary_
 }
 void ordinary_export_access::prepare_receiver_group_target_import_suspension(
     const ordinary_group_target_schema_original& original,const ordinary_target_staging_connection& connection,ordinary_launch::deadline end) {
-    creator_check();original.require_connection(connection,end);const auto held=original.state_;const auto request=held->request.lock();
+    creator_check();
+    if(ordinary_initialization_storage_scope::debit_scope_active())
+        throw ordinary_initialization_storage_error("startup cannot enter generic GROUP import suspension producer");
+    original.require_connection(connection,end);const auto held=original.state_;const auto request=held->request.lock();
     require(request&&request->state_->target_schema.get()==&original,"GROUP import suspension actual request/schema retired");
     const auto receiving=std::atomic_load(&request->state_->group_receiver);
     require(receiving&&request->state_->staging_connection.get()==&connection,"GROUP import suspension actual receiving owner differs");

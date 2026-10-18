@@ -244,7 +244,8 @@ notification_token model_base::observe_base(object_observer_t callback) {
     }
     auto fallback = property_names_;
     if (fallback.empty()) {
-        if (const auto* schema = schema_registry::instance().get_schema(route.table))
+        schema_handle_v2 declaration_lease;
+        if (const auto* schema = lattice_->schema_for_observation_(route.table,declaration_lease))
             for (const auto& property : schema->properties) fallback.push_back(property.name);
     }
     return detail::recovery_refresh_access::observe_managed(*lattice_, route.table, id_, global_id_,

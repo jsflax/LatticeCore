@@ -6,13 +6,13 @@ namespace {
 void history_stream(sqlite3* h,const std::string& sql,const values& parameters,
     const std::function<void(const values&,budget&)>& consume) {
     database::record_statement();sqlite3_stmt* raw=nullptr;const char* tail=nullptr;
-    const auto rc=sqlite3_prepare_v2(h,sql.data(),static_cast<int>(sql.size()),&raw,&tail);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> held(raw,&sqlite3_finalize);
+    const auto rc=::lattice::detail::store_physical_prepare_v2(h,sql.data(),static_cast<int>(sql.size()),&raw,&tail);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> held(raw,&::lattice::detail::store_physical_finalize);
     if(rc!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||tail!=sql.data()+sql.size()||sqlite3_bind_parameter_count(raw)!=static_cast<int>(parameters.size()))refuse("history cursor shape changed");
     for(size_t n=0;n<parameters.size();++n){const auto& value=text(parameters[n]);if(sqlite3_bind_text(raw,int(n+1),value.data(),int(value.size()),SQLITE_STATIC)!=SQLITE_OK)refuse("history cursor bind failed");}
     const int columns=sqlite3_column_count(raw);if(columns<1||columns>2050)refuse("history cursor column bound");
     int step;
-    while((step=sqlite3_step(raw))==SQLITE_ROW){
+    while((step=::lattice::detail::store_physical_step(raw))==SQLITE_ROW){
         if(sqlite3_txn_state(h,"main")!=SQLITE_TXN_WRITE)refuse("history cursor lost its actual source WRITE");
         budget scratch{history_row_limits};scratch.add(sizeof(values)+size_t(columns)*sizeof(column_value_t));values row;row.reserve(size_t(columns));
         for(int c=0;c<columns;++c){scratch.cell();switch(sqlite3_column_type(raw,c)){
@@ -168,7 +168,7 @@ ordinary_mounted_history_source ordinary_export_access::register_mounted_history
         const auto physical=writer.physical_identity("main",{},true);if(!physical)refuse("mounted history physical owner unavailable");
         ordinary_export_frame frame;frame.wire_profile=true;
         capture_projected_tables(h,parent->recovery_schemas_,[](auto& out,const auto& property){lattice_db::serialize_property_for_fingerprint(out,property);},state->mounted,frame,scratch,false,nullptr,nullptr);
-        if(history_capacity_retained_payload+frame.schema.size()+frame.scope.size()+state->mounted.size()*sizeof(std::string)>ordinary_history_limits::owner_bytes-65536)refuse("mounted history owner retention bound");
+        if(history_capacity_retained_payload+sizeof(ordinary_mounted_history_source_state)+sizeof(ordinary_history_refund_cell)+frame.schema.size()+frame.scope.size()+state->mounted.size()*sizeof(std::string)>ordinary_history_limits::owner_bytes-65536)refuse("mounted history owner retention bound");
         state->scope=std::move(frame.scope);state->schema=std::move(frame.schema);state->device=std::to_string(physical->device);state->inode=std::to_string(physical->inode);
         const bool existing=inspect_storage(h,scratch);register_mutation_guard(h);mutation_scope permission(h);
         if(!existing){
@@ -275,7 +275,7 @@ ordinary_history_export ordinary_export_access::capture_history_impl(lattice_db&
             // growing offset or repeated full-history sort per output page.
             history_stream(h,"SELECT "+columns+" FROM main."+quote(table.name)+" ORDER BY rowid",{},[&](const values& row,budget& scratch){
                 if(rows+known+unknown==limits.records)refuse("history total record quota");
-                const auto& logical=projection.tables.at(table.name);const auto& actual=metadata.tables.at(table.name);if(row.size()!=logical.columns.size())refuse("history logical row shape");
+                const auto& logical=ordinary_initialization_map_at(projection.tables,std::string_view(table.name));const auto& actual=ordinary_initialization_map_at(metadata.tables,std::string_view(table.name));if(row.size()!=logical.columns.size())refuse("history logical row shape");
                 const auto& gid=text(row[0]);if(gid.empty()||gid.size()>4096||gid.find('\0')!=std::string::npos)refuse("history logical row identity");
                 for(size_t c=0;c<row.size();++c){const auto physical_column=std::find_if(actual.columns.begin(),actual.columns.end(),[&](const auto& v){return v.name==logical.columns[c].name;});if(physical_column==actual.columns.end())refuse("history physical column missing");
                     if(std::holds_alternative<std::nullptr_t>(row[c])){if(c==0||physical_column->not_null)refuse("history row violates actual nullability");continue;}

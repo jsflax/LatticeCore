@@ -23,10 +23,47 @@ void releaseLinkListRef(lattice::link_list_ref* p) {
 #endif
 
 namespace lattice {
+namespace {
+struct list_raw_target_custody {
+    std::shared_ptr<dynamic_object> target;
+    explicit list_raw_target_custody(const swift_dynamic_object& value)
+        : target(std::make_shared<dynamic_object>(value)) {}
+    bool prepare_native_target_destruction(pid_t creator) noexcept {
+        if (creator != ::getpid()) return false;
+        target.reset(); return creator == ::getpid();
+    }
+};
+struct list_call_custody {
+    std::shared_ptr<swift_lattice> owner;
+    explicit list_call_custody(std::shared_ptr<swift_lattice> actual) : owner(std::move(actual)) {}
+    bool prepare_native_target_destruction(pid_t creator) noexcept {
+        if (creator != ::getpid()) return false;
+        owner.reset(); return creator == ::getpid();
+    }
+};
+template<class F> void with_actual_list_owner(link_list& list, F&& action) {
+    // Pointer-cache lookup never dereferences list.lattice. Exact retained
+    // Native identity must match BEFORE invoking a method on that owner;
+    // a stale/reused raw address cannot authorize another incarnation.
+    detail::process_bound_resource_owner<list_call_custody> held(
+        swift_lattice_ref::shared_for_lattice(list.lattice));
+    const auto& actual = held.get().owner;
+    if (!actual || !list.owner_identity_.matches(swift_lattice_ref::identity_for_owner(actual)))
+        throw db_error("managed list parent incarnation is no longer available");
+    std::forward<F>(action)(*actual);
+}
+}
 
-link_list::link_list(const managed<std::vector<swift_dynamic_object*>>& o) : lattice(nullptr) {
+link_list::link_list(const managed<std::vector<swift_dynamic_object*>>& o,
+                     const std::shared_ptr<swift_lattice>& owner) : lattice(nullptr) {
+    if (!owner || owner.get() != o.lattice)
+        throw std::runtime_error("managed list requires its actual parent owner");
+    auto identity = swift_lattice_ref::identity_for_owner(owner);
+    if (!identity.valid())
+        throw std::runtime_error("managed list requires its actual parent owner");
     new (&managed_) managed(o);
-    lattice = static_cast<swift_lattice*>(managed_.lattice);
+    lattice = owner.get();
+    owner_identity_ = std::move(identity);
 }
 
 // Mint a Swift-facing db handle on demand (FRT: fresh unretained heap ref the
@@ -41,17 +78,12 @@ swift_lattice_ref link_list_ref::getLattice() const {
 }
 #endif
 
-link_list::element_proxy& link_list::element_proxy::operator=(const dynamic_object_ref& o) {
-    if (list->lattice) {
-        if (o.is_managed()) {
-            list->managed_[idx] = &o.impl_->managed_;
-        } else {
-            list->lattice->add(*o.impl_.get());
-            list->managed_[idx] = &o.impl_->managed_;
-        }
-    } else {
-        list->unmanaged_[idx] = o.shared();
-    }
+link_list::element_proxy& link_list::element_proxy::operator=(const dynamic_object_ref& object) {
+    if (!list || !object.impl_) throw db_error("list replacement requires a live list and target");
+    if (list->lattice) with_actual_list_owner(*list, [&](swift_lattice& actual) {
+        actual.mutate_list(*list, object.impl_, idx);
+    });
+    else list->unmanaged_.at(idx) = object.impl_;
     return *this;
 }
 
@@ -61,11 +93,12 @@ link_list::element_proxy link_list::operator[](size_t idx) const {
     proxy.list = const_cast<link_list*>(this);
     if (lattice) {
         auto managed_obj = managed_[idx];
+        lattice->require_runtime_schema_ordinary_();
         const auto& schema = *lattice->get_properties_for_table(managed_obj.table_name());
         for (auto& [name, column_type] : schema) {
-            managed_obj.properties_[name] = column_type;
-            managed_obj.property_types_[name] = column_type.type;
-            managed_obj.property_names_.push_back(name);
+            managed_obj.properties_[detail::swift_runtime_ordinary_text_(name)] = column_type.ordinary_copy();
+            managed_obj.property_types_[detail::swift_runtime_ordinary_text_(name)] = column_type.type;
+            managed_obj.property_names_.push_back(detail::swift_runtime_ordinary_text_(name));
         }
 
         proxy.object = std::make_shared<dynamic_object>(managed_obj);
@@ -89,66 +122,30 @@ bool link_list::empty() const {
 }
 
 // Modifiers
-void link_list::push_back(const dynamic_object_ref& obj) {
-    if (lattice) {
-        if (obj.is_managed()) {
-            // Already managed - just add the link
-            managed_.push_back(&obj.impl_->managed_);
-        } else {
-            // Not managed - add to database first, then link.
-            // Wrap in a transaction so both AuditLog entries (child INSERT +
-            // link INSERT) are committed atomically. Without this, the sync
-            // system can upload the child before the link entry exists.
-            auto& db = lattice->db();
-            bool own_txn = !db.is_in_transaction();
-            if (own_txn) db.begin_transaction();
-            try {
-                lattice->add(*obj.impl_.get());
-                managed_.push_back(&obj.impl_->managed_);
-                if (own_txn) db.commit();
-            } catch (...) {
-                if (own_txn && db.is_in_transaction()) {
-                    try { db.rollback(); } catch (...) {}
-                }
-                throw;
-            }
-        }
-    } else {
-        // Store shared_ptr to keep the dynamic_object alive
-        unmanaged_.push_back(obj.shared());
-    }
+void link_list::push_back(const dynamic_object_ref& object) {
+    if (!object.impl_) throw db_error("list append requires a live target");
+    if (lattice) with_actual_list_owner(*this, [&](swift_lattice& actual) {
+        actual.mutate_list(*this, object.impl_, std::nullopt);
+    });
+    else unmanaged_.push_back(object.impl_);
 }
 
-void link_list::push_back(const swift_dynamic_object& obj) {
-    if (lattice) {
-        // Add to database and then link
-        managed_.push_back(obj);
-    } else {
-        // For unmanaged, we need to store a pointer - this is tricky
-        // For now, we don't support adding raw swift_dynamic_object to unmanaged list
-    }
+void link_list::push_back(const swift_dynamic_object& object) {
+    if (!lattice) return; // existing unsupported unmanaged raw-value path
+    detail::process_bound_resource_owner<list_raw_target_custody> retained(object);
+    with_actual_list_owner(*this, [&](swift_lattice& actual) {
+        actual.mutate_list(*this, retained.get().target, std::nullopt);
+    });
 }
 
-void link_list::erase(size_t idx) {
-    if (lattice) {
-        // Get the object at index and erase the link
-        if (idx < managed_.size()) {
-            auto obj = managed_[idx];
-            managed_.erase(&obj.operator lattice::managed<swift_dynamic_object> &());
-        }
-    } else {
-        if (idx < unmanaged_.size()) {
-            unmanaged_.erase(unmanaged_.begin() + idx);
-        }
-    }
+void link_list::erase(size_t index) {
+    if (lattice) with_actual_list_owner(*this, [&](swift_lattice& actual) { actual.mutate_list_remove(*this, index); });
+    else if (index < unmanaged_.size()) unmanaged_.erase(unmanaged_.begin() + index);
 }
 
 void link_list::clear() {
-    if (lattice) {
-        managed_.clear();
-    } else {
-        unmanaged_.clear();
-    }
+    if (lattice) with_actual_list_owner(*this, [&](swift_lattice& actual) { actual.mutate_list_remove(*this, std::nullopt); });
+    else unmanaged_.clear();
 }
 
 // Iterator

@@ -132,14 +132,14 @@ void baseline_exact_current(database& writer,const recovery_owner_schema& catalo
     // cannot prove that guarded accepted rows stayed unchanged. No second
     // decoded snapshot or owning whole-row BLOB copy is retained here.
     b.add(8*1024+observed.image.scope.size());database::record_statement();sqlite3_stmt* raw=nullptr;
-    const auto rc=sqlite3_prepare_v2(ordinary_export_storage_access::borrow(writer),"SELECT model,gid,value FROM main._lattice_ordered_receiver_baseline_v1 WHERE scope=? ORDER BY model,gid",-1,&raw,nullptr);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const auto rc=::lattice::detail::store_physical_prepare_v2(ordinary_export_storage_access::borrow(writer),"SELECT model,gid,value FROM main._lattice_ordered_receiver_baseline_v1 WHERE scope=? ORDER BY model,gid",-1,&raw,nullptr);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(rc!=SQLITE_OK||!raw||sqlite3_bind_parameter_count(raw)!=1||sqlite3_column_count(raw)!=3||!sqlite3_stmt_readonly(raw)||
         sqlite3_bind_text(raw,1,observed.image.scope.data(),static_cast<int>(observed.image.scope.size()),SQLITE_STATIC)!=SQLITE_OK)
         refuse("baseline current borrowed scan unavailable");
     fingerprint digest;digest.bytes(observed.image.scope);digest.number(observed.image.rows);
     std::size_t rows=0,total=0;int step=SQLITE_OK;
-    for(;;){managed_pair_deadline(end);step=sqlite3_step(raw);if(step!=SQLITE_ROW)break;
+    for(;;){managed_pair_deadline(end);step=::lattice::detail::store_physical_step(raw);if(step!=SQLITE_ROW)break;
         if(rows==observed.image.rows||sqlite3_column_type(raw,0)!=SQLITE_TEXT||sqlite3_column_type(raw,1)!=SQLITE_TEXT||sqlite3_column_type(raw,2)!=SQLITE_BLOB)
             refuse("baseline current exact storage changed");
         const auto model_size=sqlite3_column_bytes(raw,0),gid_size=sqlite3_column_bytes(raw,1),payload_size=sqlite3_column_bytes(raw,2);
@@ -153,7 +153,7 @@ void baseline_exact_current(database& writer,const recovery_owner_schema& catalo
         digest.number(4);digest.bytes(std::span<const std::uint8_t>(payload,static_cast<std::size_t>(payload_size)));++rows;
     }
     if(step!=SQLITE_DONE||rows!=observed.image.rows)refuse("baseline current scan did not settle");
-    if(sqlite3_finalize(statement.release())!=SQLITE_OK)refuse("baseline current borrowed finalize failed");
+    if(::lattice::detail::store_physical_finalize(statement.release())!=SQLITE_OK)refuse("baseline current borrowed finalize failed");
     if(digest.finish()!=observed.baseline_digest)refuse("baseline current accepted bytes changed");
     context.finish();managed_pair_deadline(end);
 }
@@ -443,12 +443,12 @@ void baseline_stage_physical(database& w,const values& stage) {
 void baseline_stage_stream(sqlite3* h,const values& stage,budget& b,ordinary_launch::deadline end) {
     managed_pair_deadline(end);b.add(8*1024+text(stage[0]).size());
     database::record_statement();sqlite3_stmt* raw=nullptr;
-    const auto rc=sqlite3_prepare_v2(h,"SELECT offset,payload,digest FROM main._lattice_ordered_baseline_chunk_v1 WHERE identity=? ORDER BY offset",-1,&raw,nullptr);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const auto rc=::lattice::detail::store_physical_prepare_v2(h,"SELECT offset,payload,digest FROM main._lattice_ordered_baseline_chunk_v1 WHERE identity=? ORDER BY offset",-1,&raw,nullptr);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(rc!=SQLITE_OK||!raw||sqlite3_bind_parameter_count(raw)!=1||sqlite3_column_count(raw)!=3||!sqlite3_stmt_readonly(raw)||
         sqlite3_bind_text(raw,1,text(stage[0]).data(),static_cast<int>(text(stage[0]).size()),SQLITE_STATIC)!=SQLITE_OK)refuse("baseline stage scan unavailable");
     picosha2::hash256_one_by_one stream;std::size_t offset=0,pages=0;int step=SQLITE_OK;
-    for(;;){managed_pair_deadline(end);step=sqlite3_step(raw);if(step!=SQLITE_ROW)break;
+    for(;;){managed_pair_deadline(end);step=::lattice::detail::store_physical_step(raw);if(step!=SQLITE_ROW)break;
         if(sqlite3_column_type(raw,0)!=SQLITE_INTEGER||sqlite3_column_int64(raw,0)!=static_cast<std::int64_t>(offset)||
             sqlite3_column_type(raw,1)!=SQLITE_BLOB||sqlite3_column_type(raw,2)!=SQLITE_TEXT)refuse("baseline staged chunk order/storage changed");
         const auto count=sqlite3_column_bytes(raw,1),digest_size=sqlite3_column_bytes(raw,2);
@@ -461,7 +461,7 @@ void baseline_stage_stream(sqlite3* h,const values& stage,budget& b,ordinary_lau
         stream.process(part.begin(),part.end());offset+=part.size();++pages;
     }
     if(step!=SQLITE_DONE||offset!=static_cast<std::size_t>(integer(stage[15]))||pages!=static_cast<std::size_t>(integer(stage[16])))refuse("baseline durable progress differs from chunks");
-    if(sqlite3_finalize(statement.release())!=SQLITE_OK)refuse("baseline staged statement finalization failed");
+    if(::lattice::detail::store_physical_finalize(statement.release())!=SQLITE_OK)refuse("baseline staged statement finalization failed");
     if(integer(stage[17])){stream.finish();if(offset!=static_cast<std::size_t>(integer(stage[13]))||picosha2::get_hash_hex_string(stream)!=text(stage[7]))refuse("baseline completed durable cut digest changed");}
     managed_pair_deadline(end);
 }
@@ -471,12 +471,12 @@ void baseline_stage_post(database& w,const values& expected,budget& b,bool full_
 }
 void baseline_stage_members_reopen(sqlite3* h,const values& stage,ordinary_launch::deadline end,budget& b) {
     b.add(8*1024+text(stage[0]).size());database::record_statement();sqlite3_stmt* raw=nullptr;
-    const auto rc=sqlite3_prepare_v2(h,"SELECT model,gid,seal FROM main._lattice_ordered_baseline_member_v1 WHERE identity=? ORDER BY model,gid",-1,&raw,nullptr);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const auto rc=::lattice::detail::store_physical_prepare_v2(h,"SELECT model,gid,seal FROM main._lattice_ordered_baseline_member_v1 WHERE identity=? ORDER BY model,gid",-1,&raw,nullptr);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(rc!=SQLITE_OK||!raw||sqlite3_bind_parameter_count(raw)!=1||sqlite3_column_count(raw)!=3||!sqlite3_stmt_readonly(raw)||
         sqlite3_bind_text(raw,1,text(stage[0]).data(),static_cast<int>(text(stage[0]).size()),SQLITE_STATIC)!=SQLITE_OK)refuse("baseline member reopen scan unavailable");
     std::size_t seen=0;int step=SQLITE_OK;
-    for(;;){managed_pair_deadline(end);step=sqlite3_step(raw);if(step!=SQLITE_ROW)break;
+    for(;;){managed_pair_deadline(end);step=::lattice::detail::store_physical_step(raw);if(step!=SQLITE_ROW)break;
         if(!integer(stage[17])||seen==static_cast<std::size_t>(integer(stage[14])))refuse("baseline reopened unexpected member");
         std::array<std::string_view,3> fields;
         for(std::size_t i=0;i<fields.size();++i){
@@ -494,7 +494,7 @@ void baseline_stage_members_reopen(sqlite3* h,const values& stage,ordinary_launc
         if(original_seal("ordinary-accepted-baseline-member-v1",member,3,one)!=fields[2])refuse("baseline reopened member seal changed");++seen;
     }
     if(step!=SQLITE_DONE||seen!=(integer(stage[17])?static_cast<std::size_t>(integer(stage[14])):0))refuse("baseline reopened membership count changed");
-    if(sqlite3_finalize(statement.release())!=SQLITE_OK)refuse("baseline reopened member finalize failed");
+    if(::lattice::detail::store_physical_finalize(statement.release())!=SQLITE_OK)refuse("baseline reopened member finalize failed");
 }
 
 // This cell belongs to database_retirement_state for this physical connection,

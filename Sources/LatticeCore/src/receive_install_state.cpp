@@ -1,4 +1,6 @@
 #include "receive_install_state.hpp"
+#include "receive_install_initialization_recipe.hpp"
+#include "recovery_obligation_bootstrap_statement.hpp"
 #include "recovery_producer_continuity.hpp"
 #include "recovery_writer_access.hpp"
 #include <limits>
@@ -26,11 +28,11 @@ int64_t sum(int64_t a, int64_t b) {
     return a+b;
 }
 blob bytes(const std::string& s) { return {s.begin(),s.end()}; }
-void field(const std::string& s, const receive_install_limits& limits, code c = code::invalid_argument) {
+void field(std::string_view s, const receive_install_limits& limits, code c = code::invalid_argument) {
     if (s.empty() || s.size() > static_cast<uint64_t>(limits.field_bytes))
         fail(c,"receiver installation identifier/digest exceeds explicit field limit");
 }
-int64_t binding_size(const receive_install_binding& b, const receive_install_limits& limits,
+int64_t binding_size(const auto& b, const receive_install_limits& limits,
                      code c = code::invalid_argument) {
     int64_t n=0;
     for (auto* s : {&b.channel,&b.authority,&b.source,&b.epoch,&b.scope,&b.schema}) {
@@ -46,12 +48,12 @@ void frontier(const receive_install_frontier& f, code c) {
     } else if ((f.kind != receive_frontier_kind::uninitialized && f.kind != receive_frontier_kind::beginning_null) || f.position)
         fail(c,"receiver installation has contradictory frontier initialization");
 }
-int64_t encoded_size(const receive_install_identity& i) {
+int64_t encoded_size(const auto& i) {
     return sum(88,sum(static_cast<int64_t>(i.request_digest.size()),
         sum(static_cast<int64_t>(i.receipt_digest.size()),sum(static_cast<int64_t>(i.content_digest.size()),
             static_cast<int64_t>(i.manifest_digest.size())))));
 }
-void identity(const receive_install_identity& i, const receive_install_limits& limits,
+void identity(const auto& i, const receive_install_limits& limits,
               code c = code::invalid_argument) {
     frontier(i.base,c);
     if (i.sequence <= 0 || i.expected_revision < 0 || i.expected_revision == maximum || i.head < 0 ||
@@ -127,24 +129,23 @@ std::string bounded_string(const row_t& r, const std::string& name, int64_t limi
     const auto& b=bounded_blob(r,name,limit); return {b.begin(),b.end()};
 }
 std::string integer_projection(const std::string& name) {
-    return "CASE WHEN typeof("+name+")='integer' THEN "+name+" ELSE NULL END AS "+name;
+    return receive_install_initialization_recipe::integer<std::string>(name);
 }
-std::string bounded_projection(const std::string& name, int64_t limit) {
-    // CASE bounds SQLite's result before database::query can copy TEXT/BLOB.
-    return "CASE WHEN typeof("+name+")='blob' AND length("+name+") BETWEEN 1 AND "+
-        std::to_string(limit)+" THEN "+name+" ELSE NULL END AS "+name;
+std::string bounded_projection(const std::string& name,int64_t limit) {
+    // SAME closed projection body as actual pending startup; no SQL grant.
+    return receive_install_initialization_recipe::bounded<std::string>(name,limit);
 }
-int64_t row_size(const receive_install_snapshot& s, const receive_install_limits& limits) {
+int64_t row_size(const auto& s, const receive_install_limits& limits) {
     auto n=binding_size(s.binding,limits);
     if (s.active) n=sum(n,encoded_size(*s.active));
     if (s.last_installed) n=sum(n,encoded_size(*s.last_installed));
     return n;
 }
-void covered(const std::optional<receive_install_snapshot>& s,const receive_install_usage& u,const receive_install_limits& limits) {
+void covered(const auto& s,const receive_install_usage& u,const receive_install_limits& limits) {
     if (s && (u.channels<1 || u.encoded_bytes<row_size(*s,limits)))
         fail(code::corrupt_state,"receiver installation counters do not cover addressed row");
 }
-void valid_row(const receive_install_snapshot& s, const receive_install_limits& limits) {
+void valid_row(const auto& s, const receive_install_limits& limits) {
     binding_size(s.binding,limits,code::corrupt_state); frontier(s.frontier,code::corrupt_state);
     if (s.revision<0 || s.last_sequence<0 ||
         ((s.frontier.kind==receive_frontier_kind::position)!=(s.revision>0)) ||
@@ -165,6 +166,90 @@ void valid_row(const receive_install_snapshot& s, const receive_install_limits& 
     // consume sequence numbers. High water is never an installed-result proof;
     // only exact last_installed equality can support the retained retry path.
 }
+// Borrowed decoding is restricted to the actual synchronous startup Reader.
+// The owning Request rows remain in receiver_initialization_row until every
+// comparison finishes; no standard string/blob is copied into a second owner.
+struct receiver_binding_view {
+    std::string_view channel,authority,source,epoch,scope,schema;
+};
+struct receiver_identity_view {
+    int64_t sequence=0,expected_revision=0;
+    receive_install_frontier base;
+    int64_t head=0;
+    receive_install_mode mode=receive_install_mode::full;
+    std::string_view request_digest,receipt_digest,content_digest,manifest_digest;
+};
+struct receiver_snapshot_view {
+    receiver_binding_view binding;
+    receive_install_frontier frontier;
+    int64_t revision=0,last_sequence=0;
+    std::optional<receiver_identity_view> active,last_installed;
+};
+const column_value_t& receiver_cell(const row_t& row,std::string_view name) {
+    const auto found=std::find_if(row.begin(),row.end(),[&](const auto& item){return std::string_view(item.first)==name;});
+    if(found==row.end())throw std::out_of_range("receiver installation result field absent");
+    return found->second;
+}
+int64_t receiver_integer(const row_t& row,std::string_view name) {
+    const auto found=std::find_if(row.begin(),row.end(),[&](const auto& item){return std::string_view(item.first)==name;});
+    if(found==row.end()||!std::holds_alternative<int64_t>(found->second))
+        fail(code::corrupt_state,"receiver installation expected integer metadata");
+    return std::get<int64_t>(found->second);
+}
+const blob& receiver_blob(const row_t& row,std::string_view name,int64_t limit) {
+    const auto found=std::find_if(row.begin(),row.end(),[&](const auto& item){return std::string_view(item.first)==name;});
+    if(found==row.end()||!std::holds_alternative<blob>(found->second))
+        fail(code::corrupt_state,"receiver installation wrong type or oversized encoded field");
+    const auto& value=std::get<blob>(found->second);
+    if(value.empty()||value.size()>static_cast<uint64_t>(limit))
+        fail(code::corrupt_state,"receiver installation empty or oversized encoded field");
+    return value;
+}
+std::string_view receiver_blob_view(const row_t& row,std::string_view name,int64_t limit) {
+    const auto& value=receiver_blob(row,name,limit);
+    return {reinterpret_cast<const char*>(value.data()),value.size()};
+}
+struct receiver_decoder_view {
+    const blob& bytes;size_t offset=0;
+    int64_t number() {
+        if(bytes.size()-offset<8)fail(code::corrupt_state,"receiver installation truncated identity");
+        uint64_t value=0;for(int j=0;j<8;++j)value=(value<<8)|bytes[offset++];
+        if(value>static_cast<uint64_t>(maximum))fail(code::corrupt_state,"receiver installation unrepresentable identity");
+        return static_cast<int64_t>(value);
+    }
+    std::string_view string(const receive_install_limits& limits) {
+        const auto count=number();
+        if(count<=0||count>limits.field_bytes||static_cast<uint64_t>(count)>bytes.size()-offset)
+            fail(code::corrupt_state,"receiver installation invalid encoded digest length");
+        const std::string_view result(reinterpret_cast<const char*>(bytes.data()+offset),static_cast<size_t>(count));
+        offset+=static_cast<size_t>(count);return result;
+    }
+};
+receiver_identity_view receiver_decode_view(const blob& bytes,const receive_install_limits& limits) {
+    receiver_decoder_view read{bytes};
+    if(read.number()!=1)fail(code::corrupt_state,"receiver installation unsupported identity encoding");
+    receiver_identity_view value;value.sequence=read.number();value.expected_revision=read.number();
+    value.base.kind=static_cast<receive_frontier_kind>(read.number());const auto position=read.number();
+    if(value.base.kind==receive_frontier_kind::position)value.base.position=position;
+    else if(position!=0)fail(code::corrupt_state,"receiver installation noncanonical NULL frontier");
+    value.head=read.number();value.mode=static_cast<receive_install_mode>(read.number());
+    value.request_digest=read.string(limits);value.receipt_digest=read.string(limits);
+    value.content_digest=read.string(limits);value.manifest_digest=read.string(limits);
+    if(read.offset!=bytes.size())fail(code::corrupt_state,"receiver installation trailing identity bytes");
+    identity(value,limits,code::corrupt_state);return value;
+}
+bool receiver_same_binding(const receiver_binding_view& observed,const receive_install_binding& expected)noexcept {
+    return observed.channel==expected.channel&&observed.authority==expected.authority&&observed.source==expected.source&&
+        observed.epoch==expected.epoch&&observed.scope==expected.scope&&observed.schema==expected.schema;
+}
+struct receiver_initialization_row {
+    std::vector<row_t> rows;
+    std::optional<receiver_snapshot_view> value;
+    receiver_initialization_row()=default;
+    receiver_initialization_row(receiver_initialization_row&&)=default;
+    receiver_initialization_row(const receiver_initialization_row&)=delete;
+};
+
 void changed(database& db) {
     if (db.changes()!=1) throw db_error("receiver installation write did not change its expected row");
 }
@@ -188,6 +273,111 @@ receive_install_receipt retry(const receive_install_snapshot& s) {
 }
 }
 
+receive_install_usage receive_install_store::bind_enrollment_(recovery_obligation_bootstrap_reader& reader) {
+    // No extra SAVEPOINT or generic database API: the real Reader retains the
+    // original paid WRITE and the complete no-trigger ledger preimage.
+    const auto& binding=reader.enrollment_receiver_binding_();
+    const auto& limits=reader.enrollment_receiver_limits_();
+    const bool shared=reader.shared_domains_();
+    using kind=recovery_obligation_bootstrap_statement::kind;
+    binding_size(binding,limits);
+    const auto configuration=[&]() {
+        const auto rows=reader.enrollment_receiver_run_(kind::enrollment_receiver_configuration);
+        if(rows.size()!=1||receiver_integer(rows[0],"id")!=1||receiver_integer(rows[0],"version")!=(shared?2:1))
+            fail(code::corrupt_state,"receiver installation missing/unsupported fixed metadata");
+        if(shared) {
+            const auto schema=reader.enrollment_receiver_run_(kind::enrollment_receiver_shared_schema);
+            constexpr std::string_view table="CREATE TABLE _lattice_install_channel(channel BLOB PRIMARY KEY NOT NULL,authority BLOB NOT NULL,source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_digest BLOB NOT NULL,frontier_kind INTEGER NOT NULL,frontier INTEGER,revision INTEGER NOT NULL,last_sequence INTEGER NOT NULL,active BLOB,last_install BLOB,bytes INTEGER NOT NULL) WITHOUT ROWID";
+            constexpr std::string_view index="CREATE INDEX _lattice_install_domain ON _lattice_install_channel(authority,scope)";
+            const auto text=[](const row_t& row,std::string_view name)->std::string_view {
+                const auto found=std::find_if(row.begin(),row.end(),[&](const auto& item){return std::string_view(item.first)==name;});
+                if(found==row.end()||!std::holds_alternative<std::string>(found->second))
+                    fail(code::corrupt_state,"receiver shared domain schema type differs");
+                return std::get<std::string>(found->second);
+            };
+            if(schema.size()!=2||text(schema[0],"type")!="table"||text(schema[0],"name")!="_lattice_install_channel"||text(schema[0],"sql")!=table||
+               text(schema[1],"type")!="index"||text(schema[1],"name")!="_lattice_install_domain"||text(schema[1],"sql")!=index)
+                fail(code::corrupt_state,"receiver shared domain schema/version differs; migration refused");
+        }
+        const auto& row=rows[0];
+        if(receive_install_limits{receiver_integer(row,"max_channels"),receiver_integer(row,"max_field_bytes"),receiver_integer(row,"max_bytes")}!=limits)
+            fail(code::limits_mismatch,"receiver installation explicit limits differ from durable configuration");
+        const receive_install_usage value{receiver_integer(row,"channels"),receiver_integer(row,"bytes")};
+        if(!fits(value.channels,0,limits.channels)||!fits(value.encoded_bytes,0,limits.encoded_bytes))
+            fail(code::corrupt_state,"receiver installation invalid durable usage");
+        return value;
+    };
+    const auto row=[&](std::string_view channel) {
+        field(channel,limits);const auto identity_limit=std::min(int64_t(88+4*limits.field_bytes),limits.encoded_bytes);
+        const auto sizes=reader.enrollment_receiver_run_(kind::enrollment_receiver_row_sizes,channel);
+        receiver_initialization_row output;
+        if(sizes.empty())return output;
+        if(sizes.size()!=1)fail(code::corrupt_state,"receiver installation duplicate channel");
+        int64_t total=0;
+        for(const auto name:{"channel","authority","source","epoch","scope","schema_digest","active","last_install"}) {
+            const std::string_view column=name;const bool optional=column=="active"||column=="last_install";
+            const auto count=receiver_integer(sizes[0],column);
+            if(count<(optional?0:1)||count>(optional?identity_limit:limits.field_bytes)||!fits(total,count,limits.encoded_bytes))
+                fail(code::corrupt_state,"receiver installation stored fields exceed type/byte limits");
+            total+=count;
+        }
+        output.rows=reader.enrollment_receiver_run_(kind::enrollment_receiver_row_values,channel);
+        if(output.rows.empty())return output;
+        if(output.rows.size()!=1)fail(code::corrupt_state,"receiver installation duplicate channel");
+        const auto& actual=output.rows[0];receiver_snapshot_view value;
+        value.binding={receiver_blob_view(actual,"channel",limits.field_bytes),receiver_blob_view(actual,"authority",limits.field_bytes),
+            receiver_blob_view(actual,"source",limits.field_bytes),receiver_blob_view(actual,"epoch",limits.field_bytes),
+            receiver_blob_view(actual,"scope",limits.field_bytes),receiver_blob_view(actual,"schema_digest",limits.field_bytes)};
+        value.frontier.kind=static_cast<receive_frontier_kind>(receiver_integer(actual,"frontier_kind"));
+        const auto& type=std::get<std::string>(receiver_cell(actual,"frontier_type"));
+        if(type=="integer")value.frontier.position=receiver_integer(actual,"frontier");
+        else if(type!="null")fail(code::corrupt_state,"receiver installation frontier has wrong storage type");
+        value.revision=receiver_integer(actual,"revision");value.last_sequence=receiver_integer(actual,"last_sequence");
+        if(!receiver_integer(actual,"active_null"))value.active=receiver_decode_view(receiver_blob(actual,"active",identity_limit),limits);
+        if(!receiver_integer(actual,"last_null"))value.last_installed=receiver_decode_view(receiver_blob(actual,"last_install",identity_limit),limits);
+        valid_row(value,limits);
+        if(value.binding.channel!=channel||receiver_integer(actual,"bytes")!=row_size(value,limits)||receiver_integer(actual,"bytes")>limits.encoded_bytes)
+            fail(code::corrupt_state,"receiver installation row identity/usage mismatch");
+        output.value=value;return output;
+    };
+    const auto usage=configuration();
+    const auto existing=row(binding.channel);covered(existing.value,usage,limits);
+    if(existing.value) {
+        if(!receiver_same_binding(existing.value->binding,binding))fail(code::binding_mismatch,"receiver installation immutable binding differs");
+        return usage;
+    }
+    if(shared) {
+        const auto keys=reader.enrollment_receiver_run_(kind::enrollment_receiver_aliases);
+        if(keys.size()>16)fail(code::capacity,"receiver shared domain channel capacity");
+        for(const auto& key:keys) {
+            const auto present=row(receiver_blob_view(key,"channel",limits.field_bytes));
+            if(!present.value||present.value->binding.authority!=binding.authority||present.value->binding.source!=binding.source||
+               present.value->binding.epoch!=binding.epoch||present.value->binding.scope!=binding.scope||present.value->binding.schema!=binding.schema)
+                fail(code::binding_mismatch,"receiver shared domain source/epoch/schema differs");
+        }
+    }else if(!reader.enrollment_receiver_run_(kind::enrollment_receiver_unique_domain).empty())
+        fail(code::alias,"receiver installation authority/scope already belongs to another channel");
+    receiver_snapshot_view next;next.binding={binding.channel,binding.authority,binding.source,binding.epoch,binding.scope,binding.schema};
+    valid_row(next,limits);const auto before=configuration();const auto next_bytes=row_size(next,limits);
+    const auto count=sum(before.channels,1);
+    if(count>limits.channels||!fits(before.encoded_bytes,next_bytes,limits.encoded_bytes))
+        fail(code::capacity,"receiver installation explicit storage budget exhausted");
+    const auto total=before.encoded_bytes+next_bytes;
+    const auto changed=[&]() {
+        const auto rows=reader.enrollment_receiver_run_(kind::enrollment_receiver_changes);
+        if(rows.size()!=1||receiver_integer(rows[0],"n")!=1)throw db_error("receiver installation write did not change its expected row");
+    };
+    (void)reader.enrollment_receiver_run_(kind::enrollment_receiver_insert,{},0,0,0,0,next_bytes);changed();
+    const auto written=row(binding.channel);
+    if(!written.value||!receiver_same_binding(written.value->binding,binding)||written.value->frontier!=receive_install_frontier{}||
+       written.value->revision||written.value->last_sequence||written.value->active||written.value->last_installed)
+        fail(code::corrupt_state,"receiver installation row write was altered");
+    (void)reader.enrollment_receiver_run_(kind::enrollment_receiver_usage,{},count,total,before.channels,before.encoded_bytes);changed();
+    const auto settled=configuration();
+    if(settled!=receive_install_usage{count,total})fail(code::corrupt_state,"receiver installation counter write was altered");
+    return settled;
+}
+
 receive_install_store::receive_install_store(std::shared_ptr<lattice_db> owner,receive_install_limits limits)
     : owner_(std::move(owner)),limits_(limits) {
     if (!owner_ || limits.channels<0 || limits.field_bytes<=0 || limits.field_bytes>(maximum-176)/16 || limits.encoded_bytes<0)
@@ -200,12 +390,8 @@ database& receive_install_store::connection() const {
     return *db;
 }
 receive_install_usage receive_install_store::configuration() const {
-    std::string sql="SELECT ";
-    for (auto name : {"id","version","max_channels","max_field_bytes","max_bytes","channels","bytes"}) {
-        if (sql!="SELECT ") sql+=",";
-        sql+=integer_projection(name);
-    }
-    auto rows=connection().query(sql+" FROM main._lattice_install_store LIMIT 2");
+    const auto sql=receive_install_initialization_recipe::configuration<std::string>();
+    auto rows=connection().query(sql);
     if (rows.size()!=1 || integer(rows[0],"id")!=1 || integer(rows[0],"version")!=(shared_domain_?2:1))
         fail(code::corrupt_state,"receiver installation missing/unsupported fixed metadata");
     if(shared_domain_) {
@@ -232,16 +418,8 @@ std::optional<receive_install_snapshot> receive_install_store::row(const std::st
     const auto identity_limit=std::min(88+4*limits_.field_bytes,limits_.encoded_bytes);
     // Indexed scalar preflight caps the total before copying any stored BLOB,
     // including corrupt rows whose individual fields fit but combined do not.
-    std::string preflight="SELECT ";
-    for (auto name : {"channel","authority","source","epoch","scope","schema_digest","active","last_install"}) {
-        if (preflight!="SELECT ") preflight+=",";
-        const std::string column=name;
-        const bool optional=column=="active" || column=="last_install";
-        preflight+="CASE ";
-        if (optional) preflight+="WHEN "+column+" IS NULL THEN 0 ";
-        preflight+="WHEN typeof("+column+")='blob' THEN length("+column+") ELSE -1 END AS "+column;
-    }
-    const auto sizes=connection().query(preflight+" FROM main._lattice_install_channel WHERE channel=? LIMIT 2",{bytes(channel)});
+    const auto preflight=receive_install_initialization_recipe::row_sizes<std::string>();
+    const auto sizes=connection().query(preflight,{bytes(channel)});
     if (sizes.empty()) return std::nullopt;
     if (sizes.size()!=1) fail(code::corrupt_state,"receiver installation duplicate channel");
     int64_t total=0;
@@ -253,12 +431,7 @@ std::optional<receive_install_snapshot> receive_install_store::row(const std::st
             fail(code::corrupt_state,"receiver installation stored fields exceed type/byte limits");
         total+=n;
     }
-    std::string sql="SELECT active IS NULL AS active_null,last_install IS NULL AS last_null,typeof(frontier) AS frontier_type";
-    for (auto name : {"frontier_kind","frontier","revision","last_sequence","bytes"}) sql+=","+integer_projection(name);
-    for (auto name : {"channel","authority","source","epoch","scope","schema_digest"})
-        sql+=","+bounded_projection(name,limits_.field_bytes);
-    sql+=","+bounded_projection("active",identity_limit)+","+bounded_projection("last_install",identity_limit)+
-        " FROM main._lattice_install_channel WHERE channel=? LIMIT 2";
+    const auto sql=receive_install_initialization_recipe::row_values<std::string>(limits_);
     const auto rows=connection().query(sql,{bytes(channel)});
     if (rows.empty()) return std::nullopt;
     if (rows.size()!=1) fail(code::corrupt_state,"receiver installation duplicate channel");
@@ -335,8 +508,7 @@ void receive_install_store::audit() const {
     if (actual!=expected) fail(code::corrupt_state,"receiver installation durable usage differs from full audit");
 }
 void receive_install_store::verify_domain_aliases(const receive_install_binding& binding)const {
-    const auto keys=connection().query("SELECT "+bounded_projection("channel",limits_.field_bytes)+
-        " FROM main._lattice_install_channel WHERE authority=? AND scope=? ORDER BY channel LIMIT 17",
+    const auto keys=connection().query(receive_install_initialization_recipe::aliases<std::string>(limits_),
         {bytes(binding.authority),bytes(binding.scope)});
     if(keys.size()>16)fail(code::capacity,"receiver shared domain channel capacity");
     for(const auto& key:keys){const auto existing=row(bounded_string(key,"channel",limits_.field_bytes));
@@ -368,12 +540,12 @@ void receive_install_store::write_row(const receive_install_snapshot& next,const
         // between addressed read and update. Readback rejects trigger rewrites.
         db.execute("UPDATE main._lattice_install_channel SET frontier_kind=?,frontier=?,revision=?,last_sequence=?,active=?,last_install=?,bytes=? WHERE channel=?",
             {static_cast<int64_t>(next.frontier.kind),head,next.revision,next.last_sequence,active,last,next_bytes,bytes(b.channel)});
-    } else db.execute("INSERT INTO main._lattice_install_channel VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    } else db.execute(std::string(receive_install_initialization_recipe::insert_channel()),
         {bytes(b.channel),bytes(b.authority),bytes(b.source),bytes(b.epoch),bytes(b.scope),bytes(b.schema),
          static_cast<int64_t>(next.frontier.kind),head,next.revision,next.last_sequence,active,last,next_bytes});
     changed(db);
     if (row(b.channel)!=std::optional<receive_install_snapshot>{next}) fail(code::corrupt_state,"receiver installation row write was altered");
-    db.execute("UPDATE main._lattice_install_store SET channels=?,bytes=? WHERE id=1 AND channels=? AND bytes=?",
+    db.execute(std::string(receive_install_initialization_recipe::update_usage()),
         {count,total,before.channels,before.encoded_bytes}); changed(db);
     if (configuration()!=receive_install_usage{count,total}) fail(code::corrupt_state,"receiver installation counter write was altered");
 }

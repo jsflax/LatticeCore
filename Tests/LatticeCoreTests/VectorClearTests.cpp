@@ -31,7 +31,8 @@ public:
         // Reproduce the old versioned fingerprint with the existing stable
         // property serializer. At the old epoch this marker permits fast open.
         std::ostringstream text;text<<"epoch:6\ntarget_schema_version:"<<config().target_schema_version<<'\n';
-        auto schemas=lattice::schema_registry::instance().all_schemas();
+        const auto schemas_owner=lattice::schema_registry::instance().all_schemas();
+        std::vector<const lattice::model_schema*> schemas(schemas_owner.begin(),schemas_owner.end());
         std::sort(schemas.begin(),schemas.end(),[](const auto* a,const auto* b){return a->table_name<b->table_name;});
         for(const auto* s:schemas) {
             text<<"table:"<<s->table_name<<'\n';

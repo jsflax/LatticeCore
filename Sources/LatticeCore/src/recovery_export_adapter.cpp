@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "recovery_export_adapter.hpp"
 #include "recovery_unknown_reconciliation.hpp"
 #include "recovery_receiver_source.hpp"
@@ -32,17 +33,17 @@ bool automatic_export_deferred(const recovery_install_result& result,bool* busy)
 struct statement {
     sqlite3_stmt* p=nullptr;
     statement(sqlite3* db,const std::string& sql){
-        database::record_statement();const int rc=sqlite3_prepare_v2(db,sql.c_str(),-1,&p,nullptr);
-        if(rc!=SQLITE_OK||!p||!sqlite3_stmt_readonly(p)){sqlite3_finalize(p);p=nullptr;refuse("export bounded read preparation failed");}
+        database::record_statement();const int rc=::lattice::detail::store_physical_prepare_v2(db,sql.c_str(),-1,&p,nullptr);
+        if(rc!=SQLITE_OK||!p||!sqlite3_stmt_readonly(p)){::lattice::detail::store_physical_finalize(p);p=nullptr;refuse("export bounded read preparation failed");}
     }
-    ~statement(){sqlite3_finalize(p);}
+    ~statement(){::lattice::detail::store_physical_finalize(p);}
     statement(const statement&)=delete;
     void integer(int at,int64_t value){if(sqlite3_bind_int64(p,at,value)!=SQLITE_OK)refuse("export integer binding failed");}
     void text(int at,const std::string& value){
         if(value.size()>static_cast<size_t>(std::numeric_limits<int>::max())||
            sqlite3_bind_text(p,at,value.data(),static_cast<int>(value.size()),SQLITE_STATIC)!=SQLITE_OK)refuse("export text binding failed");
     }
-    bool next(){const int rc=sqlite3_step(p);if(rc==SQLITE_ROW)return true;if(rc==SQLITE_DONE)return false;refuse("export bounded read failed");}
+    bool next(){const int rc=::lattice::detail::store_physical_step(p);if(rc==SQLITE_ROW)return true;if(rc==SQLITE_DONE)return false;refuse("export bounded read failed");}
 };
 struct budget {
     const recovery_export_limits& limits;size_t used=0;

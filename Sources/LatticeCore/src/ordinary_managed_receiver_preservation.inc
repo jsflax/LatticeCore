@@ -52,13 +52,13 @@ struct preservation_cursor {
     preservation_cursor(sqlite3* h,const preservation_table& table){
         std::string columns;for(const auto& name:table.columns){if(!columns.empty())columns+=',';columns+=quote(name);}
         const auto sql="SELECT "+columns+" FROM main."+quote(table.name);const char* tail=nullptr;
-        const auto rc=sqlite3_prepare_v2(h,sql.c_str(),int(sql.size()),&statement,&tail);
-        if(rc!=SQLITE_OK||!statement||!tail||*tail||!sqlite3_stmt_readonly(statement)||sqlite3_bind_parameter_count(statement)||sqlite3_column_count(statement)!=int(table.columns.size())){if(statement)sqlite3_finalize(statement);statement=nullptr;refuse("receiver preservation cursor prepare refused");}
+        const auto rc=::lattice::detail::store_physical_prepare_v2(h,sql.c_str(),int(sql.size()),&statement,&tail);
+        if(rc!=SQLITE_OK||!statement||!tail||*tail||!sqlite3_stmt_readonly(statement)||sqlite3_bind_parameter_count(statement)||sqlite3_column_count(statement)!=int(table.columns.size())){if(statement)::lattice::detail::store_physical_finalize(statement);statement=nullptr;refuse("receiver preservation cursor prepare refused");}
     }
-    ~preservation_cursor(){if(statement)sqlite3_finalize(statement);}
+    ~preservation_cursor(){if(statement)::lattice::detail::store_physical_finalize(statement);}
     preservation_cursor(const preservation_cursor&)=delete;
     bool next(const std::function<void(std::vector<uint8_t>&&,uint64_t,bool)>& emit){
-        const auto rc=sqlite3_step(statement);if(rc==SQLITE_DONE)return false;if(rc!=SQLITE_ROW)refuse("receiver preservation cursor did not finish");
+        const auto rc=::lattice::detail::store_physical_step(statement);if(rc==SQLITE_DONE)return false;if(rc!=SQLITE_ROW)refuse("receiver preservation cursor did not finish");
         const auto columns=sqlite3_column_count(statement);size_t encoded=8;
         for(int n=0;n<columns;++n){size_t extra=9;const auto type=sqlite3_column_type(statement,n);if(type==SQLITE_TEXT||type==SQLITE_BLOB){const auto bytes=sqlite3_column_bytes(statement,n);if(bytes<0)refuse("receiver preservation scalar length invalid");extra+=size_t(bytes);}
             else if(type!=SQLITE_NULL&&type!=SQLITE_INTEGER&&type!=SQLITE_FLOAT)refuse("receiver preservation scalar class invalid");

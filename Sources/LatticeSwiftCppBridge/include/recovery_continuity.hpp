@@ -11,6 +11,7 @@ namespace lattice::detail {
 class recovery_continuous_barrier;
 struct recovery_install_result;
 struct recovery_continuous_quiescence;
+struct recovery_continuous_open_result;
 }
 namespace lattice {
 class swift_lattice_ref;
@@ -57,8 +58,9 @@ class continuous_result {
     bool waiting_=false,frozen_=false,unexpected_=false;
     int64_t unsent_count_=0;
     continuous_barrier barrier_;
-    std::array<char,769> primary_{},cleanup_{},postcommit_{},notification_{};
+    std::array<char,769> primary_{},cleanup_{},postcommit_{},notification_{},owner_close_{};
     void assign(const detail::recovery_install_result&)noexcept;
+    void assign(const detail::recovery_continuous_open_result&)noexcept;
     void assign(const detail::recovery_continuous_quiescence&)noexcept;
     void failure(std::exception_ptr)noexcept;
 public:
@@ -74,6 +76,7 @@ public:
     std::string cleanup_error()const noexcept SWIFT_NAME(cleanupError());
     std::string postcommit_error()const noexcept SWIFT_NAME(postcommitError());
     std::string notification_error()const noexcept SWIFT_NAME(notificationError());
+    std::string owner_close_error()const noexcept SWIFT_NAME(ownerCloseError());
 };
 }
 #endif

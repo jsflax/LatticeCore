@@ -39,6 +39,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/random.h>
 #include <sys/wait.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -312,9 +313,9 @@ struct retained_engram_upgrade_session::implementation {
             if(relevant&&!supported_image(process_path(pid,end),end))refused();
         }
     }
-    void verify_phase(const retirement_phase& phase,bool first,deadline end){
+    void verify_phase(retirement_phase& phase,bool first,deadline end){
         verify(end);if(!phase.recorded||!namespace_binding)refused();
-        for(const auto& role:phase.roles){if(role.terminal!="note-exit"&&role.terminal!="kernel-old-incarnation-retired")refused();
+        for(auto& role:phase.roles){if(role.terminal!="note-exit"&&role.terminal!="kernel-old-incarnation-retired")refused();
             if(role.terminal=="note-exit"){
                 if(!role.process)refused();const auto actual=role.process->wait_for_exit(end);
                 if(actual.pid!=role.expected.pid||actual.audit_token!=role.expected.audit_token)refused();
@@ -706,6 +707,7 @@ int retained_engram_upgrade_session::run_managed_recovery(deadline end) {
             [owner](deadline until){owner->verify_retired(until);});
         return owner->namespace_transition->retain_after_managed_runtime(runtime_retired,old,end);
     }();
+    retired.drain_oversized_wals(end);
     const auto observed = retired.before_launch(end);
     fd generation(retired.duplicate_before_launch(end));
     const int control = owner->open_directory(owner->stage, "namespace", true, end);

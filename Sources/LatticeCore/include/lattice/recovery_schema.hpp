@@ -18,6 +18,9 @@ struct recovery_constraint {
 class recovery_owner_schema {
     size_t bytes_=0, properties_=0;
     bool valid_=true;
+    bool native_fallback_ready_=false;
+    schema_snapshot_v2 native_fallback_; // captured before every actual Native open
+
     bool charge(size_t);
     bool field(const std::string&);
     bool property(const property_descriptor&);
@@ -31,6 +34,8 @@ public:
     std::string swift_snapshot; // Actual normal serializer retained on SAME owner catalog.
 
     static recovery_owner_schema capture_native();
+    recovery_owner_schema&& prepare_native_fallback_()&&;
+    const schema_snapshot_v2& native_fallback_lease_()const;
     bool valid()const noexcept{return valid_;}
     void refuse()noexcept{valid_=false;}
     // Preflight before copying the model or its nested property descriptors.

@@ -1,4 +1,8 @@
 #include "ordinary_installation_files.hpp"
+#include "ordinary_resource_applications_policy.hpp"
+#include <optional>
+#include <cstring>
+#include <string_view>
 #include "vendor/picosha2/picosha2.h"
 #include <algorithm>
 #include <array>
@@ -8,6 +12,7 @@
 #include <utility>
 #if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
 #include <fcntl.h>
+#include <grp.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #define LATTICE_INSTALLATION_FILES_POSIX 1
@@ -47,6 +52,26 @@ struct stat inspect_directory(int fd) {
         file_fail(file_error_code::unavailable);
     return value;
 }
+std::optional<gid_t> actual_admin_group(){
+#if defined(__APPLE__)
+    std::array<char,16384> buffer{};group record{},*actual=nullptr;
+    if(::getgrnam_r("admin",&record,buffer.data(),buffer.size(),&actual)||actual!=&record||!record.gr_name)return {};
+    const auto start=reinterpret_cast<std::uintptr_t>(buffer.data());
+    const auto observed=reinterpret_cast<std::uintptr_t>(record.gr_name);
+    if(observed<start||observed-start>=buffer.size())return {};
+    const auto available=buffer.size()-static_cast<std::size_t>(observed-start);
+    const auto* end=static_cast<const char*>(std::memchr(record.gr_name,0,available));
+    if(!end||std::string_view(record.gr_name,static_cast<std::size_t>(end-record.gr_name))!="admin")return {};
+    return record.gr_gid;
+#else
+    return {};
+#endif
+}
+struct stat inspect_application_directory(int fd,std::optional<gid_t> admin){
+    struct stat value{};
+    if(::fstat(fd,&value)||!resource_applications_policy::directory(value,::geteuid(),admin))file_fail(file_error_code::unavailable);
+    return value;
+}
 // Comparing both identity and stable metadata detects ordinary concurrent
 // edits. This is not a claim against hostile in-place mutation by trusted code.
 bool same_metadata(const struct stat& a, const struct stat& b) {
@@ -67,7 +92,10 @@ bool same_metadata(const struct stat& a, const struct stat& b) {
 struct retained_installation_file::implementation {
     const pid_t creator = ::getpid();
     const std::thread::id thread = std::this_thread::get_id();
-    struct parent { retained_fd fd; file_identity identity; std::string name; };
+    struct parent {
+        retained_fd fd;file_identity identity;std::string name;
+        bool applications=false;std::optional<gid_t> admin;struct stat original{};
+    };
     std::vector<parent> parents;
     retained_fd file;
     std::string leaf;
@@ -84,12 +112,16 @@ struct retained_installation_file::implementation {
     void names() const {
         owner();
         for (std::size_t i = 0; i != parents.size(); ++i) {
-            if (observed_identity(inspect_directory(parents[i].fd.value)) != parents[i].identity)
+            const auto actual=parents[i].applications?
+                inspect_application_directory(parents[i].fd.value,parents[i].admin):inspect_directory(parents[i].fd.value);
+            if (observed_identity(actual) != parents[i].identity ||
+                (parents[i].applications&&!resource_applications_policy::unchanged(parents[i].original,actual)))
                 file_fail(file_error_code::changed);
             if (i) {
                 struct stat named{};
                 if (::fstatat(parents[i-1].fd.value, parents[i].name.c_str(), &named, AT_SYMLINK_NOFOLLOW) ||
-                    !S_ISDIR(named.st_mode) || observed_identity(named) != parents[i].identity)
+                    !S_ISDIR(named.st_mode) || observed_identity(named) != parents[i].identity ||
+                    (parents[i].applications&&!resource_applications_policy::unchanged(parents[i].original,named)))
                     file_fail(file_error_code::changed);
             }
         }
@@ -157,6 +189,34 @@ retained_installation_file retained_installation_file::open_executable(const exe
     state->file = retained_fd(::openat(state->parents.back().fd.value, state->leaf.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
     (void)state->inspect(end, false); return retained_installation_file(std::move(state));
 }
+retained_installation_file retained_installation_file::open_application_image(const executable_fact& expected, ordinary_launch::deadline end) {
+    if (expected.path.empty() || expected.path.front() != '/' || expected.path.size() > 4096 ||
+        expected.path.back() == '/' || !expected.identity.inode ||
+        std::all_of(expected.content.begin(), expected.content.end(), [](auto value) { return value == 0; }))
+        file_fail(file_error_code::invalid_path);
+    auto state = std::make_unique<implementation>();
+    state->expected = expected.identity; state->content = expected.content;
+    state->limit = 1024ull * 1024 * 1024; state->executable = true;
+    retained_fd root(::open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    const auto identity = observed_identity(inspect_directory(root.value));
+    state->parents.push_back({std::move(root), identity, {}});
+    std::size_t at = 1;
+    for (;;) {
+        before(end); const auto slash = expected.path.find('/', at);
+        auto component = expected.path.substr(at, slash == std::string::npos ? std::string::npos : slash - at);
+        valid_leaf(component);
+        if (slash == std::string::npos) { state->leaf = std::move(component); break; }
+        retained_fd next(::openat(state->parents.back().fd.value, component.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        const bool applications=state->parents.size()==1&&component=="Applications";
+        const auto admin=applications?actual_admin_group():std::optional<gid_t>{};
+        const auto actual=applications?inspect_application_directory(next.value,admin):inspect_directory(next.value);
+        if(applications){const auto root=inspect_directory(state->parents.front().fd.value);if(root.st_uid!=0)file_fail(file_error_code::unavailable);}
+        const auto identity=observed_identity(actual);
+        state->parents.push_back({std::move(next),identity,std::move(component),applications,admin,actual});at=slash+1;
+    }
+    state->file = retained_fd(::openat(state->parents.back().fd.value, state->leaf.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
+    (void)state->inspect(end, false); return retained_installation_file(std::move(state));
+}
 retained_installation_file retained_installation_file::open_record(int parent, const std::string& leaf,
         const file_identity& expected, const digest& content, std::size_t limit, ordinary_launch::deadline end) {
     valid_leaf(leaf);
@@ -173,6 +233,7 @@ retained_installation_file retained_installation_file::open_record(int parent, c
 #else
 struct retained_installation_file::implementation {};
 retained_installation_file retained_installation_file::open_executable(const executable_fact&, ordinary_launch::deadline) { file_fail(file_error_code::unavailable); }
+retained_installation_file retained_installation_file::open_application_image(const executable_fact&, ordinary_launch::deadline) { file_fail(file_error_code::unavailable); }
 retained_installation_file retained_installation_file::open_record(int, const std::string&, const file_identity&, const digest&, std::size_t, ordinary_launch::deadline) { file_fail(file_error_code::unavailable); }
 #endif
 retained_installation_file::retained_installation_file(std::unique_ptr<implementation> value) : impl_(std::move(value)) {}

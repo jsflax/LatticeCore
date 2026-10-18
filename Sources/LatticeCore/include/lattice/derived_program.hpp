@@ -1,4 +1,5 @@
 #pragma once
+#include "ordinary_program.hpp"
 #include <array>
 #include <string>
 #include <sstream>
@@ -19,17 +20,22 @@ struct fts5_porter_definition {
     std::string populate;
 };
 
-inline std::string fts5_porter_table_name(const std::string& model, const std::string& column) {
+template<class Text>
+Text fts5_porter_table_name_storage(const Text& model, const Text& column) {
     return "_" + model + "_" + column + "_fts";
+}
+inline std::string fts5_porter_table_name(const std::string& model, const std::string& column) {
+    return fts5_porter_table_name_storage<std::string>(model,column);
 }
 
 // Identifier handling intentionally matches existing ordinary setup. A strict
 // recovery descriptor must validate bounded identifiers before calling this
 // generator, then validate the actual complete schema/program/shadow layout.
-inline fts5_porter_definition fts5_porter_program(const std::string& model,
-                                                const std::string& column) {
-    fts5_porter_definition p;
-    p.table = fts5_porter_table_name(model, column);
+template<class Text,class Definition>
+Definition fts5_porter_program_storage(const Text& model,
+                                                const Text& column) {
+    Definition p;
+    p.table = fts5_porter_table_name_storage<Text>(model, column);
     const auto& f = p.table;
     p.create_table = "CREATE VIRTUAL TABLE " + f + " USING fts5(" + column +
         ", content='" + model + "', content_rowid='id', tokenize='porter')";
@@ -49,6 +55,10 @@ inline fts5_porter_definition fts5_porter_program(const std::string& model,
         " WHERE " + column + " IS NOT NULL";
     return p;
 }
+inline fts5_porter_definition fts5_porter_program(const std::string& model,
+                                                const std::string& column) {
+    return fts5_porter_program_storage<std::string,fts5_porter_definition>(model,column);
+}
 
 // The flat and IVF modes use the same existing four mutation programs. Vector
 // dimensions and module options are encoded only by the separate CREATE helper
@@ -59,13 +69,14 @@ struct vec0_trigger_definition {
     std::array<std::string, 4> sql;
     std::array<std::string, 4> names;
 };
-inline vec0_trigger_definition vec0_program(const std::string& bare_table,
-                                           const std::string& column_name) {
-    const std::string vec_table = "_" + bare_table + "_" + column_name + "_vec";
+template<class Text,class Definition>
+Definition vec0_program_storage(const Text& bare_table,
+                                           const Text& column_name) {
+    const Text vec_table = "_" + bare_table + "_" + column_name + "_vec";
     // Keep the established nonempty UPDATE + conditional INSERT
     // programs intact. Empty/NULL updates have their own clear program.
     // INSERT trigger
-    std::ostringstream insert_trigger;
+    ordinary_program_storage_stream<Text> insert_trigger;
     insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_insert "
                    << "AFTER INSERT ON main." << bare_table << " "
                    << "WHEN NEW." << column_name << " IS NOT NULL "
@@ -80,7 +91,7 @@ inline vec0_trigger_definition vec0_program(const std::string& bare_table,
                    << "END";
 
     // UPDATE trigger
-    std::ostringstream update_trigger;
+    ordinary_program_storage_stream<Text> update_trigger;
     update_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_update "
                    << "AFTER UPDATE OF " << column_name << " ON main." << bare_table << " "
                    << "WHEN NEW." << column_name << " IS NOT NULL "
@@ -95,14 +106,14 @@ inline vec0_trigger_definition vec0_program(const std::string& bare_table,
                    << "END";
 
     // DELETE trigger
-    std::ostringstream delete_trigger;
+    ordinary_program_storage_stream<Text> delete_trigger;
     delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_delete "
                    << "AFTER DELETE ON main." << bare_table << " "
                    << "BEGIN "
                    << "DELETE FROM " << vec_table << " WHERE global_id = OLD.globalId; "
                    << "END";
 
-    std::ostringstream clear_trigger;
+    ordinary_program_storage_stream<Text> clear_trigger;
     clear_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_clear "
                   << "AFTER UPDATE OF " << column_name << " ON main." << bare_table << " "
                   << "WHEN NEW." << column_name << " IS NULL "
@@ -113,16 +124,25 @@ inline vec0_trigger_definition vec0_program(const std::string& bare_table,
             {insert_trigger.str(), update_trigger.str(), delete_trigger.str(), clear_trigger.str()},
             {vec_table + "_insert", vec_table + "_update", vec_table + "_delete", vec_table + "_clear"}};
 }
+inline vec0_trigger_definition vec0_program(const std::string& bare_table,
+                                           const std::string& column_name) {
+    return vec0_program_storage<std::string,vec0_trigger_definition>(bare_table,column_name);
+}
 
-inline std::string vec0_create_table_program(const std::string& vec_table,
+template<class Text>
+Text vec0_create_table_program_storage(const Text& vec_table,
                                             int dimensions, int ivf_nlist, int ivf_nprobe) {
-    std::ostringstream sql;
+    ordinary_program_storage_stream<Text> sql;
     sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
         << "global_id TEXT PRIMARY KEY, embedding float[" << dimensions << "]"
         << (ivf_nlist > 0
-            ? " indexed by ivf(nlist=" + std::to_string(ivf_nlist)
-              + (ivf_nprobe > 0 ? ", nprobe=" + std::to_string(ivf_nprobe) : "") + ")"
+            ? " indexed by ivf(nlist=" + ordinary_program_storage_decimal<Text>(static_cast<unsigned long long>(ivf_nlist))
+              + (ivf_nprobe > 0 ? ", nprobe=" + ordinary_program_storage_decimal<Text>(static_cast<unsigned long long>(ivf_nprobe)) : "") + ")"
             : "") << ")";
     return sql.str();
+}
+inline std::string vec0_create_table_program(const std::string& vec_table,
+                                            int dimensions, int ivf_nlist, int ivf_nprobe) {
+    return vec0_create_table_program_storage<std::string>(vec_table,dimensions,ivf_nlist,ivf_nprobe);
 }
 } // namespace lattice::detail

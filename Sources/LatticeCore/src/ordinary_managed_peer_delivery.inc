@@ -381,8 +381,13 @@ ordinary_managed_peer_deadline_probe ordinary_export_access::exercise_managed_pe
     paused.incoming=std::unique_ptr<ordinary_managed_peer_staged>(new ordinary_managed_peer_staged(std::move(stage)));
     ordinary_managed_peer_deadline_probe probe;
     auto* handle=ordinary_export_storage_access::borrow(owner.db());
-    struct authorizer_restore {sqlite3* h;~authorizer_restore(){sqlite3_set_authorizer(h,nullptr,nullptr);}} restore{handle};
-    if(deny_commit&&sqlite3_set_authorizer(handle,[](void* raw,int action,const char* first,const char*,const char*,const char*)noexcept{
+    auto& actual_database=owner.db();
+    struct authorizer_restore {database& owner;void* context;void(*clear)(database&,void*)noexcept;
+        ~authorizer_restore(){clear(owner,context);}
+    } restore{actual_database,&probe,[](database& actual,void* exact)noexcept {
+        (void)actual.clear_sql_authorizer_(database_authorizer_slot::owned_test_restriction,exact);
+    }};
+    if(deny_commit&&actual_database.set_sql_authorizer_(database_authorizer_slot::owned_test_restriction,[](void* raw,int action,const char* first,const char*,const char*,const char*)noexcept{
         if(action==SQLITE_TRANSACTION&&first&&std::string_view(first)=="COMMIT"){
             ++static_cast<ordinary_managed_peer_deadline_probe*>(raw)->denied_commits;return SQLITE_DENY;
         }return SQLITE_OK;

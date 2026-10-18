@@ -1390,6 +1390,7 @@
     "RecoveryAutomaticExportReadAdmission.CheckedDrainRemainsPendingAcrossBothPositiveWindowsUntilActualAcks",
     "RecoveryAutomaticExportReadAdmission.ActualPositiveReplacementCannotRetargetFreshSelectionWithoutDescribe",
     "RecoveryAutomaticExportReadAdmission.FourthPositiveSendLeavesFreshDemandWhenActualSchedulerAdmissionFails",
+    "CountShortcutUpgrade.GenuinePredecessorSeedsEnabledOldBundle",
     "ReceiveDeliveryGuard.KnownFailureKeepsPriorCheckpointAndIndependentAcknowledgmentsAcrossReopen",
     "ReceiveDeliveryGuard.InitializedNullCannotBorrowAnotherChannelsLatestRemoteRow",
     "ReceiveDeliveryGuard.SuccessfulRepairAndUploadResetCannotClearStickyGap",
@@ -2810,7 +2811,6 @@
     "Storage/CanonicalWriterCustody.PublicHookBundleSurvivesSelfReplacementAndPhysicalMoves/0",
     "Storage/CanonicalWriterCustody.PublicHookBundleSurvivesSelfReplacementAndPhysicalMoves/1",
     "Storage/CanonicalWriterCustody.LocalProducerPolicyAlsoSurvivesBorrowerAndPublicHookRefusal/0",
-    "Storage/CanonicalWriterCustody.LocalProducerPolicyAlsoSurvivesBorrowerAndPublicHookRefusal/1",
-    "CountShortcutUpgrade.GenuinePredecessorSeedsEnabledOldBundle"
+    "Storage/CanonicalWriterCustody.LocalProducerPolicyAlsoSurvivesBorrowerAndPublicHookRefusal/1"
   ]
 }

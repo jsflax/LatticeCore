@@ -2,9 +2,16 @@
 // Included after header channel. No supplied SQL/path/old-owner/cut factory.
 #include "ordinary_history_record_key_recipe.hpp"
 #include "ordinary_target_history_spool.hpp"
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+#if !defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+#error "Receiving history fault qualification requires the debug macOS owner fixture"
+#endif
+#include "ordinary_receiver_reclamation_fixture.hpp"
+#endif
 namespace lattice {
 struct database::target_staging_state::history_page_native {
     using arguments=std::vector<column_value_t>;
+    terminal_native_page_tail terminal_page; // FIRST: runs after every actual page member dies.
     database* const shell;
     // SAME IO original is retained before SQL scope/native registration. The
     // numeric pair is its checked DATA; it cannot substitute for this original.
@@ -99,7 +106,7 @@ struct database::target_staging_state::history_page_native {
         const arguments& before_stage,const arguments& before_meta,const detail::ordinary_history_progress& before_progress,
         const picosha2::hash256_one_by_one& before_content,
         std::shared_ptr<const detail::ordinary_target_history_page_append> append,std::pair<std::uint64_t,std::uint64_t> span)
-        :shell(&actual),raw_append(std::move(append)),raw_span(span),owner(receiving),schema(original),previous(prior),stage(before_stage),meta(before_meta),progress(before_progress),content(before_content) {
+        :terminal_page(actual,receiving,this,input.index),shell(&actual),raw_append(std::move(append)),raw_span(span),owner(receiving),schema(original),previous(prior),stage(before_stage),meta(before_meta),progress(before_progress),content(before_content) {
         const ordinary_history_limits limits;
         if(input.index!=progress.next_page||input.previous!=progress.previous||progress.complete||input.records.empty()||input.records.size()>64||
            input.raw.empty()||input.raw.size()>limits.page_bytes||std::get<std::int64_t>(stage.at(15))<0||
@@ -167,6 +174,7 @@ struct database::target_staging_state::history_page_native {
         const auto header_original=actual.target_staging_->history_header;
         if(!header_original)throw db_error("target page actual header program missing");charge(header_original->logical_bytes);
         if(previous)charge(previous->logical_bytes); // Fixed two-page overlap; no successive allocation after unknown ending.
+        terminal_page.constructor_returned(); // Final constructor action, never a partial-page receipt.
     }
     void require(database& actual,bool unwind=false)const {
         const auto state=actual.target_staging_;
@@ -191,7 +199,7 @@ struct database::target_staging_state::history_page_native {
             throw db_error("target page fixed statement unavailable");
         require(actual,unwind);auto& call=reserve(kind::prepare,index,unwind);require(actual,unwind);
         const char* tail=nullptr;statement.prepare_entered=true;call.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(actual.db_,sql.c_str(),static_cast<int>(sql.size()+1),&statement.held,&tail);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(actual.db_,sql.c_str(),static_cast<int>(sql.size()+1),&statement.held,&tail);
         statement.prepared_identity=statement.held;statement.prepare_returned=true;returned(call,statement.prepare_rc);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held)throw db_error("target page preparation failed");
         require(actual,unwind);if(!tail||tail<sql.c_str()||tail>sql.c_str()+sql.size())throw db_error("target page native tail unavailable");
@@ -221,7 +229,7 @@ struct database::target_staging_state::history_page_native {
     int step(database& actual,std::size_t index,bool unwind=false) {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)throw db_error("target page actual VM unavailable");
         require(actual,unwind);auto& call=reserve(kind::step,index,unwind);require(actual,unwind);call.entered=true;
-        active_statement=index;const int rc=sqlite3_step(statement.held);returned(call,rc);active_statement=statements_limit;
+        active_statement=index;const int rc=::lattice::detail::store_physical_step(statement.held);returned(call,rc);active_statement=statements_limit;
         if(!statement.first_step_returned){statement.first_step_returned=true;statement.first_step_rc=rc;}
         if(rc!=SQLITE_ROW){if(statement.terminal_returned)throw db_error("target page native terminal reissued");statement.terminal_returned=true;statement.terminal_rc=rc;}
         if(index==begin)scope->record_schema_begin(actual,rc);if(index==commit)scope->record_schema_commit(actual,rc);if(index==rollback)scope->record_schema_rollback(actual,rc);
@@ -231,7 +239,7 @@ struct database::target_staging_state::history_page_native {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)return;
         require(actual,unwind);auto& call=reserve(kind::finalize,index,unwind);require(actual,unwind);
         statement.finalized_identity=statement.held;statement.finalize_entered=true;call.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
         statement.destruction_known=(statement.finalize_rc&0xff)!=SQLITE_MISUSE;if(statement.destruction_known)statement.held=nullptr;
         scope->record_schema_finalized(actual,statement.finalize_rc);
         if(statement.finalize_rc!=SQLITE_OK)throw db_error("target page native finalization failed");require(actual,unwind);
@@ -305,14 +313,14 @@ struct database::target_staging_state::history_page_native {
 };
 bool database::target_history_page_guard_destroyed_()const noexcept {
     const auto state=target_staging_;const auto actual=state?state->history_page:nullptr;
-    if(!state||!state->current_creator())return false;if(!actual)return true;
+    if(!state||!state->current_creator()||state->terminal_native_pages_attempted)return false;if(!actual)return true;
     if(!actual->userdata)return !actual->guard_registration_entered;
     return actual->guard_destroy_entered&&actual->guard_destroy_returned;
 }
 bool database::target_history_page_native_ending_()const noexcept {
     try {
         const auto state=target_staging_;const auto actual=state?state->history_page:nullptr;
-        if(!state||!state->current_creator()||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
+        if(!state||!state->current_creator()||state->terminal_native_pages_attempted||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
            !actual->guard_registration_entered||!actual->guard_registration_returned||actual->first_guard_registration_rc!=SQLITE_OK||
            !actual->userdata||actual->guard_destroy_entered||actual->guard_destroy_returned||!actual->previous_destroy_joined||
            actual->completed_operations!=10+2*actual->keys.size()||actual->guard_invocations!=actual->keys.size()+3)return false;
@@ -453,7 +461,7 @@ void database::stage_target_history_page_program_(const std::shared_ptr<detail::
         next->userdata=new native::guard_userdata(state,next,*this);
         auto& registration=next->reserve(native::kind::register_guard,native::key_first);next->require(*this);
         next->guard_registration_entered=true;registration.entered=true;
-        next->first_guard_registration_rc=sqlite3_create_function_v2(db_,"lattice_ordered_export_owned_v1",0,SQLITE_UTF8,
+        next->first_guard_registration_rc=::lattice::detail::store_physical_create_function_v2(db_,"lattice_ordered_export_owned_v1",0,SQLITE_UTF8,
             next->userdata,&native::guard_userdata::invoke,nullptr,nullptr,&native::guard_userdata::destroy);
         next->guard_registration_returned=true;native::returned(registration,next->first_guard_registration_rc);
         if(next->first_guard_registration_rc!=SQLITE_OK)throw db_error("target page guard first Native replacement failed");next->require(*this);
@@ -466,6 +474,13 @@ void database::stage_target_history_page_program_(const std::shared_ptr<detail::
         next->execute(*this,native::begin,next->begin_sql);++next->completed_operations;
         next->verify(*this,native::stage_before,next->stage_read_sql,next->stage_key,before_stage);++next->completed_operations;
         next->verify(*this,native::meta_before,next->meta_read_sql,next->stage_key,before_meta);++next->completed_operations;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+        if(next->terminal_page.page_index==1&&next->previous) {
+            next->require(*this); // SAME actual page/owner/currentness; no new role or deadline.
+            if(detail::ordinary_receiver_reclamation_fixture::history_page2_failure_requested(*receiving))
+                throw db_error("injected receiving history page2 pre-predecessor-release failure");
+        }
+#endif
         // Prior static bindings and actual guard/callback/VM ending are joined; release the old program only now.
         next->previous.reset();
         for(std::size_t at=0;at<next->keys.size();++at) {

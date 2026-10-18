@@ -1,6 +1,16 @@
 #pragma once
+#include <type_traits>
+#include <memory>
+#include <streambuf>
+#include <limits>
+#include <cstdint>
 #include "schema.hpp"
 #include <algorithm>
+#include <charconv>
+#include <memory>
+#include <string_view>
+#include <system_error>
+#include <stdexcept>
 #include <map>
 #include <set>
 #include <sstream>
@@ -9,11 +19,65 @@
 #include <vector>
 
 namespace lattice::detail {
+
+// A normal std::string wrapper keeps the exact original standard stream.
+// libc++ basic_stringbuf::overflow can swallow an allocator exception before
+// ostream observes badbit. Actual accounted producers therefore append into
+// this Text buffer directly; no buffer layer can replace the primary debit
+// failure with EOF/ios_failure or return a partial program as success.
+template<class Text>class ordinary_program_accounted_buffer : public std::basic_streambuf<
+    char,typename Text::traits_type> {
+    using traits=typename Text::traits_type;
+    Text value_;
+protected:
+    std::streamsize xsputn(const char* bytes,std::streamsize count)override {
+        if(count<0||static_cast<std::uintmax_t>(count)>std::numeric_limits<std::size_t>::max())
+            throw std::length_error("ordinary program stream extent");
+        if(count)value_.append(bytes,static_cast<std::size_t>(count));
+        return count;
+    }
+    typename traits::int_type overflow(typename traits::int_type value=traits::eof())override {
+        if(traits::eq_int_type(value,traits::eof()))return traits::not_eof(value);
+        value_.push_back(traits::to_char_type(value));return value;
+    }
+public:
+    ordinary_program_accounted_buffer()=default;
+    Text str()const{return value_;}
+};
+template<class Text>class ordinary_program_accounted_stream final :
+    private ordinary_program_accounted_buffer<Text>,
+    public std::basic_ostream<char,typename Text::traits_type> {
+    using buffer=ordinary_program_accounted_buffer<Text>;
+    using output=std::basic_ostream<char,typename Text::traits_type>;
+public:
+    // Base declaration order constructs the owning DATA buffer FIRST; the
+    // ostream is never initialized with an unconstructed member's address.
+    ordinary_program_accounted_stream():buffer(),output(static_cast<buffer*>(this)) {
+        this->exceptions(std::ios_base::badbit);
+    }
+    Text str()const{return buffer::str();}
+};
+template<class Text>using ordinary_program_storage_stream=std::conditional_t<
+    std::is_same_v<typename Text::allocator_type,std::allocator<char>>,
+    std::basic_ostringstream<char,std::char_traits<char>,typename Text::allocator_type>,
+    ordinary_program_accounted_stream<Text>>;
+template<class Text,class T>using ordinary_program_storage_vector=std::vector<T,
+    typename std::allocator_traits<typename Text::allocator_type>::template rebind_alloc<T>>;
+template<class Text,class K,class V>using ordinary_program_storage_map=std::map<K,V,std::less<K>,
+    typename std::allocator_traits<typename Text::allocator_type>::template rebind_alloc<std::pair<const K,V>>>;
+template<class Text>Text ordinary_program_storage_text(std::string_view value){return Text(value.data(),value.size());}
+template<class Text>Text ordinary_program_storage_decimal(unsigned long long value){
+    char bytes[32];const auto converted=std::to_chars(bytes,bytes+sizeof(bytes),value);
+    if(converted.ec!=std::errc{})throw std::length_error("ordinary program integer extent");
+    return Text(bytes,size_t(converted.ptr-bytes));
+}
+
 // Pure descriptions of the SQL used by actual ordinary setup. These functions
 // do not execute SQL, inspect a database, or confer schema/source authority.
 // Callers validating a store must first bound declaration inputs, then compare
 // these programs with the complete current schema under their retained view.
-inline std::string ordinary_sql_type_string(column_type type) {
+template<class Text>
+Text ordinary_sql_type_string_storage(column_type type) {
     switch (type) {
         case column_type::integer: return "INTEGER";
         case column_type::real: return "REAL";
@@ -22,13 +86,16 @@ inline std::string ordinary_sql_type_string(column_type type) {
     }
     return "TEXT";
 }
-template<class Emit>
-void ordinary_model_audit_programs(const std::string& table_name, const std::vector<std::pair<std::string,column_type>>& columns, const std::set<std::string>& no_history, const std::string& canonical_receipt_tail, Emit&& emit) {
+inline std::string ordinary_sql_type_string(column_type type) {
+    return ordinary_sql_type_string_storage<std::string>(type);
+}
+template<class Text,class Columns,class Names,class Emit>
+void ordinary_model_audit_programs_storage(const Text& table_name, const Columns& columns, const Names& no_history, const Text& canonical_receipt_tail, Emit&& emit) {
     // Skip if no columns to track
     if (columns.empty()) return;
 
     // Helper to wrap BLOB columns with hex() for JSON compatibility
-    auto value_expr = [](const std::string& prefix, const std::string& col, column_type type) {
+    auto value_expr = [](const Text& prefix, const Text& col, column_type type) {
         if (type == column_type::blob) {
             return "hex(" + prefix + "." + col + ")";
         }
@@ -36,9 +103,9 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
     };
 
     // Build the changed fields comparison for UPDATE trigger
-    std::string update_when_clause;
-    std::string json_fields;
-    std::string json_names;
+    Text update_when_clause;
+    Text json_fields;
+    Text json_names;
 
     for (size_t i = 0; i < columns.size(); ++i) {
         const auto& [col, type] = columns[i];
@@ -64,8 +131,8 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
     }
 
     // INSERT JSON (all fields)
-    std::string insert_json_fields;
-    std::string insert_json_names;
+    Text insert_json_fields;
+    Text insert_json_names;
     for (size_t i = 0; i < columns.size(); ++i) {
         const auto& [col, type] = columns[i];
         if (i > 0) {
@@ -77,8 +144,8 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
     }
 
     // DELETE JSON (all old fields)
-    std::string delete_json_fields;
-    std::string delete_json_names;
+    Text delete_json_fields;
+    Text delete_json_names;
     for (size_t i = 0; i < columns.size(); ++i) {
         const auto& [col, type] = columns[i];
         if (i > 0) {
@@ -90,7 +157,7 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
     }
 
     // UPDATE trigger
-    std::string update_trigger = "CREATE TRIGGER IF NOT EXISTS AuditLog_Update_" + table_name +
+    Text update_trigger = "CREATE TRIGGER IF NOT EXISTS AuditLog_Update_" + table_name +
         " AFTER UPDATE ON " + table_name +
         " WHEN ((sync_disabled() = 0) AND (" + update_when_clause + "))"
         " BEGIN"
@@ -108,7 +175,7 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
     emit(update_trigger);
 
     // INSERT trigger
-    std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Insert"
+    Text insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Insert"
         " AFTER INSERT ON " + table_name +
         " WHEN (sync_disabled() = 0)"
         " BEGIN"
@@ -126,7 +193,7 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
     emit(insert_trigger);
 
     // DELETE trigger
-    std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Delete"
+    Text delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Delete"
         " AFTER DELETE ON " + table_name +
         " WHEN (sync_disabled() = 0)"
         " BEGIN"
@@ -145,9 +212,14 @@ void ordinary_model_audit_programs(const std::string& table_name, const std::vec
 }
 
 template<class Emit>
-void ordinary_link_audit_programs(const std::string& link_table_name, const std::string& canonical_receipt_tail, Emit&& emit) {
+void ordinary_model_audit_programs(const std::string& table_name, const std::vector<std::pair<std::string,column_type>>& columns, const std::set<std::string>& no_history, const std::string& canonical_receipt_tail, Emit&& emit) {
+    ordinary_model_audit_programs_storage<std::string>(table_name,columns,no_history,canonical_receipt_tail,std::forward<Emit>(emit));
+}
+
+template<class Text,class Emit>
+void ordinary_link_audit_programs_storage(const Text& link_table_name, const Text& canonical_receipt_tail, Emit&& emit) {
     // INSERT trigger for link table
-    std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
+    Text insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
         " AFTER INSERT ON " + link_table_name +
         " WHEN (sync_disabled() = 0)"
         " BEGIN"
@@ -165,7 +237,7 @@ void ordinary_link_audit_programs(const std::string& link_table_name, const std:
     emit(insert_trigger);
 
     // DELETE trigger for link table
-    std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
+    Text delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
         " AFTER DELETE ON " + link_table_name +
         " WHEN (sync_disabled() = 0)"
         " BEGIN"
@@ -184,9 +256,14 @@ void ordinary_link_audit_programs(const std::string& link_table_name, const std:
 }
 
 template<class Emit>
-void ordinary_virtual_link_audit_programs(const std::string& link_table_name, Emit&& emit) {
+void ordinary_link_audit_programs(const std::string& link_table_name, const std::string& canonical_receipt_tail, Emit&& emit) {
+    ordinary_link_audit_programs_storage<std::string>(link_table_name,canonical_receipt_tail,std::forward<Emit>(emit));
+}
+
+template<class Text,class Emit>
+void ordinary_virtual_link_audit_programs_storage(const Text& link_table_name, Emit&& emit) {
     // INSERT trigger for virtual link table (includes rhs_type)
-    std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
+    Text insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
         " AFTER INSERT ON " + link_table_name +
         " WHEN (sync_disabled() = 0)"
         " BEGIN"
@@ -204,7 +281,7 @@ void ordinary_virtual_link_audit_programs(const std::string& link_table_name, Em
     emit(insert_trigger);
 
     // DELETE trigger for virtual link table
-    std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
+    Text delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
         " AFTER DELETE ON " + link_table_name +
         " WHEN (sync_disabled() = 0)"
         " BEGIN"
@@ -222,8 +299,14 @@ void ordinary_virtual_link_audit_programs(const std::string& link_table_name, Em
     emit(delete_trigger);
 }
 
-inline std::string ordinary_link_table_program(const std::string& link_table_name) {
-    std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
+template<class Emit>
+void ordinary_virtual_link_audit_programs(const std::string& link_table_name, Emit&& emit) {
+    ordinary_virtual_link_audit_programs_storage<std::string>(link_table_name,std::forward<Emit>(emit));
+}
+
+template<class Text>
+Text ordinary_link_table_program_storage(const Text& link_table_name) {
+    Text sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
         "lhs TEXT NOT NULL, "
         "rhs TEXT NOT NULL, "
         "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
@@ -238,9 +321,13 @@ inline std::string ordinary_link_table_program(const std::string& link_table_nam
     ")";
     return sql;
 }
+inline std::string ordinary_link_table_program(const std::string& link_table_name) {
+    return ordinary_link_table_program_storage<std::string>(link_table_name);
+}
 
-inline std::string ordinary_virtual_link_table_program(const std::string& link_table_name) {
-    std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
+template<class Text>
+Text ordinary_virtual_link_table_program_storage(const Text& link_table_name) {
+    Text sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
         "lhs TEXT NOT NULL, "
         "rhs TEXT NOT NULL, "
         "rhs_type TEXT NOT NULL, "
@@ -256,19 +343,23 @@ inline std::string ordinary_virtual_link_table_program(const std::string& link_t
     ")";
     return sql;
 }
+inline std::string ordinary_virtual_link_table_program(const std::string& link_table_name) {
+    return ordinary_virtual_link_table_program_storage<std::string>(link_table_name);
+}
 
 struct ordinary_union_definition {
     std::string create_table;
     std::vector<std::pair<std::string,column_type>> columns;
 };
-inline ordinary_union_definition ordinary_union_program(const std::string& union_table_name, const union_descriptor& desc) {
+template<class Text,class Definition>
+Definition ordinary_union_program_storage(const Text& union_table_name, const union_descriptor& desc) {
     // Build column info from descriptor
-    std::vector<std::pair<std::string, column_type>> columns;
+    decltype(Definition{}.columns) columns;
     columns.push_back({"\"case\"", column_type::text});
-    std::map<std::string, std::vector<std::string>> case_to_cols;
-    std::vector<std::string> all_case_cols;
+    ordinary_program_storage_map<Text,Text,ordinary_program_storage_vector<Text,Text>> case_to_cols;
+    ordinary_program_storage_vector<Text,Text> all_case_cols;
 
-    std::ostringstream sql;
+    ordinary_program_storage_stream<Text> sql;
     sql << "CREATE TABLE " << union_table_name << "("
         << "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
@@ -282,25 +373,26 @@ inline ordinary_union_definition ordinary_union_program(const std::string& union
         << "\"case\" TEXT NOT NULL";
 
     for (const auto& c : desc.cases) {
-        std::vector<std::string> cols;
+        const Text case_name(c.case_name.data(),c.case_name.size());
+        ordinary_program_storage_vector<Text,Text> cols;
         if (c.values.empty()) {
-            case_to_cols[c.case_name] = {};
+            case_to_cols[case_name] = {};
             continue;
         }
         if (c.values.size() == 1 && c.values[0].param_name.empty()) {
-            std::string col = c.case_name;
-            sql << ", " << col << " " << ordinary_sql_type_string(c.values[0].type);
+            Text col = case_name;
+            sql << ", " << col << " " << ordinary_sql_type_string_storage<Text>(c.values[0].type);
             columns.push_back({col, c.values[0].type});
             cols.push_back(col);
         } else {
             for (const auto& val : c.values) {
-                std::string col = c.case_name + "__" + val.param_name;
-                sql << ", " << col << " " << ordinary_sql_type_string(val.type);
+                Text col = case_name + "__" + ordinary_program_storage_text<Text>(val.param_name);
+                sql << ", " << col << " " << ordinary_sql_type_string_storage<Text>(val.type);
                 columns.push_back({col, val.type});
                 cols.push_back(col);
             }
         }
-        case_to_cols[c.case_name] = cols;
+        case_to_cols[case_name] = cols;
         all_case_cols.insert(all_case_cols.end(), cols.begin(), cols.end());
     }
 
@@ -309,12 +401,13 @@ inline ordinary_union_definition ordinary_union_program(const std::string& union
         sql << ", CHECK(";
         bool first_case = true;
         for (const auto& c : desc.cases) {
+        const Text case_name(c.case_name.data(),c.case_name.size());
             if (!first_case) sql << " OR ";
             first_case = false;
-            sql << "(\"case\" = '" << c.case_name << "'";
-            auto my_cols_it = case_to_cols.find(c.case_name);
+            sql << "(\"case\" = '" << case_name << "'";
+            auto my_cols_it = case_to_cols.find(case_name);
             const auto& my_cols = (my_cols_it != case_to_cols.end())
-                ? my_cols_it->second : std::vector<std::string>{};
+                ? my_cols_it->second : ordinary_program_storage_vector<Text,Text>{};
             for (const auto& col : my_cols) {
                 sql << " AND " << col << " IS NOT NULL";
             }
@@ -331,14 +424,22 @@ inline ordinary_union_definition ordinary_union_program(const std::string& union
     sql << ")";
     return {sql.str(),std::move(columns)};
 }
-
-inline std::string ordinary_union_case_index_program(const std::string& union_table_name) {
-    return "CREATE INDEX IF NOT EXISTS idx_" + union_table_name + "_case ON " + union_table_name + "(\"case\")";
+inline ordinary_union_definition ordinary_union_program(const std::string& union_table_name, const union_descriptor& desc) {
+    return ordinary_union_program_storage<std::string,ordinary_union_definition>(union_table_name,desc);
 }
 
-inline std::string ordinary_union_cascade_program(const std::string& parent_table, const std::string& field_name, const std::string& union_table_name) {
-    std::string trigger_name = "_cascade_delete_" + parent_table + "_" + field_name + "_union";
-    std::string sql =
+template<class Text>
+Text ordinary_union_case_index_program_storage(const Text& union_table_name) {
+    return "CREATE INDEX IF NOT EXISTS idx_" + union_table_name + "_case ON " + union_table_name + "(\"case\")";
+}
+inline std::string ordinary_union_case_index_program(const std::string& union_table_name) {
+    return ordinary_union_case_index_program_storage<std::string>(union_table_name);
+}
+
+template<class Text>
+Text ordinary_union_cascade_program_storage(const Text& parent_table, const Text& field_name, const Text& union_table_name) {
+    Text trigger_name = "_cascade_delete_" + parent_table + "_" + field_name + "_union";
+    Text sql =
         "CREATE TRIGGER IF NOT EXISTS " + trigger_name +
         " BEFORE DELETE ON " + parent_table +
         " WHEN OLD." + field_name + " IS NOT NULL AND OLD." + field_name + " != ''"
@@ -347,15 +448,19 @@ inline std::string ordinary_union_cascade_program(const std::string& parent_tabl
         " END";
     return sql;
 }
+inline std::string ordinary_union_cascade_program(const std::string& parent_table, const std::string& field_name, const std::string& union_table_name) {
+    return ordinary_union_cascade_program_storage<std::string>(parent_table,field_name,union_table_name);
+}
 
 struct ordinary_model_definition {
     std::string create_table;
     std::vector<std::pair<std::string,column_type>> columns;
 };
-inline ordinary_model_definition ordinary_model_program(const model_schema& schema) {
+template<class Text,class Definition,class Schema>
+Definition ordinary_model_program_storage(const Schema& schema) {
     // Create table with SQL-generated UUID default for globalId
     // This matches Lattice.swift's table creation
-    std::ostringstream sql;
+    ordinary_program_storage_stream<Text> sql;
     sql << "CREATE TABLE IF NOT EXISTS " << schema.table_name << "(";
     sql << "id INTEGER PRIMARY KEY AUTOINCREMENT, ";
     sql << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
@@ -368,7 +473,7 @@ inline ordinary_model_definition ordinary_model_program(const model_schema& sche
            ")";
 
     // Collect column names and types for triggers
-    std::vector<std::pair<std::string, column_type>> columns;
+    decltype(Definition{}.columns) columns;
 
     for (const auto& prop : schema.properties) {
         // Skip list properties - they use separate tables (link_list, geo_bounds_list)
@@ -403,10 +508,13 @@ inline ordinary_model_definition ordinary_model_program(const model_schema& sche
     sql << ")";
     return {sql.str(),std::move(columns)};
 }
+inline ordinary_model_definition ordinary_model_program(const model_schema& schema) {
+    return ordinary_model_program_storage<std::string,ordinary_model_definition>(schema);
+}
 
-template<class Emit>
-void ordinary_link_shadow_programs(const std::string& parent_table, const std::string& link_table, const std::string& shadow_col, Emit&& emit) {
-    const std::string ins_trig =
+template<class Text,class Emit>
+void ordinary_link_shadow_programs_storage(const Text& parent_table, const Text& link_table, const Text& shadow_col, Emit&& emit) {
+    const Text ins_trig =
         "LinkShadow_" + link_table + "_Insert_" + shadow_col;
     emit(
         "CREATE TRIGGER IF NOT EXISTS " + ins_trig +
@@ -417,7 +525,7 @@ void ordinary_link_shadow_programs(const std::string& parent_table, const std::s
         "   WHERE globalId = NEW.lhs;"
         " END");
 
-    const std::string del_trig =
+    const Text del_trig =
         "LinkShadow_" + link_table + "_Delete_" + shadow_col;
     // Guard with `shadow = OLD.rhs` so a stale delete doesn't
     // clobber a freshly re-assigned link.
@@ -432,9 +540,14 @@ void ordinary_link_shadow_programs(const std::string& parent_table, const std::s
         " END");
 
 }
+template<class Emit>
+void ordinary_link_shadow_programs(const std::string& parent_table, const std::string& link_table, const std::string& shadow_col, Emit&& emit) {
+    ordinary_link_shadow_programs_storage<std::string>(parent_table,link_table,shadow_col,std::forward<Emit>(emit));
+}
 
-inline std::string ordinary_unique_index_program(const std::string& table, size_t ordinal, const std::vector<std::string>& columns) {
-    std::ostringstream sql;
+template<class Text,class Columns>
+Text ordinary_unique_index_program_storage(const Text& table, size_t ordinal, const Columns& columns) {
+    ordinary_program_storage_stream<Text> sql;
     sql << "CREATE UNIQUE INDEX IF NOT EXISTS unique_" << table << "_" << ordinal
         << " ON " << table << "(";
     for(size_t i=0;i<columns.size();++i) {
@@ -444,12 +557,19 @@ inline std::string ordinary_unique_index_program(const std::string& table, size_
     sql << ")";
     return sql.str();
 }
+inline std::string ordinary_unique_index_program(const std::string& table, size_t ordinal, const std::vector<std::string>& columns) {
+    return ordinary_unique_index_program_storage<std::string>(table,ordinal,columns);
+}
 
-inline std::string ordinary_property_index_program(const std::string& table, const std::string& property) {
-    std::ostringstream sql;
+template<class Text>
+Text ordinary_property_index_program_storage(const Text& table, const Text& property) {
+    ordinary_program_storage_stream<Text> sql;
     sql << "CREATE INDEX IF NOT EXISTS idx_" << table << "_" << property
         << " ON " << table << "(" << property << ")";
     return sql.str();
+}
+inline std::string ordinary_property_index_program(const std::string& table, const std::string& property) {
+    return ordinary_property_index_program_storage<std::string>(table,property);
 }
 
 } // namespace lattice::detail

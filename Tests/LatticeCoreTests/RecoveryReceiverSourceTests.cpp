@@ -290,13 +290,13 @@ TEST(RecoveryReceiverSource, PendingActualConstructorRefusesDifferentPolicyBefor
     TempDB file{"receiver_pending_policy"};PolicyFactoryScope installed;installed.factory->arm();
     std::unique_ptr<lattice::lattice_db> first;std::exception_ptr error;
     std::thread constructor([&]{try{first=std::make_unique<lattice::lattice_db>(owner_policy(file.str()));}catch(...){error=std::current_exception();}});
-    const bool entered=installed.factory->wait();bool refused=false;std::exception_ptr unexpected;
+    const bool entered=installed.factory->wait();bool refused=false;std::string refusal_message;std::exception_ptr unexpected;
     if(entered)try{auto wrong=std::make_unique<lattice::lattice_db>(owner_policy(file.str(),true));}
-        catch(const lattice::db_error& e){refused=std::string(e.what()).find("different recovery source expectations")!=std::string::npos;}
+        catch(const lattice::db_error& e){refusal_message=e.what();refused=refusal_message=="WSS owners have different source or ordinary ordering policies";}
         catch(...){unexpected=std::current_exception();}
     installed.factory->release();constructor.join();
     ASSERT_TRUE(entered);ASSERT_FALSE(error);ASSERT_FALSE(unexpected);ASSERT_NE(first,nullptr);EXPECT_FALSE(installed.factory->timed_out());
-    EXPECT_TRUE(refused);EXPECT_EQ(installed.factory->calls.load(),1u);
+    EXPECT_TRUE(refused) << "Actual constructor refusal: " << refusal_message;EXPECT_EQ(installed.factory->calls.load(),1u);
     first->close();
     auto replacement=std::make_unique<lattice::lattice_db>(owner_policy(file.str(),true));
     EXPECT_TRUE(replacement->is_sync_agent());EXPECT_EQ(installed.factory->calls.load(),2u);replacement->close();

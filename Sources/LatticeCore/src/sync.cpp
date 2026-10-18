@@ -19,11 +19,14 @@
 #endif
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
+#include "lattice/native_retirement_storage.hpp"
+#include "lattice/ordinary_pointer_publication.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <sstream>
 #include <cmath>
 #include <iomanip>
+#include <type_traits>
 
 namespace lattice {
 
@@ -703,8 +706,133 @@ struct discovery_charge {
 // synchronizer_base implementation
 // ============================================================================
 
+// Public setters may run while the pacer or an admitted scheduler callback
+// snapshots a handler. Only immutable shared owners cross this publication
+// boundary: arbitrary target copies, invocations and destruction stay off it.
+struct synchronizer_base::handler_publications {
+private:
+    struct slots {
+        detail::ordinary_shared_publication<const on_error_handler> error;
+        detail::ordinary_shared_publication<const on_sync_complete_handler> completed;
+        detail::ordinary_shared_publication<const on_state_change_handler> state;
+    };
+    const uint64_t creator_=detail::database_native_process();
+    slots* const slots_;
+public:
+    handler_publications():slots_(new slots){}
+    template<class Handler> auto& slot()noexcept {
+        if constexpr(std::is_same_v<Handler,on_error_handler>)return slots_->error;
+        else if constexpr(std::is_same_v<Handler,on_sync_complete_handler>)return slots_->completed;
+        else {static_assert(std::is_same_v<Handler,on_state_change_handler>);return slots_->state;}
+    }
+    ~handler_publications()noexcept {
+        // A final callback capture may fork during destruction. This raw-pointer
+        // shell has no owning tail; leave the remaining heap slots behind
+        // in that child rather than automatically destroying later handlers.
+        if(creator_!=detail::database_native_process())return;
+        slots_->error.store({});if(creator_!=detail::database_native_process())return;
+        slots_->completed.store({});if(creator_!=detail::database_native_process())return;
+        slots_->state.store({});if(creator_!=detail::database_native_process())return;
+        delete slots_; // All three slots are already empty in the creator.
+    }
+};
+
+template<class Handler> class synchronizer_base::handler_snapshot final {
+    const uint64_t creator_;
+    detail::native_retirement_storage<std::shared_ptr<handler_publications>,
+        std::shared_ptr<const Handler>> held_;
+public:
+    handler_snapshot(uint64_t creator,const std::shared_ptr<handler_publications>& publications)
+        :creator_(creator) {
+        // Allocation may run arbitrary instrumentation. Check the original
+        // process before touching the inherited publication/shared owner.
+        if(!held_.in_creator_process()||creator_!=detail::database_native_process())return;
+        held_.template get<0>()=publications;
+        held_.template get<1>()=held_.template get<0>()->template slot<Handler>().load(std::memory_order_acquire);
+    }
+    explicit operator bool()const noexcept {
+        const auto* value=get();return value&&bool(*value);
+    }
+    const Handler* get()const noexcept {
+        // Defensive even if an independent internal caller omits bool(): no
+        // inherited publication/shared owner is read after a callback fork.
+        if(creator_!=detail::database_native_process()||!held_.in_creator_process())return nullptr;
+        return const_cast<handler_snapshot*>(this)->held_.template get<1>().get();
+    }
+};
+
+template<class Handler> void synchronizer_base::publish_handler(Handler handler) {
+    const auto creator=handler_creator_;
+    detail::native_retirement_storage<Handler,std::shared_ptr<handler_publications>,
+        std::shared_ptr<const Handler>,std::shared_ptr<const Handler>> held;
+    held.template get<0>().swap(handler);
+    if(!held.in_creator_process()||creator!=detail::database_native_process())return;
+    held.template get<1>()=handlers_;
+    if(held.template get<0>())
+        held.template get<2>()=std::make_shared<const Handler>(std::move(held.template get<0>()));
+    if(!held.in_creator_process()||creator!=detail::database_native_process())return;
+    held.template get<3>()=held.template get<1>()->template slot<Handler>().exchange(
+        std::move(held.template get<2>()),std::memory_order_acq_rel);
+    // No owner access after publication: a displaced target may reenter the
+    // setter, delete this owner or fork while its last capture is destroyed.
+    // Retire it before the separately retained publication cell, off all leaves.
+    if(!held.template release<3>())return;
+}
+
+template<class Handler> Handler synchronizer_base::copy_handler()const {
+    const handler_snapshot<Handler> selected(handler_creator_,handlers_);
+    const auto* value=selected.get();
+    return value?*value:Handler{}; // Exactly one opaque value copy.
+}
+synchronizer_base::on_error_handler synchronizer_base::copy_error_handler()const {
+    return copy_handler<on_error_handler>();
+}
+synchronizer_base::on_sync_complete_handler synchronizer_base::copy_completion_handler()const {
+    return copy_handler<on_sync_complete_handler>();
+}
+synchronizer_base::on_state_change_handler synchronizer_base::copy_state_handler()const {
+    return copy_handler<on_state_change_handler>();
+}
+void synchronizer_base::set_on_error(on_error_handler handler) {
+    publish_handler(std::move(handler));
+}
+void synchronizer_base::set_on_sync_complete(on_sync_complete_handler handler) {
+    publish_handler(std::move(handler));
+}
+void synchronizer_base::set_on_state_change(on_state_change_handler handler) {
+    const auto creator=handler_creator_;
+    detail::native_retirement_storage<std::shared_ptr<handler_publications>,
+        std::shared_ptr<scheduler>,std::shared_ptr<detail::sync_callback_lifetime>> held;
+    if(!held.in_creator_process()||creator!=detail::database_native_process())return;
+    held.template get<0>()=handlers_;held.template get<1>()=scheduler_;held.template get<2>()=callback_lifetime_;
+    const bool connected=is_connected_.load();
+    const auto generation=held.template get<2>()?held.template get<2>()->dispatch_generation():0;
+    publish_handler(std::move(handler));
+    if(!held.in_creator_process()||creator!=detail::database_native_process())return;
+    // The replaced capture may have deleted the facade. Only independent DATA
+    // is read after publish_handler returns; lifecycle admission is unchanged.
+    if(!connected||!held.template get<2>()||!held.template get<2>()->current(generation))return;
+    const handler_snapshot<on_state_change_handler> selected(creator,held.template get<0>());
+    if(!selected)return;
+    held.template get<1>()->invoke([creator,publications=held.template get<0>()] {
+        // Preserve the original execution-time selection, but pin that one
+        // value across the check/call. Reset before dispatch is a silent no-op.
+        const handler_snapshot<on_state_change_handler> current(creator,publications);
+        if(const auto* value=current.get();value&&*value)(*value)(true);
+    });
+}
+void synchronizer_base::report_dispatched_error(const std::exception_ptr& error,const char* stage)noexcept {
+    try {
+        const handler_snapshot<on_error_handler> selected(handler_creator_,handlers_);
+        // The existing helper makes its original single opaque callback copy.
+        // The publication pin itself never copies an arbitrary target.
+        if(const auto* value=selected.get())detail::report_sync_background_error_dispatched(*value,error,stage);
+        else detail::report_sync_background_error_dispatched({},error,stage);
+    }catch(...) {LOG_ERROR("synchronizer","background failure handler could not be captured");}
+}
+
 synchronizer_base::synchronizer_base()
-    :upload_tracking_(std::make_shared<detail::sync_upload_tracking>()),
+    :handlers_(std::make_shared<handler_publications>()),upload_tracking_(std::make_shared<detail::sync_upload_tracking>()),
      in_flight_mutex_(upload_tracking_->mutex),in_flight_ids_(upload_tracking_->ids),
      progress_pending_upload_(upload_tracking_->pending) {}
 
@@ -789,9 +917,21 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
                 if(auto configured=life->configured_attempt_owner()){configured->request_renewal();return;}
 #endif
                 const auto generation=life->dispatch_generation();life->queued(generation,[this]{connect();});},
-            [this,life](std::exception_ptr error){const auto generation=life->dispatch_generation();life->queued(generation,[this,error]{
-                detail::report_sync_background_error(scheduler_,callback_lifetime_,callback_lifetime_->dispatch_generation(),on_error_,error,"canonical receiver");});},
-            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});});
+            [this,life](const std::exception_ptr& error){
+                // drain_notifications submitted this tail through scheduler_,
+                // whose actual lifetime admission precedes any owner access.
+                // Copy the public handler/error off leaf and complete it here;
+                // do not create a second untracked original-scheduler handoff.
+                report_dispatched_error(error,"canonical receiver");},
+            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});},
+            [weak_state=std::weak_ptr<detail::sync_pacer_state>(pacer_state_)]{
+                // The route has just checked its actual creator/lifecycle.
+                // Hold only independent pacer DATA around this off-leaf wake.
+                const auto state=weak_state.lock();if(!state)return;
+                // DATA publication never waits for a caller/pacer mutex. Any
+                // missed notify is observed by the unchanged <=100ms receiver
+                // tick; the private SQL lane and episode clock are independent.
+                state->controller_notifications.store(true,std::memory_order_release);state->ready.notify_one();});
     }
 #ifndef __EMSCRIPTEN__
     start_pacer();
@@ -841,9 +981,21 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
         const auto life=callback_lifetime_;
         receiver_controller_->notifications([this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});},
             [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{connect();});},
-            [this,life](std::exception_ptr error){const auto generation=life->dispatch_generation();life->queued(generation,[this,error]{
-                detail::report_sync_background_error(scheduler_,callback_lifetime_,callback_lifetime_->dispatch_generation(),on_error_,error,"canonical receiver");});},
-            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});});
+            [this,life](const std::exception_ptr& error){
+                // drain_notifications submitted this tail through scheduler_,
+                // whose actual lifetime admission precedes any owner access.
+                // Copy the public handler/error off leaf and complete it here;
+                // do not create a second untracked original-scheduler handoff.
+                report_dispatched_error(error,"canonical receiver");},
+            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});},
+            [weak_state=std::weak_ptr<detail::sync_pacer_state>(pacer_state_)]{
+                // The route has just checked its actual creator/lifecycle.
+                // Hold only independent pacer DATA around this off-leaf wake.
+                const auto state=weak_state.lock();if(!state)return;
+                // DATA publication never waits for a caller/pacer mutex. Any
+                // missed notify is observed by the unchanged <=100ms receiver
+                // tick; the private SQL lane and episode clock are independent.
+                state->controller_notifications.store(true,std::memory_order_release);state->ready.notify_one();});
     }
 #ifndef __EMSCRIPTEN__
     start_pacer();
@@ -922,7 +1074,7 @@ void synchronizer_base::background_operation(const char* stage,const std::functi
     const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;
     const auto generation=lifetime->dispatch_generation();
     on_error_handler error;
-    try {error=on_error_;work();}
+    try {error=copy_error_handler();work();}
     catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,std::move(error),std::current_exception(),stage);}
     // Only retained values are destroyed after the possibly reentrant work.
 }
@@ -970,7 +1122,7 @@ void synchronizer_base::enqueue_discovery(detail::sync_discovery_kind kind,const
 
 void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial) {
     const auto queue=discovery_deferral_;const auto state=pacer_state_;
-    const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;const auto error=on_error_;
+    const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;const auto error=copy_error_handler();
     // Construct allocating ownership before reserving the sole dispatch.
     // Destruction settles dropped work without calling back into a scheduler
     // that may be destroying its queue under its own lock. The pacer reports
@@ -1088,7 +1240,7 @@ void synchronizer_base::maybe_checkpoint() {
     // the same connection. An immediate scheduler may run this inline.
     const auto retained=owned_db_;auto* const owner=db_ptr_;const std::string label=log_id();
     const auto scheduled=scheduler_;const auto lifetime=callback_lifetime_;const auto generation=lifetime->dispatch_generation();
-    const auto error=on_error_;
+    const auto error=copy_error_handler();
     scheduled->invoke([retained,owner,label,try_truncate,scheduled,lifetime,generation,error] {
       try {
         auto res = owner->db().wal_checkpoint(try_truncate, /*busy_budget_ms=*/250);
@@ -1143,12 +1295,15 @@ void synchronizer_base::start_pacer() {
         for (;;) {
             const auto revision=queue->revision();
             const bool requested=state->requested.load(std::memory_order_acquire);
+            const bool controller_notifications=state->controller_notifications.load(std::memory_order_acquire);
             const auto coalesce=std::chrono::milliseconds(state->coalesce_milliseconds.load(std::memory_order_acquire));
             const auto ordinary_at=ordinary?ordinary->deadline():std::chrono::steady_clock::time_point::max();
             auto wake=std::min({maintenance_at,queue->wake_at(),receiver_at,ordinary_at});
+            if(controller_notifications)wake=std::chrono::steady_clock::now();
             if(coalesce.count()>0&&requested)wake=std::min(wake,state->next_allowed_tick);
             state->ready.wait_until(lock,wake,[&]{
                 const bool changed=state->stop||queue->revision()!=revision||
+                    state->controller_notifications.load(std::memory_order_acquire)!=controller_notifications||
                     state->requested.load(std::memory_order_acquire)!=requested||
                     state->coalesce_milliseconds.load(std::memory_order_acquire)!=coalesce.count()||
                     (ordinary&&ordinary->deadline()!=ordinary_at);
@@ -1162,14 +1317,21 @@ void synchronizer_base::start_pacer() {
             const bool ordinary_ready=ordinary&&now>=ordinary->deadline();
             const bool receiver_ready=receiver_tick&&now>=receiver_at;
             if(receiver_ready)receiver_at=now+std::chrono::milliseconds(100);
+            const bool notifications_ready=state->controller_notifications.exchange(false,std::memory_order_acq_rel);
             const bool upload=coalesce.count()>0&&now>=state->next_allowed_tick&&state->requested.exchange(false,std::memory_order_acq_rel);
             if(upload)state->next_allowed_tick=now+coalesce;
             lock.unlock();
             const auto generation=lifetime->dispatch_generation();
-            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready,ordinary,ordinary_ready,wait_schedule] {
+            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready,notifications_ready,ordinary,ordinary_ready,wait_schedule] {
                 on_error_handler error;
                 try {
-                    error=on_error_;
+                    error=copy_error_handler();
+                    // Drain bounded controller notice DATA on the existing
+                    // pacer, before any Native discovery/maintenance. Original
+                    // scheduler callbacks can run inline here, never on the
+                    // independent controller SQL progress lane.
+                    if((notifications_ready||receiver_ready)&&receiver_controller_)receiver_controller_->drain_notifications();
+                    if(!lifetime->current(generation))return;
                     if(ordinary_ready&&ordinary->expire())return;
                     if(maintenance) {
                         maybe_checkpoint();if(!lifetime->current(generation))return;
@@ -1711,7 +1873,7 @@ void synchronizer_base::on_websocket_open() {
     // Capture before any synchronous callback can retire this owner.
     const auto lifetime=callback_lifetime_;
     const auto generation=lifetime->dispatch_generation();
-    const auto state_change=on_state_change_;
+    const auto state_change=copy_state_handler();
     if(state_change)schedule_background("open notification",[state_change]{state_change(true);});
     if(!lifetime->current(generation))return;
 
@@ -1781,8 +1943,9 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 
         auto event = server_sent_event::from_json(json_str);
         if (!event) {
-            if (on_error_) {
-                const auto error=on_error_;schedule_background("parse error notification",[error] { error("Failed to parse server message"); });
+            const handler_snapshot<on_error_handler> selected(handler_creator_,handlers_);
+            if (selected) {
+                const auto error=*selected.get();schedule_background("parse error notification",[error] { error("Failed to parse server message"); });
             }
             return;
         }
@@ -1902,7 +2065,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 bool admission_busy=false;mark_as_synced_after_discovery_impl(ids,*protected_store,&admission_busy);
                 if(admission_busy)return false; // The same charged ACK/callback remains queued.
                 if(!route->current(generation))return true;
-                const auto completed=on_sync_complete_;
+                const auto completed=copy_completion_handler();
                 if(completed)completed(ids); // The callback may retire or replace its owner.
                 return true;
             });
@@ -1941,9 +2104,13 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
     } catch (const std::exception& e) {
         if(!lifetime->current(generation))return;
         LOG_ERROR("synchronizer", "on_transport_message failed: %s", e.what());
-        if (on_error_) {
+        const handler_snapshot<on_error_handler> selected(handler_creator_,handlers_);
+        if (selected) {
             std::string error_msg = e.what();
-            const auto error=on_error_;schedule_background("message error notification",[error, error_msg] { error("WebSocket message handling failed: " + error_msg); });
+            // what()/message allocation is arbitrary work after the first
+            // check. Revalidate before the original opaque handler copy.
+            if(!selected)return;
+            const auto error=*selected.get();schedule_background("message error notification",[error, error_msg] { error("WebSocket message handling failed: " + error_msg); });
         }
     } catch (...) {
         LOG_ERROR("synchronizer", "on_transport_message failed with unknown error");
@@ -1956,7 +2123,7 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
 #ifndef __EMSCRIPTEN__
         struct renewal_on_exit {std::shared_ptr<detail::configured_attempt> attempt;~renewal_on_exit(){if(attempt)attempt->request_renewal();}} renewal{lifetime->configured_attempt_owner()};
 #endif
-        const auto generation=lifetime->dispatch_generation();const auto callback=on_error_;
+        const auto generation=lifetime->dispatch_generation();const auto callback=copy_error_handler();
         is_connected_=false;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->clear_ids_locked();progress_pending_upload_.store(0);}
         retire_protected_transport();
@@ -2003,8 +2170,9 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
     fire_progress();
     if(!lifetime->current(generation))return;
 
-    if (on_error_) {
-        const auto callback=on_error_;const auto scheduled=scheduler_;
+    const handler_snapshot<on_error_handler> selected(handler_creator_,handlers_);
+    if (selected) {
+        const auto callback=*selected.get();const auto scheduled=scheduler_;
         scheduled->invoke([callback, error] { callback(error); });
     }
     if(!lifetime->current(generation))return;
@@ -2019,7 +2187,7 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
 #ifndef __EMSCRIPTEN__
         struct renewal_on_exit {std::shared_ptr<detail::configured_attempt> attempt;~renewal_on_exit(){if(attempt)attempt->request_renewal();}} renewal{lifetime->configured_attempt_owner()};
 #endif
-        const auto generation=lifetime->dispatch_generation();const auto callback=on_state_change_;
+        const auto generation=lifetime->dispatch_generation();const auto callback=copy_state_handler();
         is_connected_=false;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->clear_ids_locked();progress_pending_upload_.store(0);}
         retire_protected_transport();
@@ -2047,8 +2215,9 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
     fire_progress();
     if(!lifetime->current(generation))return;
 
-    if (on_state_change_) {
-        const auto callback=on_state_change_;const auto scheduled=scheduler_;
+    const handler_snapshot<on_state_change_handler> selected(handler_creator_,handlers_);
+    if (selected) {
+        const auto callback=*selected.get();const auto scheduled=scheduler_;
         scheduled->invoke([callback] { callback(false); });
     }
     if(!lifetime->current(generation))return;
@@ -3585,7 +3754,7 @@ void synchronizer_base::mark_as_synced_after_discovery_impl(const std::vector<st
         if(receiver_source_&&continuous_route_)receiver_source_->request_upload();
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(size_t n=0;n<matched.size();++n)upload_tracking_->erase_locked(matched[n],generation,registrations[n],false);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
         progress_acked_.fetch_add(static_cast<int64_t>(matched.size()));ack_resend_failures_.store(0);
-        if(receiver_controller_)receiver_controller_->request();
+        if(receiver_controller_)receiver_controller_->legacy_delivery_acknowledged();
         schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;background_upload();});
         return; // No canonical receipt, floor advance or eager audit cleanup.
     }
@@ -3723,7 +3892,7 @@ void synchronizer_base::mark_ordinary_as_synced(const std::vector<detail::ordina
         last_matching_ack_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         progress_acked_.fetch_add(static_cast<int64_t>(matched));ack_resend_failures_=0;
     }
-    const auto completed=on_sync_complete_;
+    const auto completed=copy_completion_handler();
     if(completed&&!settled_ids.empty())completed(settled_ids);
     if(!lifetime->current(generation))return;
     schedule_background("ordinary ACK continuation",[this]{if(!is_destroyed_)background_upload();});
@@ -5413,8 +5582,14 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         change_buffer_.resize(buffered_before_entry);
                     }
                     writer->txn_dirty_.store(dirty_before_entry, std::memory_order_relaxed);
-                    if (!had_unknown_link) link_tables_unknown_target_.erase(entry.table_name);
-                    if (!had_virtual_link) virtual_link_tables_.erase(entry.table_name);
+                    if (!had_unknown_link) {
+                        const auto found=link_tables_unknown_target_.find(std::string_view(entry.table_name.data(),entry.table_name.size()));
+                        if(found!=link_tables_unknown_target_.end())link_tables_unknown_target_.erase(found);
+                    }
+                    if (!had_virtual_link) {
+                        const auto found=virtual_link_tables_.find(std::string_view(entry.table_name.data(),entry.table_name.size()));
+                        if(found!=virtual_link_tables_.end())virtual_link_tables_.erase(found);
+                    }
                     tables_ensured.clear();
                     vec0_ensured.clear();
                     schema_cache.clear();
@@ -5503,8 +5678,14 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     }
                     hook.sync_chunk = nullptr;
                     if (chunk.state == chunk_state::phase::rolled_back) {
-                        for (const auto& name : new_unknown_links) link_tables_unknown_target_.erase(name);
-                        for (const auto& name : new_virtual_links) virtual_link_tables_.erase(name);
+                        for (const auto& name : new_unknown_links) {
+                            const auto found=link_tables_unknown_target_.find(std::string_view(name.data(),name.size()));
+                            if(found!=link_tables_unknown_target_.end())link_tables_unknown_target_.erase(found);
+                        }
+                        for (const auto& name : new_virtual_links) {
+                            const auto found=virtual_link_tables_.find(std::string_view(name.data(),name.size()));
+                            if(found!=virtual_link_tables_.end())virtual_link_tables_.erase(found);
+                        }
                     }
                     throw;
                 }

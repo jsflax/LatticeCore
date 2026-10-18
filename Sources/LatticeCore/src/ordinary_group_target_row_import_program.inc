@@ -14,7 +14,10 @@ ordinary_group_target_schema_original::require_row_import(const ordinary_target_
 }
 void ordinary_export_access::prepare_receiver_group_target_row_import(const ordinary_group_target_schema_original& original,
     const ordinary_target_staging_connection& connection,ordinary_launch::deadline end) {
-    creator_check();original.require_connection(connection,end);const auto held=original.state_;const auto request=held->request.lock();
+    creator_check();
+    if(ordinary_initialization_storage_scope::debit_scope_active())
+        throw ordinary_initialization_storage_error("startup cannot enter generic GROUP row import producer");
+    original.require_connection(connection,end);const auto held=original.state_;const auto request=held->request.lock();
     require(request&&request->state_->target_schema.get()==&original,"GROUP row programme actual request retired");
     const auto receiving=std::atomic_load(&request->state_->group_receiver);
     require(receiving&&request->state_->staging_connection.get()==&connection,"GROUP row programme actual connection differs");
@@ -35,7 +38,7 @@ void ordinary_export_access::prepare_receiver_group_target_row_import(const ordi
             const auto& wire=actual.tables[position++];const auto& physical=projection->metadata->tables.at(name);
             require(wire.name==name&&wire.columns.size()==logical.columns.size()&&wire.types.size()==logical.columns.size(),
                 "GROUP row programme actual logical corroboration differs");
-            out->tables.emplace_back();auto& table=out->tables.back();table.name=name;out->add(table.name.capacity());table.local_id=logical.local_id;
+            out->tables.emplace_back();auto& table=out->tables.back();table.name=ordinary_initialization_legacy_text(name);out->add(table.name.capacity());table.local_id=logical.local_id;
             out->add(logical.columns.size()*(sizeof(std::string)+sizeof(column_type)+sizeof(bool)));
             table.columns.reserve(logical.columns.size());table.types.reserve(logical.columns.size());table.required.reserve(logical.columns.size());
             if(table.columns.capacity()>logical.columns.size())out->add((table.columns.capacity()-logical.columns.size())*sizeof(std::string));
@@ -45,7 +48,7 @@ void ordinary_export_access::prepare_receiver_group_target_row_import(const ordi
                 const auto& column=logical.columns[c];require(wire.columns[c]==column.name&&wire.types[c]==column.type,"GROUP row actual column differs");
                 const auto actual=std::find_if(physical.columns.begin(),physical.columns.end(),[&](const auto& value){return value.name==column.name;});
                 require(actual!=physical.columns.end(),"GROUP row actual physical column missing");
-                table.columns.push_back(column.name);out->add(table.columns.back().capacity());table.types.push_back(column.type);table.required.push_back(actual->not_null!=0);
+                table.columns.push_back(ordinary_initialization_legacy_text(column.name));out->add(table.columns.back().capacity());table.types.push_back(column.type);table.required.push_back(actual->not_null!=0);
             }
             // SAME exact normal absent-row INSERT expression; no logical ID is
             // copied into the fresh target's local autoincrement identity.

@@ -283,3 +283,19 @@ TEST(RecoveryObligationProducer, AddressedReadStillChecksFullManifestChargeAndEn
     f.owner->db().execute("UPDATE _lattice_obligation_producer_profile SET manifest=?",{f.profile.grant_manifest});EXPECT_EQ(f.image(),before);
     f.committed([&](auto&){auto storage=f.storage();auto changed=f.profile;changed.grant_manifest[0]^=1;refuses(error::conflict,[&]{access::enroll(storage,changed);});EXPECT_TRUE(f.stamp(r));});
 }
+
+TEST(RecoveryObligationProducer, BootstrapValidatorRetainsExactPrimaryAfterActualRollback){
+    auto physical=std::make_shared<lattice::database>(":memory:");
+    recovery_obligation_producer_discovery_limits caps{{4,128,256,2*1024*1024},{4,256,65536},{4,128,256,4096,2*1024*1024}};
+    struct actual_primary {};
+    const auto primary=std::make_exception_ptr(actual_primary{});std::exception_ptr observed;
+    bool entered=false;
+    try {access::bootstrap(physical,caps,[&](auto& actual,const auto& facts){
+        entered=true;EXPECT_EQ(&actual,physical.get());EXPECT_FALSE(facts.initialized);EXPECT_TRUE(actual.is_in_transaction());
+        std::rethrow_exception(primary);
+    });FAIL()<<"actual validator primary must escape";}
+    catch(...){observed=std::current_exception();}
+    EXPECT_TRUE(entered);EXPECT_EQ(observed,primary);EXPECT_FALSE(physical->is_in_transaction());
+    // This checks genuine normal cleanup/identity, not quarantine injection or
+    // a manufactured secondary failure. Those real-fault controls stay UNRUN.
+}

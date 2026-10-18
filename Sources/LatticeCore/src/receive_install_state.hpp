@@ -12,6 +12,7 @@ namespace lattice {
 class lattice_db;
 class database;
 namespace detail {
+class recovery_obligation_bootstrap_reader;
 
 // Inactive receiver bookkeeping, not authentication or an automatic recovery
 // controller. All byte strings are opaque, length-exact identifiers/digests.
@@ -81,6 +82,8 @@ struct receive_install_usage {
 
 class receive_install_store {
     friend class recovery_obligation_store;
+    friend class recovery_obligation_bootstrap_reader;
+    static receive_install_usage bind_enrollment_(recovery_obligation_bootstrap_reader&);
     // Caller must supply the actual owning shared_ptr, never a no-op-deleter
     // alias for a borrowed/stack object. Every call retains this owner.
     std::shared_ptr<lattice_db> owner_;

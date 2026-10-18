@@ -6,6 +6,7 @@ namespace lattice {
 struct database::target_staging_state::import_suspension_native {
     using program_type=detail::ordinary_group_target_schema_original::import_suspension_program;
     using purpose=program_type::purpose;
+    terminal_native_static_tail terminal_static; // FIRST: actual Native member tail, no shared-owner ending grant.
     database* const shell;
     const std::weak_ptr<detail::ordinary_group_target_receiving_owner> owner;
     const std::weak_ptr<detail::ordinary_group_target_schema_original> schema;
@@ -34,7 +35,7 @@ struct database::target_staging_state::import_suspension_native {
     std::exception_ptr first_failure;
     import_suspension_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
         const std::shared_ptr<detail::ordinary_group_target_schema_original>& original,const std::shared_ptr<program_type>& input)
-        :shell(&actual),owner(receiving),schema(original),program(input),commit(input->operations.size()+1),rollback(commit+1) {
+        :terminal_static(actual,this,original.get(),3,receiving),shell(&actual),owner(receiving),schema(original),program(input),commit(input->operations.size()+1),rollback(commit+1) {
         const auto state=actual.target_staging_;
         if(!state||!state->history_chain||!state->history_chain->active||!program||
            program->operations.size()>program_type::maximum_operations)
@@ -54,6 +55,7 @@ struct database::target_staging_state::import_suspension_native {
             if(operation.kind==purpose::require_absent)statement.binding=&operation.name;
         }
         // Every VM/call/rollback slot is charged and retained before BEGIN.
+        terminal_static.constructor_returned();
     }
     void add(std::size_t n) {
         if(n>ordinary_history_limits::stage_scratch_bytes-logical_bytes)
@@ -99,7 +101,7 @@ struct database::target_staging_state::import_suspension_native {
             throw db_error("GROUP import suspension actual generated statement reissue/shape refused");
         require(actual,unwind);auto& call=reserve(kind::prepare,index,unwind);require(actual,unwind);
         const char* tail=nullptr;statement.prepare_entered=true;call.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(actual.db_,sql->data(),static_cast<int>(sql->size()),&statement.held,&tail);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(actual.db_,sql->data(),static_cast<int>(sql->size()),&statement.held,&tail);
         statement.prepared_identity=statement.held;statement.prepare_returned=true;returned(call,statement.prepare_rc);
         require(actual,unwind);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held||tail!=sql->data()+sql->size())
@@ -122,7 +124,7 @@ struct database::target_staging_state::import_suspension_native {
     }
     int step(database& actual,std::size_t index,bool unwind=false) {
         auto& statement=statements[index];require(actual,unwind);auto& call=reserve(kind::step,index,unwind);require(actual,unwind);call.entered=true;
-        const int rc=sqlite3_step(statement.held);returned(call,rc);
+        const int rc=::lattice::detail::store_physical_step(statement.held);returned(call,rc);
         if(!statement.first_step_returned){statement.first_step_returned=true;statement.first_step_rc=rc;}
         if(rc!=SQLITE_ROW){statement.terminal_returned=true;statement.terminal_rc=rc;}
         if(index==begin)scope->record_schema_begin(actual,rc);
@@ -134,7 +136,7 @@ struct database::target_staging_state::import_suspension_native {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)return;
         require(actual,unwind);auto& call=reserve(kind::finalize,index,unwind);require(actual,unwind);
         statement.finalized_identity=statement.held;statement.finalize_entered=true;call.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
         if((statement.finalize_rc&0xff)!=SQLITE_MISUSE){statement.destruction_known=true;statement.held=nullptr;}
         scope->record_schema_finalized(actual,statement.finalize_rc);require(actual,unwind);
         // A returned non-MISUSE finalize has destroyed this SAME VM even
@@ -220,10 +222,10 @@ struct database::target_staging_state::import_suspension_native {
 };
 bool database::target_import_suspension_native_ending_()const noexcept {
     const auto state=target_staging_;const auto original=state?state->import_suspension:nullptr;
-    return state&&state->current_creator()&&original&&original->shell==this&&original->native_ending_known();
+    return state&&state->current_creator()&&!state->terminal_native_statics_attempted&&original&&original->shell==this&&original->native_ending_known();
 }
 bool database::target_import_suspension_cleanup_ending_()const noexcept {
-    const auto state=target_staging_;if(!state||!state->current_creator())return false;
+    const auto state=target_staging_;if(!state||!state->current_creator()||state->terminal_native_statics_attempted)return false;
     return !state->import_suspension||state->import_suspension->cleanup_known();
 }
 void database::require_target_import_suspension_issued_(const detail::ordinary_target_staging_connection& connection,

@@ -1,3 +1,5 @@
+#include <lattice/store_physical_api.hpp>
+#include "database_sql_dispatcher.hpp"
 #include "ordinary_export.hpp"
 #include "ordinary_target_staging_io.hpp"
 #include "ordinary_export_storage_access.hpp"
@@ -13,6 +15,7 @@
 #include "ordinary_projection_recipe.hpp"
 #include "ordinary_row_recipe.hpp"
 #include "ordinary_internal_schema.hpp"
+#include "observer_delivery_schema.hpp"
 #include "ordinary_vector_integrity.hpp"
 #include "ordinary_v2_property.hpp"
 #include "ordinary_v2_audit_json.hpp"
@@ -67,8 +70,8 @@ struct mutation_scope {
     ~mutation_scope(){mutation_owner=previous;}
 };
 [[noreturn]] void refuse(const char* reason){throw db_error(std::string("ordinary owned export: ")+reason);}
-std::string quote(const std::string& name) {
-    return ordinary_row_recipe::quote(name);
+std::string quote(std::string_view name) {
+    return ordinary_row_recipe::quote(ordinary_initialization_legacy_text(name));
 }
 
 struct budget {
@@ -104,8 +107,8 @@ using rows=std::vector<values>;
 rows read(sqlite3* handle,const std::string& sql,const values& parameters,
           size_t limit,budget& retained) {
     database::record_statement();sqlite3_stmt* raw=nullptr;
-    const int prepared=sqlite3_prepare_v2(handle,sql.c_str(),-1,&raw,nullptr);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const int prepared=::lattice::detail::store_physical_prepare_v2(handle,sql.c_str(),-1,&raw,nullptr);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(prepared!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw))refuse("capture requires a read-only prepared statement");
     if(sqlite3_bind_parameter_count(raw)!=static_cast<int>(parameters.size()))refuse("capture parameter shape changed");
     for(size_t n=0;n<parameters.size();++n) {
@@ -118,7 +121,7 @@ rows read(sqlite3* handle,const std::string& sql,const values& parameters,
     const int columns=sqlite3_column_count(raw);
     if(columns<1||columns>static_cast<int>(retained.limits.columns+2))refuse("capture column bound exceeded");
     rows result;int rc;
-    while((rc=sqlite3_step(raw))==SQLITE_ROW) {
+    while((rc=::lattice::detail::store_physical_step(raw))==SQLITE_ROW) {
         if(result.size()==limit)refuse("capture row bound exceeded");
         retained.add(sizeof(values)+static_cast<size_t>(columns)*sizeof(column_value_t));
         for(int c=0;c<columns;++c)retained.cell();
@@ -154,8 +157,8 @@ std::vector<database::row_t> read_metadata(sqlite3* handle,const std::string& sq
        sql.empty()||sql.size()>256*1024||parameters.size()>16||!limit||limit>262144)
         refuse("metadata adapter requires a bounded retained main view");
     database::record_statement();sqlite3_stmt* raw=nullptr;const char* tail=nullptr;
-    const int prepared=sqlite3_prepare_v2(handle,sql.data(),static_cast<int>(sql.size()),&raw,&tail);
-    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+    const int prepared=::lattice::detail::store_physical_prepare_v2(handle,sql.data(),static_cast<int>(sql.size()),&raw,&tail);
+    std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
     if(prepared!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||
        tail!=sql.data()+sql.size()||sqlite3_bind_parameter_count(raw)!=static_cast<int>(parameters.size()))
         refuse("metadata adapter statement shape changed");
@@ -177,7 +180,7 @@ std::vector<database::row_t> read_metadata(sqlite3* handle,const std::string& sq
         if(std::find(keys.begin(),keys.end()-1,keys.back())!=keys.end()-1)refuse("metadata duplicate column name");
     }
     std::vector<database::row_t> result;int rc;
-    while((rc=sqlite3_step(raw))==SQLITE_ROW) {
+    while((rc=::lattice::detail::store_physical_step(raw))==SQLITE_ROW) {
         if(result.size()==limit)refuse("metadata row bound exceeded before copy");
         retained.add(sizeof(database::row_t));database::row_t row;
         for(int c=0;c<count;++c) {
@@ -237,7 +240,7 @@ bool inspect_storage(sqlite3* handle,budget& b) {
     return true;
 }
 void register_mutation_guard(sqlite3* handle) {
-    const int rc=sqlite3_create_function_v2(handle,"lattice_ordered_export_owned_v1",0,SQLITE_UTF8,
+    const int rc=::lattice::detail::store_physical_create_function_v2(handle,"lattice_ordered_export_owned_v1",0,SQLITE_UTF8,
         nullptr,[](sqlite3_context* context,int,sqlite3_value**) noexcept {
             if(mutation_owner==sqlite3_context_db_handle(context))sqlite3_result_int(context,1);
             else sqlite3_result_error(context,"ordered source mutation requires its owned export turn",-1);
@@ -585,12 +588,14 @@ void validate_original_descriptors(const ordinary_export_frame& frame,const reco
 using projected_row_index=std::map<std::string_view,const values*,ordinary_identifier_less>;
 void validate_projected_values(const ordinary_export_frame& frame,const ordinary_schema_projection& projection,
     const ordinary_schema_metadata& metadata,const recovery_owner_schema& catalog,budget& retained) {
+    if(ordinary_initialization_storage_scope::debit_scope_active())
+        throw ordinary_initialization_storage_error("startup cannot enter generic projection adapter");
     if(frame.tables.size()!=projection.tables.size())refuse("logical table projection differs");
     size_t position=0,total=0;
     for(const auto& [name,logical]:projection.tables) {
         const auto& table=frame.tables[position++];
         if(table.name!=name||table.columns.size()!=logical.columns.size()||table.types.size()!=logical.columns.size())refuse("logical column projection differs");
-        const auto& physical=metadata.tables.at(name);std::vector<bool> required;
+        const auto& physical=ordinary_initialization_map_at(metadata.tables,std::string_view(name));std::vector<bool> required;
         retained.add(logical.columns.size()*sizeof(bool));required.reserve(logical.columns.size());
         for(size_t c=0;c<logical.columns.size();++c) {
             const auto& declared=logical.columns[c];
@@ -610,7 +615,9 @@ void validate_projected_values(const ordinary_export_frame& frame,const ordinary
         }
     }
     if(total!=frame.rows)refuse("logical row count differs");
-    for(const auto& name:projection.models)for(const auto& p:catalog.find(name)->properties) {
+    for(const auto& model_name:projection.models) {
+        const auto name=ordinary_initialization_legacy_text(model_name);
+        for(const auto& p:catalog.find(name)->properties) {
         const bool poly=p.kind==property_kind::virtual_link||p.kind==property_kind::virtual_list;
         const bool link=poly||((p.kind==property_kind::link||p.kind==property_kind::list)&&!p.is_geo_bounds&&!p.target_table.empty());
         if(!link)continue;
@@ -626,19 +633,22 @@ void validate_projected_values(const ordinary_export_frame& frame,const ordinary
                 retained.add(sizeof(std::string_view));
                 if(!parents.insert(text(row[1])).second)refuse("to-one relationship has multiple targets");
             }
-            if(poly&&!std::binary_search(projection.models.begin(),projection.models.end(),text(row[3])))
+            if(poly&&!std::binary_search(projection.models.begin(),projection.models.end(),text(row[3]),ordinary_initialization_text_less{}))
                 refuse("polymorphic relationship leaves the actual declared scope");
         }
+    }
     }
 }
 void capture_projected_tables(sqlite3* handle,const recovery_owner_schema& catalog,
     const std::function<void(std::ostringstream&,const property_descriptor&)>& serialize,
     const std::vector<std::string>& names,ordinary_export_frame& frame,budget& retained,bool include_values,
     ordinary_schema_projection* retained_projection,ordinary_schema_metadata* retained_metadata) {
+    if(ordinary_initialization_storage_scope::debit_scope_active())
+        throw ordinary_initialization_storage_error("startup cannot enter generic projection adapter");
     try {
         auto projection=describe_ordinary_projection(catalog,names);retained.add(projection.logical_bytes);
         const ordinary_metadata_query query=[&](const auto& sql,const auto& args,size_t limit){return read_metadata(handle,sql,args,limit,retained);};
-        auto metadata=validate_ordinary_schema(projection,query);
+        auto metadata=observer_delivery_schema::validate(catalog,projection,query);
         // Both validators run synchronously on this exact owned SQLite view,
         // before any source-cut or receiver-ledger mutation. Module validation
         // must precede the internal helper validator's broader FK inspection.
@@ -664,6 +674,8 @@ void capture_projected_tables(sqlite3* handle,const recovery_owner_schema& catal
 void materialize_projected(database& writer,const ordinary_export_frame& before,const ordinary_export_frame& incoming,
     const ordinary_schema_projection& projection,const ordinary_schema_metadata& metadata,
     const recovery_owner_schema& catalog,budget& retained) {
+    if(ordinary_initialization_storage_scope::debit_scope_active())
+        throw ordinary_initialization_storage_error("startup cannot enter generic projection adapter");
     auto* handle=ordinary_export_storage_access::borrow(writer);
     // Derive absent vector dimensions only from actual incoming float bytes.
     // Existing local module options/dimensions remain locally authoritative.
@@ -686,7 +698,7 @@ void materialize_projected(database& writer,const ordinary_export_frame& before,
                 if(!std::isfinite(number))refuse("derived vector contains nonfinite float");
             }
         }
-        retained.add(sizeof(std::pair<const std::string,size_t>)+derived.table.size());vector_dimensions.emplace(derived.table,dimensions);
+        retained.add(sizeof(std::pair<const std::string,size_t>)+derived.table.size());vector_dimensions.emplace(ordinary_initialization_legacy_text(derived.table),dimensions);
     }
     retained.add(2*incoming.tables.size()*sizeof(projected_row_index));
     std::vector<projected_row_index> prior(incoming.tables.size()),next(incoming.tables.size());
@@ -734,7 +746,8 @@ void materialize_projected(database& writer,const ordinary_export_frame& before,
         }
     }
     // Link shadows are local derived values, never incoming row authority.
-    for(const auto& name:projection.models)for(const auto& shadow:projection.tables.at(name).shadow_columns) {
+    for(const auto& model_name:projection.models)for(const auto& shadow:projection.tables.at(model_name).shadow_columns) {
+        const auto name=ordinary_initialization_legacy_text(model_name);
         const auto& model=*catalog.find(name);
         const auto property=std::find_if(model.properties.begin(),model.properties.end(),[&](const auto& p){return p.kind==property_kind::link&&p.name+"__link_gid"==shadow;});
         if(property==model.properties.end())refuse("validated link shadow declaration missing");
@@ -747,7 +760,7 @@ void materialize_projected(database& writer,const ordinary_export_frame& before,
             writer.execute("INSERT INTO "+table+'('+quote(derived.table)+") VALUES('rebuild')");
             writer.execute("INSERT INTO "+table+'('+quote(derived.table)+",rank) VALUES('integrity-check',1)");
         } else if(derived.kind==ordinary_derived_kind::vector) {
-            const auto dimensions=vector_dimensions.at(derived.table);
+            const auto dimensions=vector_dimensions.at(ordinary_initialization_legacy_text(derived.table));
             if(!derived.present&&!dimensions)continue;
             // DELETE/full-scan only walks vec0's rowid map. It cannot clear
             // orphan validity slots that KNN reads directly. Recreate the
@@ -755,17 +768,17 @@ void materialize_projected(database& writer,const ordinary_export_frame& before,
             // all shadow data starts empty in this same rollbackable turn.
             if(derived.present) {
                 writer.execute("DROP TABLE "+table);
-                writer.execute(derived.create_sql);
-            } else writer.execute(vec0_create_table_program(derived.table,static_cast<int>(dimensions),0,0));
+                writer.execute(ordinary_initialization_legacy_text(derived.create_sql));
+            } else writer.execute(vec0_create_table_program(ordinary_initialization_legacy_text(derived.table),static_cast<int>(dimensions),0,0));
             const auto column=quote(derived.property),predicate=column+" IS NOT NULL AND length("+column+")>0";
             writer.execute("INSERT INTO "+table+"(global_id,embedding) SELECT globalId,"+column+" FROM "+model+" WHERE "+predicate);
             const auto expected=read(handle,"SELECT globalId,"+column+" FROM "+model+" WHERE "+predicate+" ORDER BY CAST(globalId AS BLOB)",{},retained.limits.rows,retained);
             const auto actual=read(handle,"SELECT global_id,embedding FROM "+table+" ORDER BY CAST(global_id AS BLOB)",{},retained.limits.rows,retained);
             if(actual!=expected)refuse("rebuilt vector content differs from installed rows");
-            if(!derived.present)for(const auto& sql:vec0_program(derived.model,derived.property).sql)writer.execute(sql);
+            if(!derived.present)for(const auto& sql:vec0_program(ordinary_initialization_legacy_text(derived.model),ordinary_initialization_legacy_text(derived.property)).sql)writer.execute(sql);
         } else {
-            const auto& logical=projection.tables.at(derived.model);
-            const auto prefix=logical.role==ordinary_projection_role::geographic_list?std::string{}:derived.property+"_";
+            const auto& logical=ordinary_initialization_map_at(projection.tables,std::string_view(derived.model));
+            const auto prefix=logical.role==ordinary_projection_role::geographic_list?std::string{}:ordinary_initialization_legacy_text(derived.property)+"_";
             const std::array<std::string,4> fields{prefix+"minLat",prefix+"maxLat",prefix+"minLon",prefix+"maxLon"};
             std::string columns;for(const auto& field:fields){columns+=',';columns+=quote(field);}
             const auto predicate=logical.role==ordinary_projection_role::geographic_list?std::string{}:" WHERE "+quote(fields[0])+" IS NOT NULL";
@@ -773,14 +786,14 @@ void materialize_projected(database& writer,const ordinary_export_frame& before,
             writer.execute("INSERT INTO "+table+"(id,minLat,maxLat,minLon,maxLon) SELECT id"+columns+" FROM "+model+predicate);
             const auto count=read(handle,"SELECT (SELECT COUNT(*) FROM "+table+"),(SELECT COUNT(*) FROM "+model+predicate+")",{},1,retained);
             if(count.size()!=1||count[0][0]!=count[0][1])refuse("rebuilt geographic row count differs");
-            const auto check=read(handle,"SELECT rtreecheck('main',?)",{derived.table},1,retained);
+            const auto check=read(handle,"SELECT rtreecheck('main',?)",{ordinary_initialization_legacy_text(derived.table)},1,retained);
             if(check.size()!=1||text(check[0][0])!="ok")refuse("rebuilt geographic index integrity differs");
         }
     }
-    for(const auto& object:metadata.objects)if(object.type=="trigger")writer.execute(object.sql);
+    for(const auto& object:metadata.objects)if(object.type=="trigger")writer.execute(ordinary_initialization_legacy_text(object.sql));
     // Explicit generated uniqueness is restored after every swap and link
     // shadow is installed. PK/globalId autoindexes were never suspended.
-    for(const auto& index:metadata.unique_indexes)writer.execute(index.create_sql);
+    for(const auto& index:metadata.unique_indexes)writer.execute(ordinary_initialization_legacy_text(index.create_sql));
 }
 std::string entry_fingerprint(const audit_log_entry& entry){
     fingerprint hash;hash.bytes(std::string(entry.original_identity?"ordinary-origin-identity-v2":"ordinary-origin-v1"));hash.entry(entry);
@@ -1344,6 +1357,20 @@ void hydrate_canonical_original(ordinary_wire_original_turn& turn,const std::str
 
 #include "ordinary_delivery_storage.inc"
 
+void observer_delivery_schema::validate_database(database& writer,const recovery_owner_schema& catalog) {
+    auto* handle=ordinary_export_storage_access::borrow(writer);
+    if(!handle||sqlite3_get_autocommit(handle)!=0||sqlite3_txn_state(handle,"main")==SQLITE_TXN_NONE)
+        refuse("delivery schema validation requires the caller's actual retained main transaction");
+    budget retained;
+    auto projection=describe_ordinary_projection(catalog,{});retained.add(projection.logical_bytes);
+    const ordinary_metadata_query query=[&](const auto& sql,const auto& args,size_t limit) {
+        return read_metadata(handle,sql,args,limit,retained);
+    };
+    auto metadata=validate(catalog,projection,query);
+    const auto internal=validate_ordinary_internal_schema(catalog,projection,metadata,query);
+    retained.add(metadata.copied_bytes);retained.add(internal.copied_bytes);
+}
+
 void ordinary_wire_original_turn::finish() {
     auto& s=*state_;s.usable();
     if(s.current_usage&&original_capacity(s.writer,false,s.retained)!=*s.current_usage)refuse("canonical current final capacity changed");
@@ -1489,6 +1516,8 @@ std::vector<audit_log_entry> ordinary_export_access::upload_query(database& writ
     const std::function<std::vector<audit_log_entry>()>& body,bool exact_originals) {
     // The caller retains this exact physical wrapper (and its parent, if any)
     // through this synchronous call. No borrowed pointer/callback escapes.
+    store_physical_native_scope physical_call(writer);
+    if(!physical_call.entered())refuse("resource Native caller original unavailable");
     std::vector<audit_log_entry> result;std::exception_ptr failure;bool delivery_owned=false;
     try {
         auto* handle=ordinary_export_storage_access::borrow(writer);auto* mutex=handle?sqlite3_db_mutex(handle):nullptr;
@@ -1510,6 +1539,10 @@ std::vector<audit_log_entry> ordinary_export_access::upload_query(database& writ
         }
         for(auto* statement=sqlite3_next_stmt(handle,nullptr);statement;statement=sqlite3_next_stmt(handle,statement))
             if(sqlite3_stmt_busy(statement)&&!sqlite3_stmt_readonly(statement))refuse("upload cannot reenter an active mutation");
+        // Denial-only classification precedes the upload cursor. A protected
+        // read-only owner must refuse without first running an export query.
+        // Keep the same physical mutex and all later per-route guards.
+        require_continuous_legacy_export_absent(writer);
         const int autocommit=sqlite3_get_autocommit(handle);
         const auto changes=sqlite3_total_changes64(handle);
         // COUNT always produces one ROW, including genuine absence. Retaining
@@ -1518,8 +1551,8 @@ std::vector<audit_log_entry> ordinary_export_access::upload_query(database& writ
         // upgraded or settled here, including a caller's explicit READ/WRITE.
         static constexpr const char* presence_sql="SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB '_lattice_ordered_receiver*' OR tbl_name GLOB '_lattice_ordered_receiver*' OR name GLOB '_lattice_ordered_helper*' OR tbl_name GLOB '_lattice_ordered_helper*' OR name GLOB '_lattice_ordered_wire*' OR tbl_name GLOB '_lattice_ordered_wire*'";
         database::engine_query_scope pin(writer,true);delivery_owned=true;sqlite3_stmt* raw=nullptr;
-        database::record_statement();const int prepared=sqlite3_prepare_v2(handle,presence_sql,-1,&raw,nullptr);pin.adopt(raw);
-        if(prepared!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||sqlite3_step(raw)!=SQLITE_ROW||
+        database::record_statement();const int prepared=::lattice::detail::store_physical_prepare_v2(handle,presence_sql,-1,&raw,nullptr);pin.adopt(raw);
+        if(prepared!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||::lattice::detail::store_physical_step(raw)!=SQLITE_ROW||
            sqlite3_column_type(raw,0)!=SQLITE_INTEGER)refuse("upload could not pin its actual main read view");
         const auto presence=sqlite3_column_int64(raw,0);
         const int transaction=sqlite3_txn_state(handle,"main");
@@ -1655,6 +1688,8 @@ owned_server_export ordinary_export_access::capture_wire(lattice_db& owner,const
     if(!result)refuse("wire capture was not issued");return std::move(*result);
 }
 std::vector<std::string> ordinary_export_access::observation_tables(lattice_db& owner,const std::vector<std::string>& requested) {
+    if(ordinary_initialization_storage_scope::debit_scope_active())
+        throw ordinary_initialization_storage_error("startup cannot enter generic projection adapter");
     if(!owner.recovery_schemas_.valid()||requested.size()>recovery_owner_schema::max_models)
         refuse("observation catalog or scope unavailable");
     std::vector<std::string> names;
@@ -1670,6 +1705,8 @@ std::vector<std::string> ordinary_export_access::observation_tables(lattice_db& 
     if(std::adjacent_find(names.begin(),names.end())!=names.end())refuse("duplicate observation model");
     std::shared_ptr<database> writer;
     {std::lock_guard lock(owner.connection_ownership_mutex_);if(owner.closed_.load()||!owner.db_)refuse("observation owner closed");writer=owner.db_;}
+    store_physical_native_scope physical_call(*writer);
+    if(!physical_call.entered())refuse("resource Native caller original unavailable");
     std::vector<std::string> result;std::exception_ptr failure;bool delivery_owned=false;
     try {
         auto* handle=ordinary_export_storage_access::borrow(*writer);auto* mutex=handle?sqlite3_db_mutex(handle):nullptr;
@@ -1691,8 +1728,8 @@ std::vector<std::string> ordinary_export_access::observation_tables(lattice_db& 
         // Retain a real main-schema ROW across every metadata lookup. This
         // does not begin, upgrade, commit or roll back the caller's turn.
         database::engine_query_scope pin(*writer,true);delivery_owned=true;sqlite3_stmt* raw=nullptr;
-        database::record_statement();const int prepared=sqlite3_prepare_v2(handle,"SELECT COUNT(*) FROM main.sqlite_master",-1,&raw,nullptr);pin.adopt(raw);
-        if(prepared!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||sqlite3_step(raw)!=SQLITE_ROW||
+        database::record_statement();const int prepared=::lattice::detail::store_physical_prepare_v2(handle,"SELECT COUNT(*) FROM main.sqlite_master",-1,&raw,nullptr);pin.adopt(raw);
+        if(prepared!=SQLITE_OK||!raw||!sqlite3_stmt_readonly(raw)||::lattice::detail::store_physical_step(raw)!=SQLITE_ROW||
            sqlite3_column_type(raw,0)!=SQLITE_INTEGER)refuse("observation could not pin its actual main read view");
         const int transaction=sqlite3_txn_state(handle,"main");
         if(transaction!=SQLITE_TXN_READ&&transaction!=SQLITE_TXN_WRITE)refuse("observation main read view unavailable");
@@ -1703,11 +1740,11 @@ std::vector<std::string> ordinary_export_access::observation_tables(lattice_db& 
             // Metadata only: main values, AuditLog and source/receiver ledgers
             // are not read or mutated. The validator preflights owned module
             // definitions before targeted metadata can connect those modules.
-            (void)validate_ordinary_schema(projection,[&](const auto& sql,const auto& args,size_t limit){
+            (void)observer_delivery_schema::validate(owner.recovery_schemas_,projection,[&](const auto& sql,const auto& args,size_t limit){
                 return read_metadata(handle,sql,args,limit,retained);
             });
             retained.add(projection.tables.size()*sizeof(std::string));result.reserve(projection.tables.size());
-            for(const auto& [name,unused]:projection.tables){retained.add(name.size());result.push_back(name);}
+            for(const auto& [name,unused]:projection.tables){retained.add(name.size());result.push_back(ordinary_initialization_legacy_text(name));}
         } catch(const std::runtime_error& error) {
             throw db_error(std::string("ordinary observation schema: ")+error.what());
         }
@@ -1726,7 +1763,8 @@ recovery_owner_schema ordinary_export_access::managed_clone_catalog(lattice_db& 
     if(parent.is_closed() || !parent.recovery_schemas_.valid() || !config.ordinary_context ||
         config.ordinary_context!=parent.config_.ordinary_context || config.path!=parent.config_.path ||
         config.is_sync_enabled() || config.is_ipc_enabled() || config.is_in_memory() ||
-        config.read_only!=parent.config_.read_only || config.audit_retention_seconds!=0)
+        config.read_only!=parent.config_.read_only || config.audit_retention_seconds!=0||
+        config.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes)
         refuse("managed attachment clone requires its actual parent configuration");
     const auto settled=recovery_writer_access::ordinary_owned_write(parent,[&](database& writer){
         const auto profile=parent.ordinary_managed_profile_.load(std::memory_order_acquire);
@@ -1769,6 +1807,7 @@ void ordinary_export_access::admit_managed_clone(lattice_db& parent,lattice_db& 
     if(&parent==&child || parent.is_closed() || child.is_closed() ||
         child.config_.ordinary_context!=parent.config_.ordinary_context ||
         child.config_.path!=parent.config_.path || child.config_.is_sync_enabled() || child.config_.is_ipc_enabled() ||
+        child.config_.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes ||
         child.ordinary_managed_profile_.load(std::memory_order_acquire))
         refuse("managed attachment clone publication refused");
     std::shared_ptr<const ordinary_managed_profile> retained;
@@ -1799,6 +1838,9 @@ bool ordinary_export_access::fresh_origin(const lattice_db& owner,const physical
 std::unique_ptr<lattice_db> ordinary_export_access::child(lattice_db& parent,const configuration& config,
     std::shared_ptr<ordinary_history_child_connections>* history_custody) {
     if(parent.is_closed()||!parent.recovery_schemas_.valid())refuse("ordinary child parent/catalog unavailable");
+    if((parent.config_.ordinary_context||parent.config_.wal_extent_limit_bytes)&&
+       config.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes)
+        refuse("ordinary child WAL extent policy differs from its retained parent");
     // The immutable catalog is the actual parent's declaration snapshot. The
     // unexposed child does not synthesize Swift declarations from physical SQL.
     std::unique_ptr<lattice_db> child;

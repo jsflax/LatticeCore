@@ -17,7 +17,7 @@ const column_value_t& value(const row& r,const char* key){const auto i=r.find(ke
 int64_t number(const row& r,const char* key){const auto* p=std::get_if<int64_t>(&value(r,key));need(p,"vector integrity integer required");return *p;}
 const std::string& text(const row& r,const char* key){const auto* p=std::get_if<std::string>(&value(r,key));need(p,"vector integrity text required");return *p;}
 const blob& bytes(const row& r,const char* key){const auto* p=std::get_if<blob>(&value(r,key));need(p,"vector integrity blob required");return *p;}
-std::string quoted(const std::string& s){need(!s.empty()&&s.size()<=256&&s.find('\0')==std::string::npos,"vector integrity identifier bound");std::string q="\"";for(char c:s){q+=c;if(c=='\"')q+='\"';}return q+'\"';}
+std::string ordinary_vector_identifier_sql_(std::string_view s){need(!s.empty()&&s.size()<=256&&s.find('\0')==std::string::npos,"vector integrity identifier bound");std::string q="\"";for(char c:s){q+=c;if(c=='\"')q+='\"';}return q+'\"';}
 void finite(const blob& b){need(b.size()%sizeof(float)==0,"vector integrity float width");for(size_t i=0;i<b.size();i+=sizeof(float)){float f;std::memcpy(&f,b.data()+i,sizeof(f));need(std::isfinite(f),"vector integrity nonfinite float");}}
 bool valid(const blob& b,size_t at){return (b[at/8]&(uint8_t{1}<<(at%8)))!=0;}
 int64_t slot_id(const blob& b,size_t at){int64_t n;std::memcpy(&n,b.data()+at*sizeof(n),sizeof(n));return n;}
@@ -50,9 +50,9 @@ ordinary_vector_integrity validate_ordinary_vector_integrity(const ordinary_deri
     need(d.kind==ordinary_derived_kind::vector&&d.present&&d.dimensions&&d.dimensions<=8192&&d.ivf_nlist<=65536&&
         (!d.ivf_nprobe||(d.ivf_nlist&&d.ivf_nprobe<=d.ivf_nlist))&&(!expect_trained||d.ivf_nlist),"vector integrity actual profile");
     static_assert(sizeof(float)==4&&sizeof(int64_t)==8);
-    const auto model="main."+quoted(d.model),column=quoted(d.property);
-    (void)quoted(d.table);
-    const auto shadow=[&](const char* suffix){return "main."+quoted(d.table+suffix);};
+    const auto model="main."+ordinary_vector_identifier_sql_(d.model),column=ordinary_vector_identifier_sql_(d.property);
+    (void)ordinary_vector_identifier_sql_(d.table);
+    const auto shadow=[&](const char* suffix){return "main."+ordinary_vector_identifier_sql_(d.table+suffix);};
     const size_t width=d.dimensions*sizeof(float);
     ordinary_vector_integrity result;reader read{query,limits,result};
     const auto main_cookie=read.cookie("main"),temp_cookie=read.cookie("temp");

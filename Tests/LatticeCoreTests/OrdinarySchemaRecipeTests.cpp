@@ -32,6 +32,9 @@ struct ordinary_schema_recipe_test_access {
     static std::string rtree_delete(){return ordinary_schema_recipe::rtree_delete("Places","area");}
     static std::string rtree_update(){return ordinary_schema_recipe::rtree_update("Places","area");}
     static std::vector<std::string> geographic_audit(){return ordinary_schema_recipe::geo_list_audit("_Places_regions");}
+    static std::string metadata(){return ordinary_schema_recipe::metadata_table();}
+    static std::string marker_store(){return ordinary_schema_recipe::metadata_marker_store();}
+    static std::string marker_prune(){return ordinary_schema_recipe::metadata_marker_prune();}
     static std::string receiver_store(){return ordinary_schema_recipe::receive_store();}
     static std::string receiver_channel(){return ordinary_schema_recipe::receive_channel();}
 };
@@ -137,4 +140,32 @@ TEST(OrdinarySchemaRecipeTests, ReceiveStoreAndChannelKeepStrictSeparateNativeSh
     EXPECT_THROW(db.execute("INSERT INTO _lattice_receive_guard VALUES(X'03',2,NULL,0,0,NULL)"),db_error);
     auto values=db.query("SELECT typeof(channel) AS storage FROM _lattice_receive_guard",{});ASSERT_EQ(values.size(),1u);
     EXPECT_EQ(std::get<std::string>(values[0].at("storage")),"blob");
+}
+
+TEST(OrdinarySchemaRecipeTests, SharedMarkerRecipesKeepExactLegacyPrograms) {
+    EXPECT_EQ(recipe_access::marker_store(),"INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)");
+    EXPECT_EQ(recipe_access::marker_prune(),"DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' AND key <> ? AND value <> ?");
+}
+TEST(OrdinarySchemaRecipeTests, MarkerReplacementAndPrunePreserveVersionSameCookieAndRollbackFullPrefix) {
+    // Genuine ordinary profile-free SQLite only. This checks the SAME shared
+    // producers' value semantics; it is not Host/private-operator activation.
+    database db(":memory:");db.execute(recipe_access::metadata());
+    const std::string current="schema_fingerprint:1111111111111111",stale="schema_fingerprint:2222222222222222",
+        equal="schema_fingerprint:3333333333333333";
+    db.execute("INSERT INTO _lattice_meta(key,value) VALUES('schema_version','7'),('caller_prefix','keep')");
+    db.execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)",{current,std::string("old")});
+    db.execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)",{stale,std::string("4")});
+    db.execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)",{equal,std::string("5")});
+    const auto image=[&] {
+        std::map<std::string,std::string> result;
+        for(const auto& row:db.query("SELECT key,value FROM _lattice_meta ORDER BY key"))
+            result.emplace(std::get<std::string>(row.at("key")),std::get<std::string>(row.at("value")));
+        return result;
+    };
+    const auto prefix=image();db.execute("BEGIN IMMEDIATE");
+    db.execute(recipe_access::marker_store(),{current,std::string("5")});
+    db.execute(recipe_access::marker_prune(),{current,std::string("5")});
+    const std::map<std::string,std::string> expected{{"schema_version","7"},{"caller_prefix","keep"},{current,"5"},{equal,"5"}};
+    EXPECT_EQ(image(),expected);EXPECT_FALSE(image().count(stale));
+    db.execute("ROLLBACK");EXPECT_EQ(image(),prefix);EXPECT_FALSE(db.is_in_transaction());
 }

@@ -1,8 +1,22 @@
+#include <lattice/store_physical_api.hpp>
+#include "database_sql_dispatcher.hpp"
 #include "ordinary_cohort_attachment.hpp"
 #include "recovery_local_producer.hpp"
+#include "recovery_obligation_bootstrap_statement.hpp"
+#include "recovery_resume_commit_publication.hpp"
 #include "recovery_admission_test_probe.hpp"
 #include "recovery_producer_continuity.hpp"
+#include "observer_delivery_startup_test_probe.hpp"
+#include "ordinary_schema_projection.hpp"
+#include "ordinary_resource_normal_startup.hpp"
+#include <cstddef>
+#include <new>
+#include <thread>
 #include "recovery_receiver_controller.hpp"
+#ifndef __EMSCRIPTEN__
+#include "controller_store_ending.hpp"
+#include <lattice/native_retirement_storage.hpp>
+#endif
 #include "recovery_request_store.hpp"
 #ifndef __EMSCRIPTEN__
 #include "configured_recovery_connection.hpp"
@@ -26,9 +40,13 @@
 #include <utility>
 
 namespace lattice::detail {
+using bootstrap_kind=recovery_obligation_bootstrap_statement::kind;
 namespace recovery_local_producer_test_hooks {
 thread_local const authorizer_fault* fault=nullptr;
 thread_local void (*after_inventory)()=nullptr;
+// Production-null observation at the exact already-validated upgrade WRITE.
+// Tests may install the existing restricting authorizer fault for this owner.
+thread_local void (*before_count_program_upgrade)(const lattice_db*)=nullptr;
 }
 namespace {
 using blob=std::vector<uint8_t>;
@@ -122,10 +140,10 @@ std::string program_name(const std::string& sql) {
     return s.substr(prefix.size(),e-prefix.size());
 }
 using programs=std::map<std::string,std::string>;
-programs actual_programs(database& db,const std::string& table) {
-    const auto budget=db.query("SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(sql AS BLOB))),0) AS bytes FROM (SELECT name,sql FROM main.sqlite_master WHERE type='trigger' AND tbl_name=? LIMIT 17)",{table});
+programs actual_programs(database& db,const std::string& table,recovery_obligation_bootstrap_reader* initialization=nullptr) {
+    const auto budget=(initialization?initialization->query_(bootstrap_kind::trigger_budget,{table}):db.query("SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(sql AS BLOB))),0) AS bytes FROM (SELECT name,sql FROM main.sqlite_master WHERE type='trigger' AND tbl_name=? LIMIT 17)",{table}));
     if(integer(budget.at(0),"n")>16||integer(budget.at(0),"bytes")>static_cast<int64_t>(max_manifest))refuse("local producer trigger bytes exceed allocation bound");
-    const auto rows=db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='trigger' AND tbl_name=? LIMIT 17",{table});
+    const auto rows=(initialization?initialization->query_(bootstrap_kind::trigger_programs,{table}):db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='trigger' AND tbl_name=? LIMIT 17",{table}));
     if(rows.size()>16)refuse("local producer trigger inventory bound");
     programs out;for(const auto& r:rows)out.emplace(text(r,"name"),normalize_sql(text(r,"sql")));return out;
 }
@@ -150,11 +168,11 @@ programs retention_programs() {
 }
 // This reads only fixed schema names and EXISTS, never stored payload bytes.
 // Call under the actual writer transaction for maintenance mutation admission.
-bool durable_producer_present(database& db) {
-    const auto family=db.query("SELECT name FROM main.sqlite_schema WHERE name IN ('_lattice_obligation_producer_store','_lattice_obligation_producer_profile','_lattice_obligation_producer_stamp') LIMIT 4");
+bool durable_producer_present(database& db,recovery_obligation_bootstrap_reader* initialization=nullptr) {
+    const auto family=(initialization?initialization->query_(bootstrap_kind::family,{}):db.query("SELECT name FROM main.sqlite_schema WHERE name IN ('_lattice_obligation_producer_store','_lattice_obligation_producer_profile','_lattice_obligation_producer_stamp') LIMIT 4"));
     if(family.empty())return false;
     if(family.size()!=3)refuse("local producer incomplete durable family");
-    return !db.query("SELECT 1 FROM main._lattice_obligation_producer_profile LIMIT 1").empty();
+    return !(initialization?initialization->query_(bootstrap_kind::producer_present,{}):db.query("SELECT 1 FROM main._lattice_obligation_producer_profile LIMIT 1")).empty();
 }
 // Read-only discovery deliberately avoids database::query(): its settled drain
 // may deliver the very legacy notification whose callback is asking this
@@ -164,20 +182,20 @@ struct discovery_statement {
     sqlite3_stmt* value=nullptr;
     explicit discovery_statement(sqlite3* db,const char* sql) {
         database::record_statement();
-        if(sqlite3_prepare_v2(db,sql,-1,&value,nullptr)!=SQLITE_OK) {
-            sqlite3_finalize(value);value=nullptr;
+        if(::lattice::detail::store_physical_prepare_v2(db,sql,-1,&value,nullptr)!=SQLITE_OK) {
+            ::lattice::detail::store_physical_finalize(value);value=nullptr;
             refuse("export discovery could not prepare read-only metadata");
         }
         if(!value||!sqlite3_stmt_readonly(value)) {
-            sqlite3_finalize(value);value=nullptr;
+            ::lattice::detail::store_physical_finalize(value);value=nullptr;
             refuse("export discovery requires read-only metadata statements");
         }
     }
-    ~discovery_statement(){sqlite3_finalize(value);}
+    ~discovery_statement(){::lattice::detail::store_physical_finalize(value);}
     discovery_statement(const discovery_statement&)=delete;
     discovery_statement& operator=(const discovery_statement&)=delete;
     bool row() {
-        const int rc=sqlite3_step(value);
+        const int rc=::lattice::detail::store_physical_step(value);
         if(rc==SQLITE_ROW)return true;
         if(rc!=SQLITE_DONE)refuse("export discovery could not read current metadata");
         return false;
@@ -246,8 +264,8 @@ bool discovery_family_present(sqlite3* db,bool admitted_profiles) {
         refuse("export discovery dormant producer family is not empty");
     return false;
 }
-void validate_retention_programs(database& db,bool required) {
-    const auto actual=actual_programs(db,"AuditLog");
+void validate_retention_programs(database& db,bool required,recovery_obligation_bootstrap_reader* initialization=nullptr) {
+    const auto actual=actual_programs(db,"AuditLog",initialization);
     if(actual.empty()&&!required)return;
     if(actual!=retention_programs())refuse("local producer durable audit retention program mismatch");
 }
@@ -305,6 +323,15 @@ struct recovery_local_producer_adapter::context {
     std::shared_ptr<context> previous;
     std::vector<profile> profiles;
     std::shared_ptr<recovery_continuous_admission> continuous;
+    // Determined only by exact WHOLE generated-bundle comparison in bootstrap.
+    // This private spelling never grants write, receipt, or source authority.
+    bool legacy_distinct_count_programs=false;
+    bool matches_complete_programs(database& db,recovery_obligation_bootstrap_reader* initialization=nullptr)const {
+        std::set<std::string> checked;
+        for(const auto& p:profiles)for(const auto& [name,t]:p.schema.tables)
+            if(checked.insert(name).second&&actual_programs(db,name,initialization)!=t.enrolled)return false;
+        return true;
+    }
     const context* effective() const noexcept {
         const auto state=status.load(std::memory_order_acquire);
         if(state==2)return previous ? previous->effective() : nullptr;
@@ -344,8 +371,6 @@ struct recovery_local_producer_adapter::context {
     }
     static int authorize(void* raw,int action,const char* one,const char* two,const char* schema,const char* origin) noexcept {
         auto& root=*static_cast<context*>(raw);
-        const int managed=ordinary_composed_attachment_authorize(root.connection,action,one,two);
-        if(managed!=SQLITE_OK)return managed;
         const auto normal=[&]() noexcept -> int {
         for(auto* m=management_;m;m=m->previous)if(m->connection==root.connection)return SQLITE_OK;
         const auto* effective=root.effective();
@@ -397,7 +422,7 @@ std::shared_ptr<database> recovery_local_producer_adapter::retained_writer_for_t
     std::lock_guard<std::mutex> lock(owner.connection_ownership_mutex_);return owner.db_;
 }
 recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::describe(
-    lattice_db& owner,database& db,const recovery_local_producer_grant& grant,bool initial_inventory) {
+    lattice_db& owner,database& db,const recovery_local_producer_grant& grant,bool initial_inventory,recovery_obligation_bootstrap_reader* initialization) {
     const auto& catalog=owner.recovery_schemas_;
     if(!catalog.valid())refuse("local producer owner schema catalog outside bounds or ambiguous");
     if(grant.models.empty()||grant.models.size()>max_models||grant.incoming_grant_receipt.empty()||grant.incoming_grant_receipt.size()>max_receipt)
@@ -441,11 +466,11 @@ recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::des
     for(const auto& [name,sql]:retention_programs()){field(d.manifest,name);field(d.manifest,sql);}
     size_t existing=0;
     for(auto& [name,t]:d.tables) {
-        auto ddl=db.query("SELECT CASE WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='table' AND name=?",{name});
+        auto ddl=(initialization?initialization->query_(bootstrap_kind::model_definition,{name}):db.query("SELECT CASE WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='table' AND name=?",{name}));
         if(ddl.size()!=1)refuse("local producer missing durable model/link relation");t.ddl=text(ddl[0],"sql");
         if(t.ddl.find("globalId TEXT UNIQUE COLLATE NOCASE")==std::string::npos || t.ddl.find("CREATE VIRTUAL")!=std::string::npos || t.ddl.find("WITHOUT ROWID")!=std::string::npos)
             refuse("local producer unsupported durable UUID relation");
-        const auto columns=db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,CASE WHEN typeof(hidden)='integer' THEN hidden END AS hidden FROM pragma_table_xinfo(?) ORDER BY cid LIMIT 35",{name});
+        const auto columns=(initialization?initialization->query_(bootstrap_kind::model_columns,{name}):db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,CASE WHEN typeof(hidden)='integer' THEN hidden END AS hidden FROM pragma_table_xinfo(?) ORDER BY cid LIMIT 35",{name}));
         if(columns.size()>34)refuse("local producer durable column count");
         std::map<std::string,std::string> actual,want;
         for(const auto& c:columns) {if(integer(c,"hidden")!=0)refuse("local producer hidden/generated columns");actual.emplace(text(c,"name"),text(c,"type"));}
@@ -482,45 +507,45 @@ recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::des
         for(const auto& s:sql)t.ordinary.emplace(program_name(s),normalize_sql(s));
         field(d.manifest,name);number(d.manifest,t.link?1:0);field(d.manifest,t.ddl);
         for(const auto& [n,s]:t.ordinary){field(d.manifest,n);field(d.manifest,s);}
-        const auto index_budget=db.query("SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(name AS BLOB))+COALESCE(length(CAST(sql AS BLOB)),0)),0) AS bytes FROM (SELECT name,sql FROM main.sqlite_master WHERE type='index' AND tbl_name=? LIMIT 33)",{name});
+        const auto index_budget=(initialization?initialization->query_(bootstrap_kind::index_budget,{name}):db.query("SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(name AS BLOB))+COALESCE(length(CAST(sql AS BLOB)),0)),0) AS bytes FROM (SELECT name,sql FROM main.sqlite_master WHERE type='index' AND tbl_name=? LIMIT 33)",{name}));
         if(integer(index_budget.at(0),"n")>32||integer(index_budget.at(0),"bytes")>static_cast<int64_t>(max_manifest-d.manifest.size()))refuse("local producer index bytes exceed allocation bound");
-        const auto indexes=db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN sql IS NULL THEN '' WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='index' AND tbl_name=? ORDER BY name LIMIT 33",{name});
+        const auto indexes=(initialization?initialization->query_(bootstrap_kind::indexes,{name}):db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN sql IS NULL THEN '' WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='index' AND tbl_name=? ORDER BY name LIMIT 33",{name}));
         if(indexes.size()>32)refuse("local producer index inventory bound");number(d.manifest,indexes.size());
         for(const auto& i:indexes){field(d.manifest,text(i,"name"));field(d.manifest,text(i,"sql"));}
     }
     d.digest=picosha2::hash256_hex_string(d.manifest);return d;
 }
 
-void recovery_local_producer_adapter::validate_custody(lattice_db& owner,database& writer) {
+void recovery_local_producer_adapter::validate_custody(lattice_db& owner,database& writer,recovery_obligation_bootstrap_reader* initialization) {
     if(owner.config_.read_only||(!owner.recovery_continuous_ && owner.config_.is_sync_enabled())||owner.config_.is_ipc_enabled()||owner.config_.audit_retention_seconds!=0)
         refuse("local producer qualification refuses legacy transports/automatic retention/read-only owner");
     if(writer.raw_handle_escaped_.load(std::memory_order_acquire))refuse("local producer raw handle escaped; engine hook custody unavailable");
-    if(writer.canonical_callback_custody_ || writer.table_exists("_lattice_canonical_coverage"))
+    if(writer.canonical_callback_custody_ || (initialization?!initialization->query_(bootstrap_kind::canonical_coverage,{std::string("_lattice_canonical_coverage")}).empty():writer.table_exists("_lattice_canonical_coverage")))
         refuse("local producer source-canonical coattachment is unqualified");
-    const auto dbs=writer.query("SELECT name FROM pragma_database_list LIMIT 3");
+    const auto dbs=(initialization?initialization->query_(bootstrap_kind::databases,{}):writer.query("SELECT name FROM pragma_database_list LIMIT 3"));
     if(dbs.size()>2)refuse("local producer attached databases are unqualified");
     for(const auto& r:dbs)if(text(r,"name")!="main"&&text(r,"name")!="temp")refuse("local producer attached databases are unqualified");
-    if(!writer.query("SELECT 1 FROM temp.sqlite_master LIMIT 1").empty())refuse("local producer temporary schema is unqualified");
-    validate_retention_programs(writer,durable_producer_present(writer));
-    if(!writer.query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND substr(tbl_name,1,20)='_lattice_obligation_' LIMIT 1").empty())
+    if(!(initialization?initialization->query_(bootstrap_kind::temporary_presence,{}):writer.query("SELECT 1 FROM temp.sqlite_master LIMIT 1")).empty())refuse("local producer temporary schema is unqualified");
+    validate_retention_programs(writer,durable_producer_present(writer,initialization),initialization);
+    if(!(initialization?initialization->query_(bootstrap_kind::metadata_triggers,{}):writer.query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND substr(tbl_name,1,20)='_lattice_obligation_' LIMIT 1")).empty())
         refuse("local producer obligation metadata triggers are unqualified");
 }
 void recovery_local_producer_adapter::register_context(database& writer,const std::shared_ptr<context>& c) {
     if(c->continuous) {
         auto* continuous_held=new std::shared_ptr<context>(c);
-        if(sqlite3_create_function_v2(c->connection,"lattice_recovery_continuity_owned_v1",0,SQLITE_UTF8,continuous_held,context::continuous_guard,nullptr,nullptr,
+        if(::lattice::detail::store_physical_create_function_v2(c->connection,"lattice_recovery_continuity_owned_v1",0,SQLITE_UTF8,continuous_held,context::continuous_guard,nullptr,nullptr,
             [](void* p){delete static_cast<std::shared_ptr<context>*>(p);})!=SQLITE_OK)refuse("continuous guard registration failed");
     }
     auto* held=new std::shared_ptr<context>(c);
-    if(sqlite3_create_function_v2(c->connection,"lattice_recovery_producer_guard_v1",6,SQLITE_UTF8,held,context::guard,nullptr,nullptr,
+    if(::lattice::detail::store_physical_create_function_v2(c->connection,"lattice_recovery_producer_guard_v1",6,SQLITE_UTF8,held,context::guard,nullptr,nullptr,
         [](void* p){delete static_cast<std::shared_ptr<context>*>(p);})!=SQLITE_OK)refuse("local producer guard registration failed");
-    if(sqlite3_create_function_v2(c->connection,"lattice_recovery_producer_uuid_v1",1,SQLITE_UTF8|SQLITE_DETERMINISTIC,nullptr,uuid_sql,nullptr,nullptr,nullptr)!=SQLITE_OK)
+    if(::lattice::detail::store_physical_create_function_v2(c->connection,"lattice_recovery_producer_uuid_v1",1,SQLITE_UTF8|SQLITE_DETERMINISTIC,nullptr,uuid_sql,nullptr,nullptr,nullptr)!=SQLITE_OK)
         refuse("local producer UUID registration failed");
     // Authorizer userdata has the same physical lifetime as the registered UDF;
     // database close/replacement revokes admission before releasing its copy.
     std::atomic_store(&writer.local_producer_callback_custody_,std::static_pointer_cast<void>(c));
     std::atomic_store(&writer.local_producer_write_allowed_,c->active);
-    if(sqlite3_set_authorizer(c->connection,context::authorize,c.get())!=SQLITE_OK)refuse("local producer authorizer registration failed");
+    if(writer.set_sql_authorizer_(database_authorizer_slot::local_producer,context::authorize,c.get())!=SQLITE_OK)refuse("local producer authorizer registration failed");
 }
 
 void recovery_local_producer_adapter::compile_programs(lattice_db& owner,descriptor& d,
@@ -650,6 +675,9 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
     // Only success restores the prior policy; an earlier refusal stays fenced.
     const bool prior_suppression=writer && writer->suppress_destructor_optimize_;
     if(writer)writer->suppress_destructor_optimize_=true;
+    if(!writer)refuse("local producer bootstrap requires retained physical connection");
+    auto initialization=recovery_obligation_bootstrap_reader::create_(*writer,discovery_caps,
+        recovery_continuous_producer::shared_install_domains(owner));
     std::shared_ptr<context> c;
     recovery_obligation_producer_store::bootstrap_profiles(writer,discovery_caps,
         [&](database& view,const recovery_obligation_producer_inventory& inventory) {
@@ -657,33 +685,42 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
             // Storage-only initialization can predate first enrollment. Empty
             // families allow absent guards or the exact retained dormant bundle;
             // partial/replaced programs always refuse, active profiles need all.
-            validate_retention_programs(view,!inventory.profiles.empty());
+            validate_retention_programs(view,!inventory.profiles.empty(),initialization.get());
             if(inventory.profiles.empty())return;
-            validate_custody(owner,view);
-            const bool continuous=view.table_exists(continuous_table);
+            validate_custody(owner,view,initialization.get());
+            const bool continuous=(initialization?!initialization->query_(bootstrap_kind::continuous_presence,{std::string(continuous_table)}).empty():view.table_exists(continuous_table));
+            if(continuous&&initialization&&(!owner.delivery_startup_||
+               !recovery_continuous_producer::pending_startup_matches_(owner,*owner.delivery_startup_)))
+                refuse("ordinary initialization cannot adopt continuous producer custody");
             if(continuous!=static_cast<bool>(owner.recovery_continuous_))refuse("continuous lineage requires actual retained factory; no legacy adoption");
-            if(continuous)continuous_verify_row(view,*owner.recovery_continuous_->state,false);
+            if(continuous)continuous_verify_row(view,*owner.recovery_continuous_->state,false,initialization.get());
             if(recovery_local_producer_test_hooks::after_inventory)recovery_local_producer_test_hooks::after_inventory();
             c=std::make_shared<context>();c->connection=view.internal_handle();c->owner=&owner;c->lifetime=owner.guard_;
             c->admitted_limits={inventory.stored_obligation_limits,inventory.stored_installation_limits,inventory.stored_producer_limits};
             c->continuous=owner.recovery_continuous_;
             std::set<std::string> relations;
             for(const auto& p:inventory.profiles) {
-                auto d=describe(owner,view,grant_from(p),false);
+                auto d=describe(owner,view,grant_from(p),false,initialization.get());
                 if(p.program_revision!=(continuous?(continuous_receiver_enabled(*c->continuous->state)?3:2):1)||d.manifest!=p.grant_manifest||d.digest!=p.program_digest)refuse("local producer bootstrap descriptor/program revision mismatch");
                 if(!continuous)compile_programs(owner,d,recovery_obligation_producer_store::compile(p,inventory.stored_obligation_limits,inventory.stored_producer_limits));
                 if(!continuous)for(const auto& [name,t]:d.tables) {
                     if(!relations.insert(name).second)refuse("local producer bootstrap overlapping grants");
-                    if(actual_programs(view,name)!=t.enrolled)refuse("local producer bootstrap generated program mismatch");
+                    if(actual_programs(view,name,initialization.get())!=t.enrolled)refuse("local producer bootstrap generated program mismatch");
                 }
                 c->profiles.push_back({p,std::move(d)});
             }
             if(continuous) {
                 compile_continuous(owner,*c);
-                for(const auto& p:c->profiles)for(const auto& [name,t]:p.schema.tables)
-                    if(actual_programs(view,name)!=t.enrolled)refuse("continuous complete generated program differs");
+                if(!c->matches_complete_programs(view,initialization.get())) {
+                    if(!continuous_receiver_enabled(*c->continuous->state))refuse("continuous complete generated program differs");
+                    // One complete historical bundle is the only alternative.
+                    // Never select old/new programs separately by trigger or table.
+                    c->legacy_distinct_count_programs=true;
+                    compile_continuous(owner,*c);
+                    if(!c->matches_complete_programs(view,initialization.get()))refuse("continuous complete generated program differs");
+                }
             }
-        },recovery_continuous_producer::shared_install_domains(owner));
+        },recovery_continuous_producer::shared_install_domains(owner),initialization.get());
     if(!c) {
         writer->suppress_destructor_optimize_=prior_suppression;
         return {};
@@ -693,8 +730,8 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
     // final owned profile discovery rereads storage and refuses stale custody.
     database::maintenance_scope maintenance(*writer);
     register_context(*writer,c);
-    {management changing(c->connection);writer->execute("PRAGMA recursive_triggers=ON");}
-    if(integer(writer->query("PRAGMA recursive_triggers").at(0),"recursive_triggers")!=1)refuse("local producer recursive-trigger setup failed");
+    {management changing(c->connection);if(initialization)initialization->registration_enable_();else writer->execute("PRAGMA recursive_triggers=ON");}
+    if(integer((initialization?initialization->registration_getter_():writer->query("PRAGMA recursive_triggers")).at(0),"recursive_triggers")!=1)refuse("local producer recursive-trigger setup failed");
     writer->suppress_destructor_optimize_=prior_suppression;
     return c;
 }
@@ -778,6 +815,8 @@ std::optional<bool> recovery_local_producer_adapter::export_protection_impl(std:
         writer=owner->db_;
     }
     if(!writer)refuse("export discovery has no published writer");
+    store_physical_native_scope physical_call(*writer);
+    if(!physical_call.entered())refuse("resource Native caller original unavailable");
     auto* db=writer->internal_handle();auto* mutex=db?sqlite3_db_mutex(db):nullptr;
 #ifndef __EMSCRIPTEN__
     if(!mutex)refuse("export discovery requires a serialized connection");
@@ -816,8 +855,9 @@ std::optional<bool> recovery_local_producer_adapter::export_protection_impl(std:
     if(automatic&&!owned_write) {
         // A busy SELECT without a main read transaction still needs provenance;
         // so does same-thread query/callback reentry even when main is idle.
-        if(database::maintenance_scope::controller_classify_locked(*writer)==
-                database::maintenance_scope::admission::engine_read_busy) {
+        const auto admission=database::maintenance_scope::controller_classify_locked(*writer, &owner->txn_owner_thread_);
+        if(admission==database::maintenance_scope::admission::engine_read_busy ||
+           admission==database::maintenance_scope::admission::core_write_busy) {
             validate_deferred_owner();return std::nullopt;
         }
     }else if(!idle&&!owned_write)

@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "scoped_recovery_install.hpp"
 #include "canonical_scoped_install.hpp"
 #include "recovery_witness.hpp"
@@ -67,11 +68,11 @@ struct stmt {
     sqlite3_stmt* p=nullptr;
     explicit stmt(sqlite3* db,const std::string& sql) {
         database::record_statement();
-        const int rc=sqlite3_prepare_v2(db,sql.c_str(),-1,&p,nullptr);
-        if(rc!=SQLITE_OK || !p) { sqlite3_finalize(p); p=nullptr; refuse("recovery SQLite prepare failed"); }
+        const int rc=::lattice::detail::store_physical_prepare_v2(db,sql.c_str(),-1,&p,nullptr);
+        if(rc!=SQLITE_OK || !p) { ::lattice::detail::store_physical_finalize(p); p=nullptr; refuse("recovery SQLite prepare failed"); }
     }
     stmt(const stmt&)=delete;
-    ~stmt() { sqlite3_finalize(p); }
+    ~stmt() { ::lattice::detail::store_physical_finalize(p); }
     void value(int at,const recovery_scalar& v) {
         int rc=SQLITE_MISUSE;
         if(std::holds_alternative<std::nullptr_t>(v)) rc=sqlite3_bind_null(p,at);
@@ -89,7 +90,7 @@ struct stmt {
     void text(int at,const std::string& s) { value(at,s); }
     void integer(int at,int64_t n) { value(at,n); }
     bool next() {
-        const int rc=sqlite3_step(p);
+        const int rc=::lattice::detail::store_physical_step(p);
         if(rc==SQLITE_ROW) return true;
         require(rc==SQLITE_DONE,"recovery SQLite step failed"); return false;
     }

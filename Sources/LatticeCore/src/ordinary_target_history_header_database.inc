@@ -7,6 +7,7 @@
 namespace lattice {
 struct database::target_staging_state::history_header_native {
     using arguments=std::vector<column_value_t>;
+    terminal_native_static_tail terminal_static; // FIRST: actual member death, not source-null inference.
     database* const shell;
     const bool raw_pages; // Selected only by the private unmounted target programme.
     const std::weak_ptr<detail::ordinary_group_target_receiving_owner> owner;
@@ -77,7 +78,7 @@ struct database::target_staging_state::history_header_native {
     // constructor is selected; static binding copies are held before effects.
     history_header_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
         std::shared_ptr<detail::ordinary_group_target_schema_original> input,arguments stage_row,arguments meta_row,bool raw)
-        :shell(&actual),raw_pages(raw),owner(receiving),schema(std::move(input)),stage(std::move(stage_row)),meta(std::move(meta_row)),stage_key{stage.at(0)} {
+        :terminal_static(actual,this,input.get(),1,receiving),shell(&actual),raw_pages(raw),owner(receiving),schema(std::move(input)),stage(std::move(stage_row)),meta(std::move(meta_row)),stage_key{stage.at(0)} {
         const std::array<const char*,4> names{"_lattice_ordered_history_stage_v1",raw_pages?detail::ordinary_target_raw_history_storage_recipe::page_name:"_lattice_ordered_history_page_v1","_lattice_ordered_history_receive_v1","_lattice_ordered_history_receive_key_v1"};
         const std::array<const char*,4> create{detail::ordinary_history_storage_recipe::stage,raw_pages?detail::ordinary_target_raw_history_storage_recipe::page:detail::ordinary_history_storage_recipe::page,detail::ordinary_history_storage_recipe::meta,detail::ordinary_history_storage_recipe::key};
         std::size_t at=0;for(std::size_t table=0;table<names.size();++table) {
@@ -99,6 +100,7 @@ struct database::target_staging_state::history_header_native {
             }
         }
         logical_bytes=retained;
+        terminal_static.constructor_returned();
     }
     void require(database& actual,bool unwind=false)const {
         const auto state=actual.target_staging_;
@@ -124,7 +126,7 @@ struct database::target_staging_state::history_header_native {
             throw db_error("target header fixed statement unavailable");
         require(actual,unwind);auto& call=reserve(kind::prepare,index,unwind);require(actual,unwind);
         const char* tail=nullptr;statement.prepare_entered=true;call.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(actual.db_,sql.c_str(),static_cast<int>(sql.size()+1),&statement.held,&tail);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(actual.db_,sql.c_str(),static_cast<int>(sql.size()+1),&statement.held,&tail);
         statement.prepared_identity=statement.held;statement.prepare_returned=true;returned(call,statement.prepare_rc);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held)throw db_error("target header preparation failed");
         require(actual,unwind);if(!tail||tail<sql.c_str()||tail>sql.c_str()+sql.size())throw db_error("target header native tail unavailable");
@@ -154,7 +156,7 @@ struct database::target_staging_state::history_header_native {
     int step(database& actual,std::size_t index,bool unwind=false) {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)throw db_error("target header actual VM unavailable");
         require(actual,unwind);auto& call=reserve(kind::step,index,unwind);require(actual,unwind);call.entered=true;
-        const int rc=sqlite3_step(statement.held);returned(call,rc);
+        const int rc=::lattice::detail::store_physical_step(statement.held);returned(call,rc);
         if(!statement.first_step_returned){statement.first_step_returned=true;statement.first_step_rc=rc;}
         if(rc!=SQLITE_ROW){if(statement.terminal_returned)throw db_error("target header native terminal reissued");statement.terminal_returned=true;statement.terminal_rc=rc;}
         if(index==begin)scope->record_schema_begin(actual,rc);if(index==commit)scope->record_schema_commit(actual,rc);if(index==rollback)scope->record_schema_rollback(actual,rc);
@@ -164,7 +166,7 @@ struct database::target_staging_state::history_header_native {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)return;
         require(actual,unwind);auto& call=reserve(kind::finalize,index,unwind);require(actual,unwind);
         statement.finalized_identity=statement.held;statement.finalize_entered=true;call.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
         statement.destruction_known=(statement.finalize_rc&0xff)!=SQLITE_MISUSE;if(statement.destruction_known)statement.held=nullptr;
         scope->record_schema_finalized(actual,statement.finalize_rc);
         if(statement.finalize_rc!=SQLITE_OK)throw db_error("target header native finalization failed");require(actual,unwind);
@@ -243,7 +245,7 @@ void database::require_target_catalog_ending_(const detail::ordinary_target_stag
 bool database::target_history_header_native_ending_()const noexcept {
     try {
         const auto state=target_staging_;const auto actual=state?state->history_header:nullptr;
-        if(!state||!state->current_creator()||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
+        if(!state||!state->current_creator()||state->terminal_native_statics_attempted||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
            !actual->guard_registration_entered||!actual->guard_registration_returned||actual->first_guard_registration_rc!=SQLITE_OK||
            !actual->userdata||actual->guard_destroy_entered||actual->guard_destroy_returned||actual->completed_operations!=22||actual->guard_invocations!=2)
             return false;
@@ -286,7 +288,7 @@ bool database::target_history_raw_storage_(const detail::ordinary_target_staging
 }
 bool database::target_history_guard_destroyed_()const noexcept {
     const auto state=target_staging_;const auto actual=state?state->history_header:nullptr;
-    if(!state||!state->current_creator())return false;
+    if(!state||!state->current_creator()||state->terminal_native_statics_attempted)return false;
     if(!target_history_page_guard_destroyed_())return false;
     if(!actual)return true; // Native work is only after this exact field is retained.
     if(!actual->userdata)return !actual->guard_registration_entered;
@@ -328,7 +330,7 @@ void database::stage_target_history_header_program_(const std::shared_ptr<detail
         actual->userdata=new native::guard_userdata(state,*actual,*this); // Exact object before Native registration diagnostics.
         actual->require(*this);auto& registration=actual->reserve(native::kind::register_guard,native::stage_insert);actual->require(*this);
         actual->guard_registration_entered=true;registration.entered=true;
-        actual->first_guard_registration_rc=sqlite3_create_function_v2(db_,"lattice_ordered_export_owned_v1",0,SQLITE_UTF8,
+        actual->first_guard_registration_rc=::lattice::detail::store_physical_create_function_v2(db_,"lattice_ordered_export_owned_v1",0,SQLITE_UTF8,
             actual->userdata,&native::guard_userdata::invoke,nullptr,nullptr,&native::guard_userdata::destroy);
         actual->guard_registration_returned=true;native::returned(registration,actual->first_guard_registration_rc);
         if(actual->first_guard_registration_rc!=SQLITE_OK)throw db_error("target passive header guard registration failed");actual->require(*this);

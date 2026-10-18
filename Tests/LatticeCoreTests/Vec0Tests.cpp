@@ -883,3 +883,444 @@ TEST_F(Vec0Test, ConcurrentUpsertSameRow_NoUniqueThrow) {
     EXPECT_EQ(std::get<int64_t>(cnt[0].at("c")), 1)
         << "exactly one index row must survive the race";
 }
+
+
+TEST_F(Vec0Test, IvfOwnedLookupsEndBeforeTheNextCallerOperation) {
+    lattice::lattice_db db;
+    createVectorTable(db);
+    for (int i = 0; i < 32; ++i)
+        insertDoc(db, "seed-" + std::to_string(i), "seed", {float(i), 1.0f, 2.0f});
+    ASSERT_TRUE(db.train_vec0("VectorDoc", "embedding"));
+    const auto trained = db.db().query(
+        "SELECT value FROM _VectorDoc_embedding_vec_info WHERE key = 'ivf_trained_0'");
+    ASSERT_EQ(trained.size(), 1u);
+    ASSERT_EQ(std::get<int64_t>(trained[0].at("value")), 1);
+    // Diagnostic raw access is no admission grant. Observe actual VM state;
+    // never guess ownership from SQL or prune/finalize a retained statement.
+    auto* native = db.db().handle();
+    auto expect_no_busy_original = [&] {
+        for (auto* statement = sqlite3_next_stmt(native, nullptr); statement;
+             statement = sqlite3_next_stmt(native, statement))
+            EXPECT_FALSE(sqlite3_stmt_busy(statement)) << sqlite3_sql(statement);
+    };
+    expect_no_busy_original();
+    db.begin_transaction();
+    for (int i = 0; i < 50; ++i) {
+        insertDoc(db, "next-" + std::to_string(i), "after training", {float(i), 3.0f, 4.0f});
+        expect_no_busy_original();
+        ASSERT_TRUE(db.db().is_in_transaction());
+    }
+    db.commit();
+    ASSERT_FALSE(db.db().is_in_transaction());
+    const auto total = db.db().query("SELECT COUNT(*) AS n FROM VectorDoc");
+    ASSERT_EQ(std::get<int64_t>(total[0].at("n")), 82);
+    const auto expected = pack_floats({49.0f, 3.0f, 4.0f});
+    const auto point = db.db().query(
+        "SELECT embedding FROM _VectorDoc_embedding_vec WHERE global_id = ?", {std::string("next-49")});
+    ASSERT_EQ(point.size(), 1u);
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(point[0].at("embedding")), expected);
+    expect_no_busy_original();
+    db.begin_transaction();
+    db.db().execute("DELETE FROM VectorDoc WHERE globalId = ?", {std::string("next-49")});
+    expect_no_busy_original();
+    db.commit();
+    EXPECT_FALSE(db.db().is_in_transaction());
+    const auto remaining = db.db().query("SELECT COUNT(*) AS n FROM _VectorDoc_embedding_vec");
+    EXPECT_EQ(std::get<int64_t>(remaining[0].at("n")), 81);
+    expect_no_busy_original();
+}
+
+#include <map>
+#include <set>
+
+class IvfSparseMutationTest : public Vec0Test {
+protected:
+    using image = std::map<std::string, std::vector<float>>;
+    void seed_ivf(lattice::lattice_db& db, image& expected) {
+        db.db().execute("CREATE TABLE VectorDoc (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                        "globalId TEXT UNIQUE NOT NULL, title TEXT NOT NULL, embedding BLOB)");
+        // Actual IVF from its first vector, initially unassigned. Public train
+        // below preserves this same table instead of rebuilding a flat index.
+        db.ensure_vec0_table("VectorDoc", "embedding", 3, 2, 2);
+        ASSERT_TRUE(db.db().table_exists("_VectorDoc_embedding_vec_ivf_centroids00"));
+        for (int i = 0; i < 32; ++i) {
+            const auto id = "row-" + std::to_string(i);
+            expected[id] = {float(i), 1.0f, 2.0f};
+            insertDoc(db, id, "seed", expected[id]);
+        }
+    }
+    void erase(lattice::lattice_db& db, image& expected, const std::string& id) {
+        db.db().execute("DELETE FROM VectorDoc WHERE globalId = ?", {id});
+        expected.erase(id);
+    }
+    void add(lattice::lattice_db& db, image& expected, const std::string& id,
+             std::vector<float> value) {
+        insertDoc(db, id, "replacement", value);
+        expected[id] = std::move(value);
+    }
+    void update(lattice::lattice_db& db, image& expected, const std::string& id,
+                std::vector<float> value) {
+        db.db().execute("UPDATE VectorDoc SET embedding = ? WHERE globalId = ?",
+                        {pack_floats(value), id});
+        expected[id] = std::move(value);
+    }
+    void expect_image(lattice::lattice_db& db, const image& expected) {
+        const auto count = db.db().query("SELECT COUNT(*) AS n FROM VectorDoc");
+        ASSERT_EQ(std::get<int64_t>(count.at(0).at("n")), int64_t(expected.size()));
+        const auto cells = db.db().query(
+            "SELECT n_vectors, validity FROM _VectorDoc_embedding_vec_ivf_cells00");
+        int64_t actual_live = 0;
+        for (const auto& cell : cells) {
+            int live = 0;
+            for (const auto byte : std::get<std::vector<uint8_t>>(cell.at("validity")))
+                for (int bit = 0; bit < 8; ++bit) if (byte & (1 << bit)) ++live;
+            EXPECT_EQ(std::get<int64_t>(cell.at("n_vectors")), live);
+            actual_live += live;
+        }
+        EXPECT_EQ(actual_live, int64_t(expected.size()));
+        const auto map_count = db.db().query(
+            "SELECT COUNT(*) AS n FROM _VectorDoc_embedding_vec_ivf_rowid_map00");
+        EXPECT_EQ(std::get<int64_t>(map_count.at(0).at("n")), int64_t(expected.size()));
+        const auto aliases = db.db().query(
+            "SELECT cell_id, slot, COUNT(*) AS n FROM _VectorDoc_embedding_vec_ivf_rowid_map00 "
+            "GROUP BY cell_id, slot HAVING COUNT(*) <> 1");
+        EXPECT_TRUE(aliases.empty());
+        for (const auto& item : expected) {
+            const auto point = db.db().query(
+                "SELECT embedding FROM _VectorDoc_embedding_vec WHERE global_id = ?", {item.first});
+            ASSERT_EQ(point.size(), 1u) << item.first;
+            EXPECT_EQ(std::get<std::vector<uint8_t>>(point.at(0).at("embedding")), pack_floats(item.second))
+                << item.first;
+            const auto nearest = db.knn_query("VectorDoc", "embedding", pack_floats(item.second), 1,
+                                              lattice::lattice_db::distance_metric::l2);
+            ASSERT_EQ(nearest.size(), 1u) << item.first;
+            EXPECT_EQ(nearest.at(0).global_id, item.first);
+        }
+    }
+};
+
+TEST_F(IvfSparseMutationTest, DeleteFirstAndMiddleReuseFreeSlotsWithoutOverwritingSurvivors) {
+    lattice::lattice_db db;
+    image expected;
+    seed_ivf(db, expected);
+    erase(db, expected, "row-0");
+    erase(db, expected, "row-15");
+    // Holes alone are already scannable. The old bug overwrote high survivors
+    // on the NEXT insert because live count was mistaken for a free slot.
+    expect_image(db, expected);
+    add(db, expected, "new-32", {32.0f, 1.0f, 2.0f});
+    add(db, expected, "new-33", {33.0f, 1.0f, 2.0f});
+    expect_image(db, expected);
+    update(db, expected, "row-5", {105.0f, 2.0f, 3.0f});
+    expect_image(db, expected);
+}
+
+TEST_F(IvfSparseMutationTest, TrainingAndTrainedMutationPreserveSparseValuesAndNearestIDs) {
+    lattice::lattice_db db;
+    image expected;
+    seed_ivf(db, expected);
+    erase(db, expected, "row-0");
+    erase(db, expected, "row-15");
+    expect_image(db, expected);
+    ASSERT_TRUE(db.train_vec0("VectorDoc", "embedding"));
+    expect_image(db, expected);
+    erase(db, expected, "row-2");
+    add(db, expected, "near-deleted", {2.25f, 1.0f, 2.0f});
+    update(db, expected, "row-10", {10.25f, 1.0f, 2.0f});
+    expect_image(db, expected);
+}
+
+TEST_F(IvfSparseMutationTest, CallerRollbackAndReopenKeepExactOriginalThenCommittedMappings) {
+    image original, committed;
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        seed_ivf(db, original);
+        ASSERT_TRUE(db.train_vec0("VectorDoc", "embedding"));
+        auto changed = original;
+        db.begin_transaction();
+        erase(db, changed, "row-0");
+        erase(db, changed, "row-15");
+        add(db, changed, "rolled-back", {40.0f, 1.0f, 2.0f});
+        update(db, changed, "row-31", {131.0f, 2.0f, 3.0f});
+        expect_image(db, changed);
+        db.rollback();
+        EXPECT_FALSE(db.db().is_in_transaction());
+        expect_image(db, original);
+    }
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        expect_image(db, original);
+        committed = original;
+        db.begin_transaction();
+        erase(db, committed, "row-0");
+        erase(db, committed, "row-15");
+        add(db, committed, "committed", {40.0f, 1.0f, 2.0f});
+        update(db, committed, "row-31", {131.0f, 2.0f, 3.0f});
+        db.commit();
+        EXPECT_FALSE(db.db().is_in_transaction());
+        expect_image(db, committed);
+    }
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        expect_image(db, committed);
+    }
+}
+
+TEST_F(IvfSparseMutationTest, LateRowMapFailurePreservesCallerPrefixAndRestoresEveryCell) {
+    lattice::lattice_db db;
+    image expected;
+    seed_ivf(db, expected);
+    db.begin_transaction();
+    add(db, expected, "caller-prefix", {40.0f, 1.0f, 2.0f});
+    erase(db, expected, "row-0");
+    expect_image(db, expected);
+    // Real failure AFTER the candidate slot's bitmap/payload/count writes.
+    // No fake result counter and no repair SQL for the attempted vector.
+    db.db().execute(
+        "CREATE TRIGGER sparse_map_deny BEFORE INSERT ON _VectorDoc_embedding_vec_ivf_rowid_map00 "
+        "BEGIN SELECT RAISE(ABORT, 'IVF rowmap denial'); END");
+    bool failed = false;
+    try {
+        insertDoc(db, "must-not-exist", "denied", {50.0f, 1.0f, 2.0f});
+    } catch (const lattice::db_error& error) {
+        failed = true;
+        EXPECT_NE(std::string(error.what()).find("IVF rowmap denial"), std::string::npos);
+    }
+    EXPECT_TRUE(failed);
+    ASSERT_TRUE(db.db().is_in_transaction());
+    db.db().execute("DROP TRIGGER sparse_map_deny");
+    expect_image(db, expected);
+    add(db, expected, "after-denial", {51.0f, 1.0f, 2.0f});
+    db.commit();
+    EXPECT_FALSE(db.db().is_in_transaction());
+    expect_image(db, expected);
+}
+
+
+TEST_F(IvfSparseMutationTest, QuantizedCommandsPreserveSparseSlotsAndActualCentroidIDs) {
+    for (const std::string quantizer : {"int8", "binary"}) {
+        lattice::lattice_db db;
+        db.db().execute("CREATE VIRTUAL TABLE _q USING vec0(global_id TEXT PRIMARY KEY, "
+                        "embedding float[8] indexed by ivf(nlist=2,nprobe=2,quantizer=" + quantizer + ",oversample=2))");
+        image expected;
+        for (int i=0;i<32;++i) {
+            std::vector<float> v(8);
+            for (int bit=0;bit<8;++bit) v[bit]=(i&(1<<bit))?0.75f:-0.75f;
+            const auto id="q-"+std::to_string(i);expected[id]=v;
+            db.db().execute("INSERT INTO _q(global_id,embedding) VALUES (?,?)",{id,pack_floats(v)});
+        }
+        db.db().execute("DELETE FROM _q WHERE global_id IN ('q-0','q-15')");
+        expected.erase("q-0");expected.erase("q-15");
+        const std::vector<float> extra{0.5f,-0.5f,0.5f,-0.5f,0.5f,-0.5f,0.5f,-0.5f};
+        db.db().execute("INSERT INTO _q(global_id,embedding) VALUES (?,?)",{std::string("extra"),pack_floats(extra)});
+        expected["extra"]=extra;
+        auto verify=[&] {
+            for(const auto& item:expected){
+                const auto point=db.db().query("SELECT embedding FROM _q WHERE global_id=?",{item.first});
+                ASSERT_EQ(point.size(),1u);
+                EXPECT_EQ(std::get<std::vector<uint8_t>>(point.at(0).at("embedding")),pack_floats(item.second));
+            }
+            const auto found=db.db().query(
+                "SELECT global_id FROM _q WHERE embedding MATCH ? AND k=? ORDER BY distance",
+                {pack_floats(extra),int64_t(expected.size())});
+            std::set<std::string> ids;
+            for(const auto& row:found)ids.insert(std::get<std::string>(row.at("global_id")));
+            EXPECT_EQ(found.size(),expected.size());EXPECT_EQ(ids.size(),expected.size());
+            for(const auto& item:expected)EXPECT_EQ(ids.count(item.first),1u);
+        };
+        verify();
+        // Non-contiguous actual centroid IDs must not become array indices.
+        db.db().execute("INSERT INTO _q(_q,embedding) VALUES ('set-centroid:17',?)",{pack_floats(std::vector<float>(8,-0.75f))});
+        db.db().execute("INSERT INTO _q(_q,embedding) VALUES ('set-centroid:43',?)",{pack_floats(std::vector<float>(8,0.75f))});
+        db.db().execute("INSERT INTO _q(_q) VALUES ('assign-vectors')");
+        const auto bad=db.db().query("SELECT 1 FROM _q_ivf_cells00 WHERE centroid_id NOT IN (17,43)");
+        EXPECT_TRUE(bad.empty());verify();
+        db.db().execute("INSERT INTO _q(_q) VALUES ('clear-centroids')");
+        const auto assigned=db.db().query("SELECT 1 FROM _q_ivf_cells00 WHERE centroid_id<>-1");
+        EXPECT_TRUE(assigned.empty());verify();
+        const auto changed=std::vector<float>(8,0.25f);
+        db.db().execute("UPDATE _q SET embedding=? WHERE global_id='q-31'",{pack_floats(changed)});
+        expected["q-31"]=changed;verify();
+    }
+}
+
+class IvfCommandRollbackTest : public Vec0Test {
+protected:
+    enum class command { train, clear, set };
+    using point_image = std::map<std::string, std::vector<float>>;
+    using shadow_image = std::vector<std::vector<lattice::database::row_t>>;
+
+    void put(lattice::lattice_db& db, point_image& expected,
+             const std::string& id, const std::vector<float>& value) {
+        db.db().execute("INSERT INTO _q(global_id,embedding) VALUES (?,?)",
+                        {id, pack_floats(value)});
+        expected[id] = value;
+    }
+    void seed(lattice::lattice_db& db, const std::string& quantizer, point_image& expected) {
+        db.db().execute("CREATE VIRTUAL TABLE _q USING vec0(global_id TEXT PRIMARY KEY, "
+                        "embedding float[8] indexed by ivf(nlist=2,nprobe=2,quantizer=" +
+                        quantizer + ",oversample=" + (quantizer == "none" ? "1" : "2") + "))");
+        db.db().execute("CREATE TABLE ivf_command_prefix(id INTEGER PRIMARY KEY, globalId TEXT NOT NULL UNIQUE, value INTEGER NOT NULL UNIQUE)");
+        db.db().execute("INSERT INTO ivf_command_prefix(globalId,value) VALUES ('prefix-11',11)");
+        for (int id = 0; id < 32; ++id) {
+            std::vector<float> value(8);
+            for (int bit = 0; bit < 8; ++bit)
+                value[bit] = (id & (1 << bit)) ? 0.75f : -0.75f;
+            put(db, expected, "q-" + std::to_string(id), value);
+        }
+        db.db().execute("DELETE FROM _q WHERE global_id IN ('q-0','q-15')");
+        expected.erase("q-0"); expected.erase("q-15");
+        put(db, expected, "sparse-extra", std::vector<float>(8, 0.125f));
+    }
+    ::testing::AssertionResult values_match(lattice::lattice_db& db, const point_image& expected) {
+        const auto count = db.db().query("SELECT COUNT(*) AS n FROM _q");
+        if (count.size() != 1 || std::get<int64_t>(count.at(0).at("n")) != int64_t(expected.size()))
+            return ::testing::AssertionFailure() << "point count differs";
+        for (const auto& item : expected) {
+            const auto point = db.db().query("SELECT embedding FROM _q WHERE global_id=?", {item.first});
+            if (point.size() != 1 ||
+                std::get<std::vector<uint8_t>>(point.at(0).at("embedding")) != pack_floats(item.second))
+                return ::testing::AssertionFailure() << "full point bytes differ for " << item.first;
+        }
+        const auto found = db.db().query(
+            "SELECT global_id,embedding FROM _q WHERE embedding MATCH ? AND k=128 ORDER BY distance",
+            {pack_floats(std::vector<float>(8, 0.0f))});
+        std::set<std::string> seen;
+        for (const auto& row : found) {
+            const auto& id = std::get<std::string>(row.at("global_id"));
+            const auto item = expected.find(id);
+            if (item == expected.end() || !seen.insert(id).second ||
+                std::get<std::vector<uint8_t>>(row.at("embedding")) != pack_floats(item->second))
+                return ::testing::AssertionFailure() << "KNN identity or full vector bytes differ for " << id;
+        }
+        if (found.size() != expected.size() || seen.size() != expected.size())
+            return ::testing::AssertionFailure() << "KNN omitted or duplicated an original";
+        return ::testing::AssertionSuccess();
+    }
+    shadow_image shadows(lattice::lattice_db& db, const std::string& quantizer) {
+        shadow_image result;
+        for (const auto* sql : {
+                 "SELECT rowid,* FROM _q_ivf_cells00 ORDER BY rowid",
+                 "SELECT * FROM _q_ivf_rowid_map00 ORDER BY rowid",
+                 "SELECT * FROM _q_rowids ORDER BY rowid",
+                 "SELECT key,value FROM _q_info ORDER BY key",
+                 "SELECT centroid_id,centroid FROM _q_ivf_centroids00 ORDER BY centroid_id",
+                 "SELECT value FROM ivf_command_prefix ORDER BY value"})
+            result.push_back(db.db().query(sql));
+        if (quantizer != "none")
+            result.push_back(db.db().query("SELECT rowid,vector FROM _q_ivf_vectors00 ORDER BY rowid"));
+        return result;
+    }
+    int64_t trained(lattice::lattice_db& db) {
+        const auto rows = db.db().query(
+            "SELECT CAST(value AS INTEGER) AS trained FROM _q_info WHERE key='ivf_trained_0'");
+        return std::get<int64_t>(rows.at(0).at("trained"));
+    }
+    void exercise(const std::string& quantizer, command actual, bool rollback_to) {
+        lattice::lattice_db db;
+        point_image original;
+        seed(db, quantizer, original);
+        ASSERT_TRUE(values_match(db, original)); // prime actual untrained cache
+        const bool originally_trained = actual == command::clear;
+        if (originally_trained) {
+            db.db().execute("INSERT INTO _q(_q) VALUES ('compute-centroids')");
+            ASSERT_TRUE(values_match(db, original));
+        }
+        ASSERT_EQ(trained(db), originally_trained ? 1 : 0);
+        auto expected = original;
+        auto restored_shadows = shadows(db, quantizer);
+
+        db.begin_transaction();
+        db.db().execute("INSERT INTO ivf_command_prefix(globalId,value) VALUES ('prefix-22',22)");
+        put(db, expected, "caller-prefix", std::vector<float>(8, 0.25f));
+        ASSERT_TRUE(values_match(db, expected));
+        if (rollback_to) {
+            // A genuine caller prefix predates this actual savepoint. Neither
+            // rollback-to nor the module's cache invalidation may discard it.
+            restored_shadows = shadows(db, quantizer);
+            db.db().execute("SAVEPOINT ivf_command_rollback");
+        }
+        const auto before_command = shadows(db, quantizer);
+        if (actual == command::train) {
+            db.db().execute("INSERT INTO _q(_q) VALUES ('compute-centroids')");
+        } else if (actual == command::clear) {
+            db.db().execute("INSERT INTO _q(_q) VALUES ('clear-centroids')");
+        } else {
+            db.db().execute("INSERT INTO _q(_q,embedding) VALUES ('set-centroid:17',?)",
+                            {pack_floats(std::vector<float>(8, -0.75f))});
+            const auto custom = db.db().query("SELECT centroid_id FROM _q_ivf_centroids00 ORDER BY centroid_id");
+            ASSERT_EQ(custom.size(), 1u);
+            ASSERT_EQ(std::get<int64_t>(custom.at(0).at("centroid_id")), 17);
+        }
+        ASSERT_TRUE(db.db().is_in_transaction());
+        ASSERT_EQ(trained(db), originally_trained ? 0 : 1);
+        ASSERT_NE(shadows(db, quantizer), before_command) << "the actual command must change SQL state";
+        // Standalone set-centroid is observed through actual marker/centroid
+        // bytes. No unqualified intermediate set-centroid query is required.
+        if (actual != command::set) ASSERT_TRUE(values_match(db, expected));
+
+        if (rollback_to) {
+            db.db().execute("ROLLBACK TO ivf_command_rollback");
+            ASSERT_TRUE(db.db().is_in_transaction());
+        } else {
+            db.rollback();
+            ASSERT_FALSE(db.db().is_in_transaction());
+            expected = original;
+        }
+        // Exact cell/map/rowid/marker/centroid/full-precision blob values and
+        // the original public point+KNN oracle must BOTH recover.
+        ASSERT_EQ(shadows(db, quantizer), restored_shadows);
+        ASSERT_EQ(trained(db), originally_trained ? 1 : 0);
+        ASSERT_TRUE(values_match(db, expected));
+        const auto prefix = db.db().query("SELECT value FROM ivf_command_prefix ORDER BY value");
+        ASSERT_EQ(prefix.size(), rollback_to ? 2u : 1u);
+        ASSERT_EQ(std::get<int64_t>(prefix.at(0).at("value")), 11);
+        if (rollback_to) {
+            ASSERT_EQ(std::get<int64_t>(prefix.at(1).at("value")), 22);
+            db.db().execute("RELEASE ivf_command_rollback");
+            ASSERT_TRUE(db.db().is_in_transaction());
+        }
+        put(db, expected, "after-rollback", std::vector<float>(8, 0.5f));
+        ASSERT_TRUE(values_match(db, expected));
+        if (rollback_to) db.commit();
+        ASSERT_FALSE(db.db().is_in_transaction());
+        ASSERT_TRUE(values_match(db, expected));
+    }
+};
+
+TEST_F(IvfCommandRollbackTest, ActualTrainingCallerRollbackRestoresFullPointsKnnAndShadowBytes) {
+    for (const std::string quantizer : {"none", "int8", "binary"}) {
+        SCOPED_TRACE(quantizer);
+        ASSERT_NO_FATAL_FAILURE(exercise(quantizer, command::train, false));
+    }
+}
+TEST_F(IvfCommandRollbackTest, ActualClearCallerRollbackRestoresFullPointsKnnAndShadowBytes) {
+    for (const std::string quantizer : {"none", "int8", "binary"}) {
+        SCOPED_TRACE(quantizer);
+        ASSERT_NO_FATAL_FAILURE(exercise(quantizer, command::clear, false));
+    }
+}
+TEST_F(IvfCommandRollbackTest, ActualCustomCentroidCallerRollbackRestoresFullPointsKnnAndShadowBytes) {
+    for (const std::string quantizer : {"none", "int8", "binary"}) {
+        SCOPED_TRACE(quantizer);
+        ASSERT_NO_FATAL_FAILURE(exercise(quantizer, command::set, false));
+    }
+}
+TEST_F(IvfCommandRollbackTest, ActualTrainingRollbackToRetainsCallerPrefixFullPointsKnnAndShadowBytes) {
+    for (const std::string quantizer : {"none", "int8", "binary"}) {
+        SCOPED_TRACE(quantizer);
+        ASSERT_NO_FATAL_FAILURE(exercise(quantizer, command::train, true));
+    }
+}
+TEST_F(IvfCommandRollbackTest, ActualClearRollbackToRetainsCallerPrefixFullPointsKnnAndShadowBytes) {
+    for (const std::string quantizer : {"none", "int8", "binary"}) {
+        SCOPED_TRACE(quantizer);
+        ASSERT_NO_FATAL_FAILURE(exercise(quantizer, command::clear, true));
+    }
+}
+TEST_F(IvfCommandRollbackTest, ActualCustomCentroidRollbackToRetainsCallerPrefixFullPointsKnnAndShadowBytes) {
+    for (const std::string quantizer : {"none", "int8", "binary"}) {
+        SCOPED_TRACE(quantizer);
+        ASSERT_NO_FATAL_FAILURE(exercise(quantizer, command::set, true));
+    }
+}

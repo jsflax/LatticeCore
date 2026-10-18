@@ -1,9 +1,16 @@
 #pragma once
 #include <lattice/db.hpp>
+#include <climits>
+#include <cstdint>
+#include <cstddef>
 namespace lattice::detail::recovery_admission_test_hooks {
 // A private observation/rendezvous after a real engine query yields a row.
 // No provenance is synthesized. Production leaves this thread-local hook null.
 inline thread_local void (*after_initial_probe)() = nullptr;
+// Actual Core ending has returned and published its empty stamp under the
+// physical SQLite mutex. This rendezvous runs off that mutex before delivery;
+// it cannot set ownership, completion, authority, result or retry state.
+inline thread_local void (*after_core_transaction_end)() = nullptr;
 inline thread_local void (*after_read_row)(database&, sqlite3_stmt*) = nullptr;
 inline void read_row(database& db, sqlite3_stmt* statement) {
     if (after_read_row) after_read_row(db, statement);
@@ -67,3 +74,88 @@ inline void route_maintenance(route_maintenance_point point)noexcept {
     if(auto* out=route_observation;out&&out->inside_install)out->maintenance=point;
 }
 }
+
+namespace lattice::detail::recovery_admission_test_hooks {
+// Private passive observation only. Production's default is null.
+// Emit ONLY after the real admission classifier has proved that every actual
+// busy statement is an owned readonly materialization on another thread, and
+// after releasing every Core-owned/tracked Native and writer/store/ownership
+// gate. Arbitrary caller raw locks are not enumerable and are not released.
+// Eligibility is fresh autocommit, with no inherited tracked caller/store/Native
+// gate levels. Raw/caller/nested/same-thread cases never gain waiting authority.
+// One deadline starts at managed entry: min(positive busy_timeout_ms, 2000ms);
+// explicit zero refuses a busy admission immediately and emits no wait. No reset.
+// Emission precedes BEGIN/SAVEPOINT, mutation body/checkpoint or any retry grant.
+// An observer can rendezvous/throw in a trusted control; it returns no status,
+// ownership, cursor, replacement original, permission or successful ending.
+// After it returns the producer must still use the ORIGINAL finite budget and
+// revalidate actual writer/gate/transaction/read corpus/creator/closed/debt.
+// Passive observers must not move/destroy or replace the stable wrapper. The
+// producer emits only at its real classified off-gate wait; never self-emit in
+// a test before the producer has actually entered this boundary.
+inline thread_local void (*after_mutation_owned_read_wait_unlocked)(database&) = nullptr;
+inline void mutation_owned_read_wait_unlocked(database& owner) {
+    if (after_mutation_owned_read_wait_unlocked) after_mutation_owned_read_wait_unlocked(owner);
+}
+}
+
+namespace lattice::detail::recovery_admission_test_hooks {
+// Passive observation of a FAILED real publication try-lock, emitted only
+// after every Core-owned/tracked Native/store/publication leaf is released.
+// Initial capture uses the actual immutable owner timeout; retained-writer
+// capture must then prove that same policy. All later waits keep the original
+// admission deadline. This hook issues no status, owner, permission or retry,
+// and must not mutate/destroy/move any observed owner or private lifetime.
+// Production leaves the thread-local hook null. Zero/nested/caller/known Core
+// callback or Native-frame entries refuse contention without emitting it.
+inline thread_local void (*after_mutation_publication_wait_unlocked)(lattice_db&) = nullptr;
+inline void mutation_publication_wait_unlocked(lattice_db& owner) {
+    if(after_mutation_publication_wait_unlocked)after_mutation_publication_wait_unlocked(owner);
+}
+}
+
+namespace lattice::detail::recovery_admission_test_hooks {
+// Private passive diagnostic only. Nil means no extra Native observations.
+// The exact throwing classifier alone records a refusal; tests may separately
+// inspect before-call/after-return DATA, never claim the throwing guard's state.
+struct mutation_tail_data {
+    bool flushing=false,recovery_reserved=false;
+    std::uint64_t rows=0,topology_depth=0,mutation_depth=0,custody_epoch=0;
+};
+struct mutation_refusal_observation {
+    const std::uint64_t creator=database_native_process();
+    const database* expected_writer=nullptr; // comparison DATA, not ownership
+    unsigned refusals=0;
+    std::uint64_t owned_reads=0,native_census_prefix=0;
+    std::uintptr_t statement_comparison=0;
+    bool busy=false,readonly=false,same_native=false,sql_present=false,sql_truncated=false;
+    int columns=0;
+    char sql[512]{};
+    mutation_tail_data before_call{},after_return{};
+};
+static_assert(sizeof(mutation_refusal_observation)<=1024,"fixed passive refusal DATA");
+inline thread_local mutation_refusal_observation* mutation_refusal=nullptr;
+struct mutation_refusal_scope final {
+    const std::uint64_t creator=database_native_process();
+    mutation_refusal_observation* const previous=mutation_refusal;
+    explicit mutation_refusal_scope(mutation_refusal_observation& actual)noexcept {mutation_refusal=&actual;}
+    ~mutation_refusal_scope()noexcept {mutation_refusal=creator==database_native_process()?previous:nullptr;}
+    mutation_refusal_scope(const mutation_refusal_scope&)=delete;
+};
+inline void observe_unregistered_busy(database& actual,sqlite3* native,sqlite3_stmt* statement,
+    std::uint64_t owned,std::uint64_t prefix)noexcept {
+    auto* out=mutation_refusal;
+    if(!out||out->creator!=database_native_process()||out->expected_writer!=&actual)return;
+    if(out->refusals!=UINT_MAX)++out->refusals;
+    if(out->refusals!=1)return; // first refusal is never overwritten by cleanup
+    out->owned_reads=owned;out->native_census_prefix=prefix;
+    out->statement_comparison=reinterpret_cast<std::uintptr_t>(statement);
+    out->busy=sqlite3_stmt_busy(statement)!=0;out->readonly=sqlite3_stmt_readonly(statement)!=0;
+    out->same_native=sqlite3_db_handle(statement)==native;out->columns=sqlite3_column_count(statement);
+    const auto* sql=sqlite3_sql(statement);out->sql_present=sql!=nullptr;
+    if(sql) {
+        std::size_t size=0;while(size+1<sizeof(out->sql)&&sql[size]){out->sql[size]=sql[size];++size;}
+        out->sql[size]=0;out->sql_truncated=sql[size]!=0;
+    }
+}
+} // namespace lattice::detail::recovery_admission_test_hooks

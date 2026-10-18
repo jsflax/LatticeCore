@@ -5,6 +5,7 @@
 #include "ordinary_projection_recipe.hpp"
 #include "ordinary_row_recipe.hpp"
 #include "ordinary_internal_schema.hpp"
+#include "observer_delivery_schema.hpp"
 #include "ordinary_managed_wss_binding.hpp"
 #include "ordinary_managed_wss_owner.hpp"
 #include "configured_recovery_connection.hpp"
@@ -610,6 +611,7 @@ std::shared_ptr<ordinary_managed_wss_handle> ordinary_managed_ipc_access::start_
             require(clock::now()<deadline&&!application->is_closed(),"managed WSS child admission expired");
             configuration child(application->config_.path,std::make_shared<std_thread_scheduler>());
             child.ordinary_context=application->config_.ordinary_context;
+            child.wal_extent_limit_bytes=application->config_.wal_extent_limit_bytes;
             child.busy_timeout_ms=application->config_.busy_timeout_ms;
             child.target_schema_version=application->config_.target_schema_version;
             child.migration_block=application->config_.migration_block;

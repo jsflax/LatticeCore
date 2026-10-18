@@ -1,3 +1,5 @@
+#include <lattice/store_physical_api.hpp>
+#include "database_sql_dispatcher.hpp"
 #include "ordinary_cohort_attachment.hpp"
 #include "lattice/projection.hpp"
 #include "lattice/lattice.hpp"
@@ -26,6 +28,12 @@ constexpr bool kMemoryCaptureEnabled = true;
 constexpr size_t kMaxLeases = 2; // Explicit resource choice; not a measured optimum.
 constexpr int64_t kMaxRequestBytes = 1024 * 1024;
 std::atomic<uint64_t> next_operation_id{1};
+uint64_t reserve_projection_operation_id() noexcept {
+    auto current = next_operation_id.load(std::memory_order_relaxed);
+    while (current != 0 && current != std::numeric_limits<uint64_t>::max())
+        if (next_operation_id.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) return current;
+    return 0; // Sticky exhaustion, never reuse a live physical-store token.
+}
 
 std::string quote_sql_identifier(const std::string& name) {
     std::string value = "\"";
@@ -119,7 +127,7 @@ private:
 };
 
 struct projection_operation_state : std::enable_shared_from_this<projection_operation_state> {
-    uint64_t id = next_operation_id.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = reserve_projection_operation_id();
     std::shared_ptr<projection_service> service;
     projection_query query;
     std::shared_ptr<database_read_control> control = std::make_shared<database_read_control>();
@@ -341,6 +349,9 @@ projection_status projection_store_ticket::publish(uint64_t operation_id, const 
     state_->operation_id = operation_id;
     return projection_status::batch;
 }
+projection_status projection_store_ticket::publish_unique(const std::shared_ptr<database_read_control>& control) const {
+    return publish(reserve_projection_operation_id(), control);
+}
 void projection_store_ticket::release() noexcept { state_.reset(); }
 std::shared_ptr<projection_pressure_source> make_projection_pressure_source(const std::shared_ptr<const physical_store_identity>& identity) {
     if (!identity) return {};
@@ -439,10 +450,12 @@ void projection_operation_state::cleanup_locked() noexcept {
     if (connection) {
         auto* handle = connection->internal_handle();
         control->unpublish(handle);
-        sqlite3_progress_handler(handle, 0, nullptr, nullptr);
-        sqlite3_busy_timeout(handle, 0);
-        if (statement) { sqlite3_finalize(statement); statement = nullptr; }
-        if (sqlite3_get_autocommit(handle) == 0) sqlite3_exec(handle, "ROLLBACK", nullptr, nullptr, nullptr);
+        const int progress_restored=connection->clear_sql_progress_(detail::database_handler_slot::checked_read,control.get());
+        const int busy_restored=connection->clear_sql_busy_(detail::database_handler_slot::checked_read,control.get(),0);
+        if(progress_restored!=SQLITE_OK||busy_restored!=SQLITE_OK)
+            control->stop(static_cast<int32_t>(projection_status::unsupported));
+        if (statement) { ::lattice::detail::store_physical_finalize(statement); statement = nullptr; }
+        if (sqlite3_get_autocommit(handle) == 0) ::lattice::detail::store_physical_exec(handle, "ROLLBACK", nullptr, nullptr, nullptr);
         if(connection.get_deleter().ledger)retired_connection.swap(connection);
         else connection.reset(); // Neutral existing disposal remains exact.
     }
@@ -642,7 +655,7 @@ void projection_operation_state::capture_all(sqlite3* handle) {
     int64_t captured_count = 0, captured_bytes = 0;
     for (;;) {
         check();
-        const int rc = sqlite3_step(statement);
+        const int rc = ::lattice::detail::store_physical_step(statement);
         if (rc == SQLITE_DONE) { check(); return; }
         if (rc != SQLITE_ROW) {
             check();
@@ -739,6 +752,7 @@ projection_read_operation projection_service::start(const projection_query& quer
         else if (operations_.size() >= kMaxOperations) { rejection = projection_status::admission_rejected; reason = "projection pending operation bound exceeded"; }
         state = std::make_shared<projection_operation_state>(shared_from_this(),
             rejection == projection_status::batch ? query : projection_query{}, deadline);
+        if (state->id == 0) { rejection = projection_status::admission_rejected; reason = "projection operation identity exhausted"; }
         if (rejection != projection_status::batch) {
             state->error = reason;
             state->control->stop_code.store(static_cast<int32_t>(rejection));
@@ -859,20 +873,20 @@ void projection_operation_state::prepare_query(sqlite3* handle,
     // File metadata stays on its private connection; memory metadata comes
     // only from the preflighted policy while its schema guards remain active.
     sqlite3_stmt* metadata = nullptr;
-    struct finalizer { sqlite3_stmt*& p; ~finalizer() { if (p) sqlite3_finalize(p); } } metadata_cleanup{metadata};
+    struct finalizer { sqlite3_stmt*& p; ~finalizer() { if (p) ::lattice::detail::store_physical_finalize(p); } } metadata_cleanup{metadata};
     bool has_source = false;
     if (policy) policy->validate_columns(query, has_source);
     else {
     const auto metadata_sql = "PRAGMA table_info(" + quote_sql_identifier(query.table) + ')';
     database::record_statement();
-    int rc = sqlite3_prepare_v2(handle, metadata_sql.c_str(), -1, &metadata, nullptr);
+    int rc = ::lattice::detail::store_physical_prepare_v2(handle, metadata_sql.c_str(), -1, &metadata, nullptr);
     if (rc != SQLITE_OK) throw db_error(sqlite3_errmsg(handle));
     std::set<std::string> missing(query.columns.begin(), query.columns.end());
     missing.insert(query.order_columns.begin(), query.order_columns.end());
     if (!query.group_by.empty()) missing.insert(query.group_by);
     if (!query.distinct_by.empty()) missing.insert(query.distinct_by);
     size_t inspected_columns = 0;
-    while ((rc = sqlite3_step(metadata)) == SQLITE_ROW) {
+    while ((rc = ::lattice::detail::store_physical_step(metadata)) == SQLITE_ROW) {
         check();
         if (++inspected_columns > 4096) fail(projection_status::schema_changed, "projection schema exceeds column bound");
         const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(metadata, 1));
@@ -885,7 +899,7 @@ void projection_operation_state::prepare_query(sqlite3* handle,
         }
     }
     if (rc != SQLITE_DONE) throw db_error(sqlite3_errmsg(handle));
-    sqlite3_finalize(metadata); metadata = nullptr;
+    ::lattice::detail::store_physical_finalize(metadata); metadata = nullptr;
     if (!missing.empty()) fail(projection_status::schema_changed, "projected or shape-dependent stored column is missing");
     }
 
@@ -901,14 +915,14 @@ void projection_operation_state::prepare_query(sqlite3* handle,
             const auto sql = "SELECT 1 FROM " + quote_sql_identifier(schema) +
                 ".sqlite_master WHERE type='table' AND name=? LIMIT 1";
             database::record_statement();
-            int result = sqlite3_prepare_v2(handle, sql.c_str(), -1, &metadata, nullptr);
+            int result = ::lattice::detail::store_physical_prepare_v2(handle, sql.c_str(), -1, &metadata, nullptr);
             if (result != SQLITE_OK) throw db_error(sqlite3_errmsg(handle));
             bind_checked(metadata, 1, table);
-            result = sqlite3_step(metadata);
+            result = ::lattice::detail::store_physical_step(metadata);
             check();
             if (result != SQLITE_ROW && result != SQLITE_DONE) throw db_error(sqlite3_errmsg(handle));
             const bool exists = result == SQLITE_ROW;
-            sqlite3_finalize(metadata); metadata = nullptr;
+            ::lattice::detail::store_physical_finalize(metadata); metadata = nullptr;
             return exists;
         };
         std::vector<spatial_query_arm> arms;
@@ -964,7 +978,7 @@ void projection_operation_state::prepare_query(sqlite3* handle,
     if (policy) policy->prepare_read(sql);
     else {
         database::record_statement();
-        const int rc = sqlite3_prepare_v2(handle, sql.c_str(), -1, &statement, &tail);
+        const int rc = ::lattice::detail::store_physical_prepare_v2(handle, sql.c_str(), -1, &statement, &tail);
         if (rc != SQLITE_OK) throw db_error(sqlite3_errmsg(handle));
     }
     while (tail && *tail && std::isspace(static_cast<unsigned char>(*tail))) ++tail;
@@ -1029,7 +1043,7 @@ projection_read_batch projection_operation_state::next(int64_t max_rows) {
         size_t batch_rows = 0;
         while (batch_rows < row_capacity) {
             check();
-            const int rc = sqlite3_step(statement);
+            const int rc = ::lattice::detail::store_physical_step(statement);
             if (rc == SQLITE_DONE) {
                 check(); done.store(true); cleanup_locked();
                 return result(projection_status::done, std::move(cells));
@@ -1128,6 +1142,7 @@ column_value_t projection_read_batch::value(int64_t row, int64_t column) const {
 }
 
 projection_read_operation lattice_db::start_projection(const projection_query& query) {
+    require_catalog_callback_absent();
     note_history_uncaptured_connection(); // Before a private projection connection or service can be admitted.
     std::shared_ptr<projection_service> service;
     {

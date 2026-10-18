@@ -15,6 +15,17 @@ struct recovery_continuous_state {
     int64_t incarnation=0,barrier=0,attempt=0;
     std::set<std::string> generated_names;
     std::weak_ptr<recovery_receiver_controller> controller;
+#ifndef __EMSCRIPTEN__
+    // Actual candidate originals, reserved BEFORE construction/worker launch.
+    // Retain racing/unpublished candidates independently of controller weak refs.
+    std::array<std::shared_ptr<controller_worker_original>,64> controller_originals;
+    std::shared_ptr<controller_worker_original> first_failed_controller_original;
+    const uint64_t controller_creator=database_native_process();
+    size_t controller_publication_builders=0;
+    std::atomic<bool> controller_publication_unknown{false};
+    std::condition_variable controller_publications_returned;
+    bool controller_deletion_retiring=false;
+#endif
     // Physical custody survives controller/route turnover while old work still
     // owns a cohort. Never clear this slot on request/source replacement.
     std::weak_ptr<const recovery_reconciliation_cohort> reconciliation_cohort;
@@ -54,6 +65,18 @@ struct recovery_continuous_state {
 struct recovery_continuous_admission {
     std::shared_ptr<const recovery_continuous_producer::owner_recipe> recipe;
     std::shared_ptr<recovery_continuous_state> state;
+    // Fixed process/builder-fenced DATA, retained BEFORE the actual writer
+    // opens. It retains no additional Native original or strong facade owner.
+    struct pending_startup_handoff {
+        const std::uint64_t creator=database_native_process();
+        const std::thread::id builder=std::this_thread::get_id();
+        std::shared_ptr<observer_delivery_startup> startup;
+        std::shared_ptr<observer_delivery_open_startup> writer_open;
+        const recovery_owner_schema* catalog=nullptr; // comparison only
+        bool attempted=false;
+        std::chrono::steady_clock::time_point resource_end{};
+        std::optional<store_resource_continuous_startup> resource_startup;
+    } pending_startup;
     lattice_db* owner=nullptr;
     database* writer=nullptr;
     std::weak_ptr<lattice_db> retained_owner;
@@ -117,16 +140,17 @@ bool continuous_authorize(const recovery_continuous_admission& a,int action,cons
     }
     return true;
 }
-programs continuous_guards() {
-    programs out;
+template<class Text,class Programs>Programs continuous_guards_storage() {
+    Programs out;
     for(const char* op:{"INSERT","UPDATE","DELETE"}) {
-        const auto name=std::string("_lattice_producer_continuity_")+op;
+        const auto name=Text("_lattice_producer_continuity_")+op;
         out.emplace(name,"CREATE TRIGGER "+name+" BEFORE "+op+" ON _lattice_producer_continuity BEGIN SELECT CASE WHEN lattice_recovery_continuity_owned_v1()=1 THEN 1 ELSE RAISE(ABORT,'continuous closed mutation required') END; END");
     }
     return out;
 }
-void continuous_inventory(database& db) {
-    const auto rows=db.query("SELECT type,CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN length(CAST(sql AS BLOB))<=4096 THEN sql END AS sql FROM main.sqlite_schema WHERE name GLOB '_lattice_producer_continuity*' LIMIT 5");
+programs continuous_guards() {return continuous_guards_storage<std::string,programs>();}
+void continuous_inventory(database& db,recovery_obligation_bootstrap_reader* initialization=nullptr) {
+    const auto rows=initialization?initialization->query_(bootstrap_kind::continuous_inventory):db.query("SELECT type,CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN length(CAST(sql AS BLOB))<=4096 THEN sql END AS sql FROM main.sqlite_schema WHERE name GLOB '_lattice_producer_continuity*' LIMIT 5");
     auto expected=continuous_guards();expected.emplace(continuous_table,continuous_ddl);
     if(rows.size()!=expected.size())refuse("continuous fixed schema inventory differs");
     for(const auto& row:rows){const auto name=text(row,"name");const auto found=expected.find(name);
@@ -172,27 +196,40 @@ blob continuous_manifest(const recovery_continuous_policy& policy) {
     }
     return out;
 }
+blob continuous_request_preflight(const configuration& config,const recovery_continuous_policy& policy) {
+    if(config.path.size()>4096||config.read_only||config.is_in_memory()||config.is_ipc_enabled()||config.audit_retention_seconds||config.migration_block||
+       config.path.find('?')!=std::string::npos||config.path.starts_with("file:"))refuse("continuous configuration topology unavailable");
+    auto manifest=continuous_manifest(policy); // validates all counts before route traversal/copy
+    if(config.is_sync_enabled()) {
+        bool match=false;for(const auto& route:policy.routes)if(route.endpoint==config.websocket_url&&route.sync_id=="wss:"+config.websocket_url)match=true;
+        if(!match||config.sync_filter)refuse("continuous configured WSS route outside policy");
+    }
+    return manifest;
+}
 std::mutex continuous_sessions_mutex;
 std::map<std::string,std::weak_ptr<recovery_continuous_state>> continuous_sessions;
 bool continuous_reserved(const std::filesystem::path& path) {
     for(const auto& component:path)if(component.string().ends_with(".lattice-continuous"))return true;
     return false;
 }
-std::shared_ptr<recovery_continuous_admission> continuous_acquire(const configuration& config,const recovery_continuous_policy& policy) {
+} // private helper namespace; actual producer consumes its real resource original
+std::shared_ptr<recovery_continuous_admission> recovery_continuous_producer::acquire_(
+    const configuration& config,const recovery_continuous_policy& policy,
+    store_resource_continuous_startup resources,std::chrono::steady_clock::time_point resource_end) {
 #if defined(__APPLE__) || defined(__linux__)
-    if(config.path.size()>4096||config.read_only||config.is_in_memory()||config.is_ipc_enabled()||config.audit_retention_seconds||config.migration_block||
-       config.path.find('?')!=std::string::npos||config.path.starts_with("file:"))refuse("continuous configuration topology unavailable");
-    auto manifest=continuous_manifest(policy);
+    auto manifest=continuous_request_preflight(config,policy);
     auto normalized=policy; // First bounded validation above precedes copying.
     for(auto& contribution:normalized.contributions)std::sort(contribution.models.begin(),contribution.models.end());
     std::sort(normalized.contributions.begin(),normalized.contributions.end(),[](const auto& a,const auto& b){return a.profile.binding.channel<b.profile.binding.channel;});
     std::sort(normalized.routes.begin(),normalized.routes.end(),[](const auto& a,const auto& b){return a.sync_id<b.sync_id;});
     manifest=continuous_manifest(normalized);
-    if(config.is_sync_enabled()) {
-        bool match=false;for(const auto& route:policy.routes)if(route.endpoint==config.websocket_url&&route.sync_id=="wss:"+config.websocket_url)match=true;
-        if(!match||config.sync_filter)refuse("continuous configured WSS route outside policy");
-    }
+
+    if(resource_end==std::chrono::steady_clock::time_point::max()||std::chrono::steady_clock::now()>=resource_end)
+        refuse("continuous resource factory deadline exhausted");
+    const bool managed=resources.managed_();
     auto admission=std::make_shared<recovery_continuous_admission>();
+    admission->pending_startup.resource_end=resource_end;
+    admission->pending_startup.resource_startup.emplace(std::move(resources));
     const auto lexical=std::filesystem::absolute(config.path).lexically_normal();
     if(lexical.filename()!="store.sqlite"||!lexical.parent_path().filename().string().ends_with(".lattice-continuous"))refuse("continuous explicit reserved container required");
     const auto outer=std::filesystem::canonical(lexical.parent_path().parent_path());
@@ -203,7 +240,16 @@ std::shared_ptr<recovery_continuous_admission> continuous_acquire(const configur
     std::shared_ptr<recovery_continuous_state> state;
     {std::lock_guard<std::mutex> lock(continuous_sessions_mutex);
      if(const auto found=continuous_sessions.find(path);found!=continuous_sessions.end())state=found->second.lock();}
-    if(state){std::lock_guard<std::mutex> lock(state->mutex);
+    if(state){
+        // The real retained state pins these directory originals. Perform all
+        // resource/path/Host work BEFORE the existing state data mutex, then
+        // revalidate the actual session data under that mutex before counting.
+        if(managed) {
+            const auto source=admission->pending_startup.resource_startup->claim_container_(path,state->parent_fd,state->container_fd);
+            if(source!=store_resource_continuous_startup::first_start::existing)
+                refuse("continuous live session cannot adopt a new physical incarnation");
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
         if(!state->initialized||state->opening||state->manifest!=manifest||state->owners==policy.owners)refuse("continuous existing session unavailable or policy changed");
         ++state->owners;
     } else {
@@ -215,15 +261,24 @@ std::shared_ptr<recovery_continuous_admission> continuous_acquire(const configur
         struct stat root{},container{},main{};
         if(::fstat(state->parent_fd,&root)||!S_ISDIR(root.st_mode))refuse("continuous parent is not directory");
         const auto name=lexical.parent_path().filename().string();
-        if(::mkdirat(state->parent_fd,name.c_str(),0700)==0)state->fresh=true;
-        else if(errno!=EEXIST)refuse("continuous fresh container creation failed");
+        if(!managed) {
+            if(::mkdirat(state->parent_fd,name.c_str(),0700)==0)state->fresh=true;
+            else if(errno!=EEXIST)refuse("continuous fresh container creation failed");
+        }
         state->container_fd=::openat(state->parent_fd,name.c_str(),flags);
         if(state->container_fd<0||::fstat(state->container_fd,&container)||!S_ISDIR(container.st_mode)||container.st_uid!=::geteuid()||(container.st_mode&07777)!=0700)
             refuse("continuous container missing, replaced or malformed");
         if(::flock(state->container_fd,LOCK_EX|LOCK_NB))refuse("continuous directory already owned or platform lock unavailable");
         state->locked=true;
+        if(managed) {
+            const auto source=admission->pending_startup.resource_startup->claim_container_(path,state->parent_fd,state->container_fd);
+            state->fresh=source!=store_resource_continuous_startup::first_start::existing;
+        }
         const int present=::fstatat(state->container_fd,"store.sqlite",&main,AT_SYMLINK_NOFOLLOW);
-        if(state->fresh ? (present==0||errno!=ENOENT) : (present!=0||!S_ISREG(main.st_mode)||main.st_nlink!=1))refuse("continuous first-open/reopen identity invalid");
+        // A managed first start consumes an actual creation original with its
+        // already-created zero MAIN; legacy mkdir freshness remains unchanged.
+        if(state->fresh&&!managed ? (present==0||errno!=ENOENT) :
+           (present!=0||!S_ISREG(main.st_mode)||main.st_nlink!=1))refuse("continuous first-open/reopen identity invalid");
         state->parent_device=state->bounded(root.st_dev);state->parent_inode=state->bounded(root.st_ino);
         state->container_device=state->bounded(container.st_dev);state->container_inode=state->bounded(container.st_ino);
         if(::fsync(state->container_fd)||::fsync(state->parent_fd))refuse("continuous directory durability unavailable");
@@ -236,12 +291,13 @@ std::shared_ptr<recovery_continuous_admission> continuous_acquire(const configur
     }
     admission->state=std::move(state);admission->counted=true;return admission;
 #else
-    (void)config;(void)policy;refuse("continuous native directory custody platform unavailable");
+    (void)config;(void)policy;(void)resources;(void)resource_end;refuse("continuous native directory custody platform unavailable");
 #endif
 }
-void continuous_verify_row(database& db,recovery_continuous_state& state,bool current=true) {
-    state.verify_file(db);continuous_inventory(db);
-    const auto rows=db.query(continuous_query);
+namespace {
+void continuous_verify_row(database& db,recovery_continuous_state& state,bool current=true,recovery_obligation_bootstrap_reader* initialization=nullptr) {
+    state.verify_file(db);continuous_inventory(db,initialization);
+    const auto rows=initialization?initialization->query_(bootstrap_kind::continuous_row):db.query(continuous_query);
     if(rows.size()!=1)refuse("continuous lineage row missing or duplicate");const auto& row=rows[0];
     const auto bytes=[&](const char* name)->const blob&{const auto at=row.find(name);if(at==row.end()||!std::holds_alternative<blob>(at->second))refuse("continuous invalid blob");return std::get<blob>(at->second);};
     if(integer(row,"id")!=1||integer(row,"version")!=(continuous_receiver_enabled(state)?2:1)||bytes("manifest")!=state.manifest||bytes("digest")!=blob(state.digest.begin(),state.digest.end())||
@@ -250,7 +306,7 @@ void continuous_verify_row(database& db,recovery_continuous_state& state,bool cu
        integer(row,"container_device")!=state.container_device||integer(row,"container_inode")!=state.container_inode||
        integer(row,"incarnation")<=0||integer(row,"barrier")<0||integer(row,"attempt")<0||integer(row,"phase")<0||integer(row,"phase")>(continuous_receiver_enabled(state)?4:2)||(integer(row,"phase")!=0&&(integer(row,"barrier")==0||integer(row,"attempt")==0))||
        (current&&integer(row,"incarnation")!=state.incarnation))refuse("continuous lineage physical/policy binding differs");
-    const auto mode=db.query("PRAGMA journal_mode"),durability=db.query("PRAGMA synchronous");
+    const auto mode=initialization?initialization->query_(bootstrap_kind::journal_mode):db.query("PRAGMA journal_mode"),durability=initialization?initialization->query_(bootstrap_kind::synchronous):db.query("PRAGMA synchronous");
     if(mode.size()!=1||text(mode[0],"journal_mode")!="wal"||durability.size()!=1||integer(durability[0],"synchronous")<2)refuse("continuous requires WAL and FULL/EXTRA synchronous");
 }
 } // namespace

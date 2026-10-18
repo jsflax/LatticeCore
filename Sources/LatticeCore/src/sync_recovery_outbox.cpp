@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "sync_recovery_outbox.hpp"
 #include "recovery_writer_access.hpp"
 #include <cmath>
@@ -19,18 +20,18 @@ struct statement {
     sqlite3_stmt* value = nullptr;
     statement(sqlite3* db, const std::string& sql) {
         database::record_statement();
-        const int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &value, nullptr);
+        const int rc = ::lattice::detail::store_physical_prepare_v2(db, sql.c_str(), -1, &value, nullptr);
         if (rc != SQLITE_OK) {
-            sqlite3_finalize(value); value = nullptr;
+            ::lattice::detail::store_physical_finalize(value); value = nullptr;
             sql_ok(rc);
         }
         if (!value || !sqlite3_stmt_readonly(value)) {
-            sqlite3_finalize(value); value = nullptr;
+            ::lattice::detail::store_physical_finalize(value); value = nullptr;
             fail(code::sql_error, "outbox requires a read-only statement");
         }
     }
     statement(const statement&) = delete;
-    ~statement() { sqlite3_finalize(value); }
+    ~statement() { ::lattice::detail::store_physical_finalize(value); }
     void text(int at, const std::string& text) {
         if (text.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
             fail(code::budget_exceeded, "outbox binding is too large");
@@ -39,7 +40,7 @@ struct statement {
     }
     void integer(int at, int64_t n) { sql_ok(sqlite3_bind_int64(value, at, n)); }
     bool next() {
-        const int rc = sqlite3_step(value);
+        const int rc = ::lattice::detail::store_physical_step(value);
         if (rc == SQLITE_ROW) return true;
         if (rc == SQLITE_DONE) return false;
         fail(code::sql_error, "outbox SQLite read failed", rc);

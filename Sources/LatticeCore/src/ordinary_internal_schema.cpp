@@ -1,4 +1,5 @@
 #include "ordinary_internal_schema.hpp"
+#include "observer_delivery_schema.hpp"
 #include <lattice/ordinary_internal_program.hpp>
 #include <algorithm>
 #include <set>
@@ -80,7 +81,7 @@ struct validator {
     void inventory(){auto rows=read.get("SELECT type,name,tbl_name AS owner,sql FROM main.sqlite_schema ORDER BY name COLLATE BINARY LIMIT "+std::to_string(read.limits.objects+1),{},read.limits.objects);
         for(const auto& r:rows){ordinary_object_metadata f{text(r,"type"),text(r,"name"),text(r,"owner"),null(r,"sql")?std::string{}:text(r,"sql")};
             require(f.name.size()<=256&&f.owner.size()<=256&&f.sql.size()<=read.limits.sql_bytes,"ordinary internal schema object bound");require(all.emplace(fold(f.name),std::move(f)).second,"ordinary internal schema name collision");}}
-    void table(const table_spec& spec){owned.insert(fold(spec.name));const auto& f=object(spec.name,"table",spec.name);require(program(f.sql)==program(spec.sql),"ordinary internal table program/default mismatch");
+    void table(const table_spec& spec,bool exact_program=false){owned.insert(fold(spec.name));const auto& f=object(spec.name,"table",spec.name);require(exact_program?f.sql==spec.sql:program(f.sql)==program(spec.sql),"ordinary internal table program/default mismatch");
         auto cols=read.get("SELECT cid,name,type,\"notnull\" AS nn,dflt_value AS def,pk,hidden FROM pragma_table_xinfo(?, 'main') ORDER BY cid LIMIT "+std::to_string(spec.columns.size()+1),{spec.name},spec.columns.size());
         require(cols.size()==spec.columns.size(),"ordinary internal column count mismatch");ordinary_table_metadata observed{spec.name,{}};
         for(size_t i=0;i<cols.size();++i){const auto& r=cols[i];const auto& c=spec.columns[i];require(number(r,"cid")==int64_t(i)&&text(r,"name")==c.name&&fold(text(r,"type"))==c.type&&number(r,"nn")==c.nn&&number(r,"pk")==c.pk&&number(r,"hidden")==0,"ordinary internal column flags mismatch");
@@ -99,6 +100,27 @@ struct validator {
                 if(key){auto c=std::find_if(spec.columns.begin(),spec.columns.end(),[&](const auto& x){return x.name==s.columns[i];});require(c!=spec.columns.end(),"ordinary internal generated index column missing");cid=c-spec.columns.begin();coll=c->collation;}
                 require(number(d,"seqno")==int64_t(i)&&number(d,"cid")==cid&&number(d,"descending")==0&&number(d,"iskey")==int64_t(key)&&fold(text(d,"coll"))==coll&&(key?text(d,"name")==s.columns[i]:null(d,"name")),"ordinary internal index keys/collation mismatch");}
         }
+    }
+    void delivery(const recovery_owner_schema& catalog){
+        // The stored ledger only selects the *closed versioned* expectation.
+        // It is not authority: exact DDL, physical shape, row types, complete
+        // regenerated AuditLog guards and unchanged ownership closure follow.
+        const auto found=all.find(fold(std::string(observer_delivery_meter::ledger_name())));
+        if(found==all.end())return;
+        table_spec ledger{std::string(observer_delivery_meter::ledger_name()),std::string(observer_delivery_meter::ledger_ddl()),
+            {{"id","integer",0,1},{"token","blob",1},{"events","integer",1},{"bytes","integer",1}}, {}};
+        table(ledger,true); // no widening of the existing SQL lexer/grammar
+        const auto rows=read.get("SELECT id,typeof(token) AS token_type,length(token) AS token_bytes,CASE WHEN typeof(events)='integer' THEN events END AS events,CASE WHEN typeof(bytes)='integer' THEN bytes END AS bytes FROM main._lattice_observer_delivery_meter_v1 LIMIT 2",{},2);
+        require(rows.size()==1&&number(rows[0],"id")==1&&text(rows[0],"token_type")=="blob"&&
+            number(rows[0],"token_bytes")==32&&number(rows[0],"events")>=0&&number(rows[0],"bytes")>=0,
+            "ordinary internal delivery ledger row shape differs");
+        size_t count=0;
+        for(const auto& expected_program:observer_delivery_schema::programs(catalog)) {
+            if(expected_program.table!="AuditLog")continue;
+            const auto& actual=object(expected_program.name,"trigger","AuditLog");
+            require(actual.sql==expected_program.sql,"ordinary internal exact delivery audit guard differs");++count;
+        }
+        require(count==3,"ordinary internal complete delivery audit guard bundle missing");
     }
     void close(){for(const auto& [name,f]:all)if(owned.count(name)||owned.count(fold(f.owner)))require(expected.count(name),"ordinary internal extra owned trigger/program");
         auto temp=read.get("SELECT type,name,tbl_name AS owner,sql FROM temp.sqlite_schema LIMIT "+std::to_string(read.limits.objects+1),{},read.limits.objects);
@@ -145,7 +167,7 @@ ordinary_internal_schema_metadata validate_ordinary_internal_schema(const recove
     validator v{{query,limits},{},{},{},{}};v.result.schema_cookie=v.read.cookie("main");v.result.temp_schema_cookie=v.read.cookie("temp");
     require(v.result.schema_cookie==inspected.schema_cookie&&v.result.temp_schema_cookie==inspected.temp_schema_cookie,"ordinary internal view differs from preflight");
     auto databases=v.read.get("PRAGMA database_list",{},3);require(databases.size()<=2,"ordinary internal attached schema refused");for(const auto& r:databases)require(text(r,"name")=="main"||text(r,"name")=="temp","ordinary internal attached schema refused");
-    v.inventory();for(const auto& s:specifications())v.table(s);v.close();memberships(v,catalog,projection);
+    v.inventory();for(const auto& s:specifications())v.table(s);v.delivery(catalog);v.close();memberships(v,catalog,projection);
     require(v.read.cookie("main")==v.result.schema_cookie&&v.read.cookie("temp")==v.result.temp_schema_cookie,"ordinary internal retained view changed");
     v.result.inspected_rows=v.read.rows;v.result.copied_bytes=v.read.copied;return std::move(v.result);
 }

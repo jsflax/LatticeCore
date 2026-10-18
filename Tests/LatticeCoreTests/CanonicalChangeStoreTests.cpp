@@ -1,6 +1,7 @@
 #include "TestHelpers.hpp"
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/canonical_change_store.hpp"
+#include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
 #include <limits>
 
 namespace {
@@ -148,7 +149,7 @@ TEST(CanonicalChangeStoreFaults, AbortedOrIgnoredWritesRestoreEveryCounterAndAll
             SCOPED_TRACE(std::string(stage)+"/"+mode);
             lattice::lattice_db db{config(":memory:")}; Owned tx(db); canonical_change_store s(db,binding(),limits()); s.initialize();
             s.record({{"T","existing"}}); const auto before=s.state(); int calls=0;
-            ASSERT_EQ(sqlite3_create_function(db.db().handle(),"canonical_fault_seen",0,SQLITE_UTF8,&calls,
+            ASSERT_EQ(sqlite3_create_function(recovery_writer_access::active_handle(db,db.db()),"canonical_fault_seen",0,SQLITE_UTF8,&calls,
                 [](sqlite3_context* c,int,sqlite3_value**) noexcept { ++*static_cast<int*>(sqlite3_user_data(c)); sqlite3_result_int(c,1); },
                 nullptr,nullptr),SQLITE_OK);
             const std::string stage_name=stage;
@@ -163,7 +164,7 @@ TEST(CanonicalChangeStoreFaults, AbortedOrIgnoredWritesRestoreEveryCounterAndAll
             EXPECT_EQ(s.touch({"T","existing"}),std::optional<int64_t>(1)); s.audit();
             db.db().execute("DROP TRIGGER canonical_fault");
             EXPECT_TRUE(s.record(ids,request()).newly_recorded); s.audit();
-            ASSERT_EQ(sqlite3_create_function(db.db().handle(),"canonical_fault_seen",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
+            ASSERT_EQ(sqlite3_create_function(recovery_writer_access::active_handle(db,db.db()),"canonical_fault_seen",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
             tx.commit();
         }
     }
@@ -210,7 +211,7 @@ TEST_F(CanonicalChangeStore, FailedOuterCommitCannotPublishTentativeHeadOrReceip
     initialize();
     {
         Owned tx(db); auto s=store(); s.record({{"T","a"}},request()); int attempts=0;
-        ASSERT_EQ(sqlite3_set_authorizer(db.db().handle(),
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(db,db.db()),
             [](void* value,int action,const char* first,const char*,const char*,const char*) noexcept {
                 if (action==SQLITE_TRANSACTION && first && std::strcmp(first,"COMMIT")==0) {
                     ++*static_cast<int*>(value); return SQLITE_DENY;
@@ -218,7 +219,7 @@ TEST_F(CanonicalChangeStore, FailedOuterCommitCannotPublishTentativeHeadOrReceip
                 return SQLITE_OK;
             },&attempts),SQLITE_OK);
         EXPECT_THROW(tx.commit(),lattice::db_error); EXPECT_EQ(attempts,1);
-        ASSERT_EQ(sqlite3_set_authorizer(db.db().handle(),nullptr,nullptr),SQLITE_OK); tx.rollback();
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(db,db.db()),nullptr,nullptr),SQLITE_OK); tx.rollback();
     }
     Owned verify(db); EXPECT_EQ(store().state(),canonical_store_state{}); EXPECT_FALSE(store().receipt("original")); verify.commit();
 }
@@ -228,7 +229,7 @@ TEST_F(CanonicalChangeStore, CleanupFailureCarriesBothErrorsAndRequiresOuterRoll
     {
         Owned tx(db); auto s=store(); int denied=0;
         db.db().execute("CREATE TRIGGER canonical_fail BEFORE INSERT ON _lattice_canonical_receipt BEGIN SELECT RAISE(ABORT,'receipt'); END");
-        ASSERT_EQ(sqlite3_set_authorizer(db.db().handle(),
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(db,db.db()),
             [](void* value,int action,const char* first,const char* second,const char*,const char*) noexcept {
                 if (action==SQLITE_SAVEPOINT && first && second && std::strcmp(first,"ROLLBACK")==0 &&
                     std::strcmp(second,"lattice_canonical_primitive")==0) {
@@ -242,7 +243,7 @@ TEST_F(CanonicalChangeStore, CleanupFailureCarriesBothErrorsAndRequiresOuterRoll
             caught=true; EXPECT_EQ(e.code,err::cleanup_failed); EXPECT_TRUE(e.primary_error); EXPECT_TRUE(e.cleanup_error);
         }
         catch (...) { ADD_FAILURE()<<"expected structured cleanup failure"; }
-        ASSERT_EQ(sqlite3_set_authorizer(db.db().handle(),nullptr,nullptr),SQLITE_OK);
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(db,db.db()),nullptr,nullptr),SQLITE_OK);
         EXPECT_TRUE(caught); EXPECT_EQ(denied,1); tx.rollback();
     }
     Owned verify(db); EXPECT_EQ(store().state(),canonical_store_state{}); store().audit(); verify.commit();
@@ -340,7 +341,7 @@ TEST_F(CanonicalChangeStore, AddressedRecordDoesNotScanRetainedMarkerSet) {
         "INSERT INTO _lattice_canonical_touch SELECT CAST('T' AS BLOB),CAST(x AS BLOB),x,25+length(CAST(x AS BLOB)) FROM n");
     db.db().execute("UPDATE _lattice_canonical_store SET head=3072,markers=3072,marker_bytes="
         "(SELECT SUM(charge) FROM _lattice_canonical_touch)"); s.audit();
-    int callbacks=0; auto* handle=db.db().handle();
+    int callbacks=0; auto* handle=recovery_writer_access::active_handle(db,db.db());
     sqlite3_progress_handler(handle,10,[](void* value) noexcept { return ++*static_cast<int*>(value)>2000 ? 1:0; },&callbacks);
     EXPECT_NO_THROW(s.record({{"T","3072"}},request()));
     sqlite3_progress_handler(handle,0,nullptr,nullptr);

@@ -176,13 +176,44 @@ retained_historical_generation engram_namespace_retirement::retain_after_managed
     custody.verify_(end);
     auto owner=impl_;auto prior=runtime.state_;auto old=custody.verify_;
     auto state=std::make_shared<retained_historical_generation::implementation>();
-    state->verify=[owner,prior,old](deadline until) {
+    state->verify=[owner,prior,old,original_end=end](deadline until) {
+        if(until!=original_end)fail(code::invalid);
         old(until);auto result=owner->inspect_managed(*prior,until);old(until);return result;
     };
-    state->duplicate_generation=[owner,verify=state->verify](deadline until) {
-        (void)verify(until);auto copy=duplicate(owner->generation.n);
+    auto attempt = std::make_shared<retained_historical_generation::implementation::drain_attempt>();
+    state->drain_state = attempt;
+    state->duplicate_generation=[owner,verify=state->verify,attempt](deadline until) {
+        (void)verify(until);bound(until);
+        if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+        if (!attempt->entered || !attempt->terminal_success) fail(code::incomplete);
+        auto copy=duplicate(owner->generation.n);
         if(identity(held(copy.n))!=owner->generation_id)fail(code::changed);
-        (void)verify(until);return std::exchange(copy.n,-1);
+        (void)verify(until);bound(until);
+        if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+        if (!attempt->entered || !attempt->terminal_success) fail(code::incomplete);
+        return std::exchange(copy.n,-1);
+    };
+    state->drain = [owner, verify = state->verify, attempt, original_end = end](deadline until) {
+        if (until != original_end) fail(code::invalid);
+        const auto observed = verify(until); // Actual creator/currentness before mutable attempt facts.
+        if (attempt->entered) {
+            if (attempt->first_failure) std::rethrow_exception(attempt->first_failure);
+            fail(code::incomplete);
+        }
+        attempt->entered = true;
+        try {
+            const std::function<void(deadline)> reverify = [verify, original_end](deadline check_end) {
+                if (check_end != original_end) fail(code::invalid);
+                (void)verify(check_end);
+            };
+            historical_wal_checkpoint::drain(owner->generation.n, observed, until, reverify);
+            (void)verify(until);
+            bound(until);
+            attempt->terminal_success = true;
+        } catch (...) {
+            attempt->first_failure = std::current_exception();
+            throw;
+        }
     };
     (void)state->verify(end);return retained_historical_generation(std::move(state));
 #else

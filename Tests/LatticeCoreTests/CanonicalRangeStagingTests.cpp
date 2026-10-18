@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "../../Sources/LatticeCore/src/canonical_range_staging.hpp"
+#include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -313,7 +314,7 @@ TEST_F(CanonicalRangeStaging, AppendAndPointReadHaveFixedSQLiteWorkDespiteRetain
     x.seal();initialize();Owned tx(*owner);begin();
     for(uint64_t i=0;i<2048;++i)staged->append(x.content(i));
     // Setup and whole verification are deliberately outside the VM ceiling.
-    auto* handle=owner->db().handle();int callbacks=0;
+    auto* handle=recovery_writer_access::active_handle(*owner,owner->db());int callbacks=0;
     const auto ceiling=[&]{callbacks=0;sqlite3_progress_handler(handle,10,[](void* p) noexcept {return ++*static_cast<int*>(p)>2000?1:0;},&callbacks);};
     ceiling();EXPECT_NO_THROW(staged->append(x.content(2048)));sqlite3_progress_handler(handle,0,nullptr,nullptr);
     EXPECT_LE(callbacks,2000)<<"append must not recount/rehash the retained page set";
@@ -369,7 +370,7 @@ TEST_F(CanonicalRangeStaging, CorruptNumericSlotsAreRejectedBeforeGenericBlobOrT
         owner->db().execute("SAVEPOINT corrupt_numeric");
         owner->db().execute(std::string("UPDATE ")+table+" SET "+column+"="+(stored_text?"CAST(zeroblob(262144) AS TEXT)":"zeroblob(262144)"));
         exposed={};
-        {trace_guard trace(owner->db().handle(),exposed);
+        {trace_guard trace(recovery_writer_access::active_handle(*owner,owner->db()),exposed);
          refusal(canonical_staging_code::corrupt_state,[&]{
              if(std::string_view(table)=="_lattice_range_store")staged->usage();else staged->append(x.content());
          });}

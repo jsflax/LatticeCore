@@ -169,7 +169,7 @@ public:
 class ConfiguredConnectionOwner:public ::testing::Test {
 protected:
     TempDB unique{"configured-owner"};
-    std::filesystem::path container=unique.str()+".continuous";
+    std::filesystem::path container=unique.str()+".lattice-continuous";
     std::shared_ptr<network_factory> prior;
     std::shared_ptr<configured_test_factory> factory=std::make_shared<configured_test_factory>();
     std::shared_ptr<lattice_db> owner;

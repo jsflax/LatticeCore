@@ -44,6 +44,7 @@ struct sync_pacer_state {
     std::condition_variable ready;
     bool stop=false;
     std::atomic<bool> requested{false};
+    std::atomic<bool> controller_notifications{false};
     std::atomic<int> coalesce_milliseconds{0};
     std::chrono::steady_clock::time_point next_allowed_tick{};
     // Queue revisions have their own mutex. Join the condition-variable
@@ -58,6 +59,8 @@ struct sync_pacer_state {
 // Admission fences physical C++ owner teardown. A shared cell alone is not an
 // owner: destructor retirement waits for foreign executions before members die.
 class sync_callback_lifetime {
+    friend struct sync_callback_lifetime_test_access; // deny-only private fixture
+    const uint64_t creator_;
     struct execution;
     static thread_local execution* current_;
     std::mutex mutex_;
@@ -102,6 +105,10 @@ public:
 };
 void report_sync_background_error(std::shared_ptr<scheduler>,std::shared_ptr<sync_callback_lifetime>,uint64_t,
     std::function<void(const std::string&)>,std::exception_ptr,const char*) noexcept;
+// Narrow route-notification tail: caller is already admitted by the actual
+// original lifetime scheduler. Does not enqueue another untracked error tail.
+void report_sync_background_error_dispatched(const std::function<void(const std::string&)>&,
+    const std::exception_ptr&,const char*) noexcept;
 void schedule_sync_terminal_notification(std::shared_ptr<scheduler>,std::shared_ptr<sync_callback_lifetime>,uint64_t,std::function<void()>);
 std::shared_ptr<scheduler> make_sync_lifetime_scheduler(std::shared_ptr<scheduler>,std::shared_ptr<sync_callback_lifetime>);
 
@@ -112,9 +119,11 @@ struct sync_retirement_result {
     bool disconnect_returned=false,pacer_present=false,pacer_joined=false,callbacks_settled=false;
     bool unstarted_reservation_canceled=false;
 };
+class recovery_controller_executor;
+struct recovery_controller_executor_test_access;
 class sync_retirement_lane : public std::enable_shared_from_this<sync_retirement_lane> {
     enum class phase { free,reserved,queued,active,quarantined };
-    struct slot {phase state=phase::free;uint64_t serial=0,queued_order=0;std::shared_ptr<sync_transport> transport;std::shared_ptr<sync_callback_lifetime> lifetime;std::thread pacer;std::shared_ptr<const std::function<void(sync_retirement_result)>> completed;};
+    struct slot {phase state=phase::free;uint64_t serial=0,queued_order=0;std::shared_ptr<sync_transport> transport;std::shared_ptr<sync_callback_lifetime> lifetime;std::thread pacer;std::shared_ptr<const std::function<void(sync_retirement_result)>> completed;std::shared_ptr<void> controller_thread_custody;};
     std::array<slot,64> slots_{};
     std::mutex mutex_;
     std::condition_variable ready_,settled_;
@@ -129,9 +138,12 @@ class sync_retirement_lane : public std::enable_shared_from_this<sync_retirement
     void request(size_t,uint64_t,std::thread = {}) noexcept;
     void cancel(size_t,uint64_t) noexcept;
     friend struct sync_retirement_test_access;
+    friend struct recovery_controller_executor_test_access;
 public:
     class reservation {
         friend class sync_retirement_lane;
+        friend class recovery_controller_executor;
+        void bind_controller_thread(std::shared_ptr<void>,std::function<void(sync_retirement_result)>);
         std::shared_ptr<sync_retirement_lane> lane_;
         size_t slot_=0;uint64_t serial_=0;bool published_=false;
         reservation(std::shared_ptr<sync_retirement_lane>,size_t,uint64_t);

@@ -230,15 +230,31 @@ TEST(NoHistory, OrdinaryQueryKeepsActualRawMembershipAfterTargetDeletion) {
     owner.db().execute("UPDATE NhDoc SET body='v2' WHERE globalId='d1'");
     owner.db().execute("DELETE FROM NhDoc WHERE globalId='d1'");
     const auto before=owner.db().query("SELECT * FROM AuditLog ORDER BY id");
+    // The existing trigger emits every tracked key; unchanged title has a null
+    // placeholder, while only body is named. Observe SQLite's raw JSON directly
+    // so this test does not assume sparse trigger fields or reuse the decoder.
+    const auto raw_fields=owner.db().query("SELECT key,type FROM json_each((SELECT changedFields FROM AuditLog WHERE tableName='NhDoc' AND operation='UPDATE')) ORDER BY key");
+    ASSERT_EQ(raw_fields.size(),2u);
+    EXPECT_EQ(std::get<std::string>(raw_fields[0].at("key")),"body");EXPECT_EQ(std::get<std::string>(raw_fields[0].at("type")),"null");
+    EXPECT_EQ(std::get<std::string>(raw_fields[1].at("key")),"title");EXPECT_EQ(std::get<std::string>(raw_fields[1].at("type")),"null");
+    const auto raw_names=owner.db().query("SELECT value FROM json_each((SELECT changedFieldsNames FROM AuditLog WHERE tableName='NhDoc' AND operation='UPDATE')) WHERE type='text' ORDER BY key");
+    ASSERT_EQ(raw_names.size(),1u);EXPECT_EQ(std::get<std::string>(raw_names[0].at("value")),"body");
     const auto input=lattice::detail::query_ordinary_upload_entries(owner.db(),"ordinary-current-observation",std::nullopt,0,64);
     ASSERT_EQ(input.size(),3u);const auto update=std::find_if(input.begin(),input.end(),[](const auto& e){return e.operation=="UPDATE";});ASSERT_NE(update,input.end());
-    EXPECT_TRUE(update->changed_fields.empty());EXPECT_TRUE(update->changed_fields_names.empty());ASSERT_TRUE(update->upload_original);
-    EXPECT_EQ(update->upload_original->fields,(std::vector<std::string>{"body"}));EXPECT_EQ(update->upload_original->names,(std::vector<std::string>{"body"}));
+    ASSERT_EQ(update->changed_fields.size(),1u);ASSERT_EQ(update->changed_fields.count("title"),1u);
+    EXPECT_EQ(update->changed_fields.at("title").kind,lattice::any_property_kind::null_kind);
+    EXPECT_TRUE(update->changed_fields_names.empty());ASSERT_TRUE(update->upload_original);
+    EXPECT_EQ(update->upload_original->fields,(std::vector<std::string>{"body","title"}));EXPECT_EQ(update->upload_original->names,(std::vector<std::string>{"body"}));
+    EXPECT_TRUE(update->generate_instruction().first.empty());EXPECT_TRUE(update->generate_instruction().second.empty());
     EXPECT_EQ(update->ordinary_delivery_version,(std::optional<std::string>{"0"}));
     EXPECT_EQ(owner.db().query("SELECT * FROM AuditLog ORDER BY id"),before);
     const auto legacy=lattice::query_audit_log_for_sync(owner.db(),"ordinary-current-observation",std::nullopt,0,64);
     ASSERT_EQ(legacy.size(),3u);const auto old_update=std::find_if(legacy.begin(),legacy.end(),[](const auto& e){return e.operation=="UPDATE";});ASSERT_NE(old_update,legacy.end());
-    EXPECT_TRUE(old_update->changed_fields.empty());EXPECT_TRUE(old_update->changed_fields_names.empty());EXPECT_FALSE(old_update->upload_original);EXPECT_FALSE(old_update->ordinary_delivery_version);
+    ASSERT_EQ(old_update->changed_fields.size(),1u);ASSERT_EQ(old_update->changed_fields.count("title"),1u);
+    EXPECT_EQ(old_update->changed_fields.at("title").kind,lattice::any_property_kind::null_kind);
+    EXPECT_TRUE(old_update->changed_fields_names.empty());EXPECT_FALSE(old_update->upload_original);EXPECT_FALSE(old_update->ordinary_delivery_version);
+    EXPECT_TRUE(old_update->generate_instruction().first.empty());EXPECT_TRUE(old_update->generate_instruction().second.empty());
+    EXPECT_EQ(owner.db().query("SELECT * FROM AuditLog ORDER BY id"),before);
 }
 
 TEST(NoHistory, OrdinaryQueryRefusesUnboundedAndActualNativeReadFailureWithoutMutation) {

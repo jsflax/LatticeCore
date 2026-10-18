@@ -40,6 +40,9 @@ struct ordinary_group_target_receiving_owner::state {
     std::shared_ptr<ordinary_target_staging_io> io;
     std::shared_ptr<ordinary_target_staging_connection> connection;
     std::shared_ptr<ordinary_group_target_schema_original> schema;
+    bool schema_roots_attempted=false,schema_roots_allocation_returned=false,schema_roots_allocation_exception_returned=false;
+    std::shared_ptr<ordinary_target_schema_roots_ending> schema_roots_original;
+    std::exception_ptr schema_roots_first_failure;
     std::shared_ptr<configured_retirement_registry> registry;
     std::optional<configured_retirement_registry::reservation> reservation;
     platform_retirement_receipt receipt;
@@ -76,6 +79,14 @@ struct ordinary_group_target_receiving_owner::state {
     bool model_send_entered=false,model_send_returned=false,model_send_result=false,model_agreed=false;
     bool history_send_entered=false,history_send_returned=false,history_send_result=false;
     bool sqlite_and_files_joined=false,native_completion_entered=false,native_completion_returned=false;
+    // Distinct terminal history; never overwrites constructor-only success.
+    bool terminal_cancel_entered=false,terminal_cancel_returned=false;
+    bool terminal_collection_selected=false,terminal_graph_joined=false;
+    std::shared_ptr<ordinary_target_staging_connection::terminal_collection_record> terminal_collection_original;
+    std::exception_ptr terminal_collection_first_failure;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    std::array<std::uint64_t,10> terminal_collection_observation{};
+#endif
 #if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
     bool qualification_checkpoint=false,qualification_disposition_returned=false,qualification_fallback_entered=false;
     ordinary_target_staging_connection::abandoned_retirement_result qualification_disposition=
@@ -527,6 +538,12 @@ void ordinary_group_target_receiving_owner::enqueue_event(const platform_transpo
             if(data->process!=creator())return;
             state::packet_body_return body(packet->ending.original);
             if(auto owner=weak.lock())try {
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+                struct actual_history_observation_tail {
+                    ordinary_group_target_receiving_owner* original;
+                    ~actual_history_observation_tail(){ordinary_receiver_reclamation_fixture::observe_history_worker(*original);}
+                } observe_history{owner.get()};
+#endif
                 owner->require_worker_current();
                 if(opened)owner->opened_on_worker(endpoint);
                 else {
@@ -792,9 +809,15 @@ void ordinary_group_target_receiving_owner::send_page_progress(const platform_tr
 }
 void ordinary_group_target_receiving_owner::request_close()noexcept {
     const auto data=state_;if(!data||data->process!=creator())return;
-    if(const auto original=data->request.lock())original->state_->cancelled.store(true,std::memory_order_release);
     std::function<void()> work;std::shared_ptr<std_thread_scheduler> worker;bool never_entered=false;
     try {
+        if(const auto original=data->request.lock()) {
+            // The existing real cancellation store remains the producer.
+            // Lock/record exceptions stay inside the real failure-capture path.
+            std::lock_guard lock(data->leaf);data->terminal_cancel_entered=true;
+            original->state_->cancelled.store(true,std::memory_order_release);
+            data->terminal_cancel_returned=true;
+        }
         {std::lock_guard lock(data->leaf);data->stop=true;worker=data->worker;
             if(worker&&!data->cleanup_queued){data->cleanup_queued=true;work=data->cleanup_work;}
             never_entered=!data->preparation_active&&!data->startup_active&&!data->worker_creation_entered&&!data->target_preparation_entered&&!data->factory_entered;}
@@ -831,7 +854,7 @@ void ordinary_group_target_receiving_owner::release_service_custody()noexcept {
     const auto data=state_;if(!data||data->process!=creator())return;
     {std::lock_guard lock(data->leaf);
         if(data->service_released||!data->collected||(!data->worker_joined&&!data->never_started_ending)||
-            (data->target_preparation_entered&&!data->sqlite_and_files_joined)||data->callbacks||data->queued)return;
+            (data->target_preparation_entered&&!data->sqlite_and_files_joined&&!data->terminal_graph_joined)||data->callbacks||data->queued)return;
         data->service_released=true;}
     // Actual Native collection plus original worker ending releases service
     // retention only. Lifetime credit stays charged until state::dispose has
@@ -1067,6 +1090,18 @@ bool ordinary_group_target_receiving_owner::terminal_inputs_ended(const ordinary
         !known(first.decoded,state::capture_return_record::kind::decoded,nullptr)))return false;
     return true; // Selected receiver captures only; no Native/charge/shell/owner/registry join.
 }
+// Actual published weak self only. Lifetime wake custody, never a receiver,
+// source/target/currentness grant, replacement admission or copied payload.
+std::weak_ptr<ordinary_group_target_receiving_owner> ordinary_group_target_receiving_owner::terminal_retirement_wake_original(
+    const ordinary_target_staging_connection& connection)const noexcept {
+    try {
+        const auto data=state_;if(!data||data->process!=creator())return {};
+        std::lock_guard lock(data->leaf);
+        if(!data->worker_entered||data->creator_thread!=std::this_thread::get_id()||data->connection.get()!=&connection||
+           data->receiving_original.lock().get()!=this)return {};
+        return data->receiving_original;
+    }catch(...){return {};}
+}
 bool ordinary_group_target_receiving_owner::terminal_decoder_charge_identity_matches(
     const ordinary_target_staging_connection& connection,const void* charge_original)const noexcept {
     const auto data=state_;if(!data||data->process!=creator()||!charge_original)return false;
@@ -1076,6 +1111,19 @@ bool ordinary_group_target_receiving_owner::terminal_decoder_charge_identity_mat
     std::lock_guard lock(data->leaf);
     return data->worker_entered&&data->creator_thread==std::this_thread::get_id()&&data->stop&&data->cleanup_entered&&
         data->connection.get()==&connection&&data->history_charge&&data->history_charge.get()==charge_original;
+}
+std::shared_ptr<ordinary_resource_reservation<true>> ordinary_group_target_receiving_owner::terminal_scope_charge(
+    const ordinary_target_staging_connection& connection)const noexcept {
+    const auto data=state_;if(!data||data->process!=creator())return {};
+    std::lock_guard lock(data->leaf);
+    if(!data->worker_entered||data->creator_thread!=std::this_thread::get_id()||!data->stop||!data->cleanup_entered||
+       data->startup_active||data->callbacks||data->queued||data->connection.get()!=&connection||
+       data->receiving_original.lock().get()!=this)return {};
+    return data->history_charge; // SAME slot only; the token has no owner/Conn backedge.
+}
+bool ordinary_group_target_receiving_owner::terminal_scope_owner_matches(
+    const ordinary_target_staging_connection& connection,const void* charge)const noexcept {
+    const auto actual=terminal_scope_charge(connection);return actual&&actual.get()==charge;
 }
 void ordinary_group_target_receiving_owner::retire_on_worker()noexcept {
     const auto data=state_;if(!data||data->process!=creator())return;
@@ -1164,21 +1212,74 @@ void ordinary_group_target_receiving_owner::collect_on_worker()noexcept {
             if(data->process!=creator())return;
             bool external=false;
             {std::lock_guard lock(data->leaf);data->collector_active=false;external=std::exchange(data->collector_external_wake,false);}
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS)
+            ordinary_receiver_reclamation_fixture::history_collection_turn_returned(*owner);
+#endif
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+            ordinary_receiver_reclamation_fixture::observe_history_worker(*owner);
+#endif
             if(external)owner->schedule_collection();
         }
     } turn{this,data}; // Actual function custody, never native/current permission.
-    if(data->connection) {
+    if(data->connection&&!data->connection->terminal_receiving_payloads_selected()) {
         // Real later destructor/callback wakes may reobserve readiness before
         // the first extraction. Once storage/extraction starts it never retries.
         (void)retire_terminal_inputs(*data->connection);
         if(terminal_inputs_ended(*data->connection)) {
-            (void)data->connection->retire_terminal_native_decoder_payloads(*this);
-            (void)data->connection->retire_terminal_native_phases(*this);
+            // Each later family consumes genuine first predecessor history;
+            // no live observer is called again after that family's extraction.
+            (void)data->connection->retire_terminal_raw_objects(*this);
+            if(data->connection->terminal_raw_objects_ended(*this)) {
+                (void)data->connection->retire_terminal_schema_programmes(*this);
+                if(data->connection->terminal_schema_programmes_ended(*this)) {
+                    (void)data->connection->retire_terminal_schema_roots(*this);
+                    if(data->connection->terminal_schema_roots_ended(*this)) {
+                        (void)data->connection->retire_terminal_scope_roots(*this);
+                        if(data->connection->terminal_scope_roots_ended(*this)) {
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+                            // Last genuine complete family snapshots, before any live source ends.
+                            ordinary_receiver_reclamation_fixture::observe_history_worker(*this);
+#endif
+                            (void)data->connection->retire_terminal_receiving_payloads(*this);
+                        }
+                    }
+                }
+            }
         }
     }
+    if(!data->terminal_collection_selected&&data->connection&&data->connection->terminal_receiving_payloads_ended(*this)) {
+        // Anchor the actual request so its source cell addresses stay alive
+        // through extraction. Cancellation/stop seals further source writers.
+        const auto request=data->request.lock();
+        if(request&&request->state_&&request->state_->process==creator()&&
+           request->state_->cancelled.load(std::memory_order_acquire)&&
+           std::atomic_load(&request->state_->group_receiver).get()==this) {
+            bool quiet=false;
+            {std::lock_guard lock(data->leaf);quiet=data->terminal_cancel_returned&&!data->startup_active&&data->cleanup_entered&&data->native_lane_returned&&
+                !data->callbacks&&!data->queued&&data->worker_entered&&data->creator_thread==std::this_thread::get_id();}
+            if(quiet) {
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS)
+                ordinary_receiver_reclamation_fixture::before_terminal_collection(*this);
+#endif
+                const bool ended=ordinary_target_staging_connection::retire_terminal_collection(*this,
+                    data->terminal_collection_original,data->terminal_collection_selected,data->terminal_collection_first_failure,
+                    data->connection,request->state_->staging_connection,data->io,request->state_->staging_io,
+                    data->target,request->state_->unpublished_target,data->schema_roots_original,data->history_charge);
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS)
+                ordinary_receiver_reclamation_fixture::terminal_collection_returned(*this,ended);
+#endif
+                if(data->process!=creator())return;
+                {std::lock_guard lock(data->leaf);data->terminal_graph_joined=ended;}
+            }
+        }
+    }
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    {const auto observation=ordinary_target_staging_connection::qualification_terminal_collection_observation(data->terminal_collection_original);
+        std::lock_guard lock(data->leaf);data->terminal_collection_observation=observation;}
+#endif
     {std::lock_guard lock(data->leaf);
         if(data->startup_active||!data->cleanup_entered||!data->native_lane_returned||data->callbacks||data->queued||
-            (data->target_preparation_entered&&!data->sqlite_and_files_joined)||data->worker_join_failure||data->worker_join_active||
+            (data->target_preparation_entered&&!data->sqlite_and_files_joined&&!data->terminal_graph_joined)||data->worker_join_failure||data->worker_join_active||
             (data->first_worker_join_entered&&!data->first_worker_join_returned))return;}
     auto counts=data->custody->snapshot();
     if(counts.commands||counts.payloads||counts.first_error)return;
@@ -1225,7 +1326,7 @@ void ordinary_group_target_receiving_owner::collect_on_worker()noexcept {
 bool ordinary_group_target_receiving_owner::cleanup_complete()const noexcept {
     const auto data=state_;if(!data||data->process!=creator())return false;
     std::lock_guard lock(data->leaf);return data->collected&&(data->worker_joined||data->never_started_ending)&&
-        (!data->target_preparation_entered||data->sqlite_and_files_joined);
+        (!data->target_preparation_entered||data->sqlite_and_files_joined||data->terminal_graph_joined);
 }
 lattice_close_result ordinary_group_target_receiving_owner::close(clock::time_point until)noexcept {
     lattice_close_result result;result.cleanup_complete=false;result.sync=sync_drain_state::deadline_pending;

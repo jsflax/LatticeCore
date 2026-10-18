@@ -213,7 +213,7 @@
     "dataCommand": 30
   },
   "resources": {
-    "buildJobs": 2,
+    "buildJobs": 1,
     "initialFreeBytes": 18253611008,
     "minimumFreeBytes": 12884901888
   },

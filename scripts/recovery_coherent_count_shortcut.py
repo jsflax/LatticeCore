@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 from recovery_coherent_supervisor import file_fact, run_stage, write_json
 
-PLAN_SHA256 = '591009115a41796c7970ba117a5300614aed3a680f9e8b31641d83030f94aae4'
+PLAN_SHA256 = '397f6c6585fcf8baa68234aa784b11ad6ddd409d0e2513e6e797caa155bba501'
 COUNT_CURRENT_CATALOG_SHA256 = 'e0ffe557fedc3d5d93a04530ef5618c0e27c150e51ab5f952cdf4c9725c77f4b'
 GIB = 1024**3
 
@@ -800,7 +800,7 @@ def main():
             '-DCMAKE_C_COMPILER='+str(cc),'-DCMAKE_CXX_COMPILER='+str(cxx),'-DCMAKE_OSX_SYSROOT='+str(sdk)]
         run.stage('CURRENT-CONFIGURE',['cmake','-G','Unix Makefiles','-S',source,'-B',build,*common],
                   source,plan['caps']['currentConfigure'])
-        run.stage('CURRENT-BUILD',['cmake','--build',build,'--parallel','2','--verbose','--','-k'],
+        run.stage('CURRENT-BUILD',['cmake','--build',build,'--parallel',str(plan['resources']['buildJobs']),'--verbose','--','-k'],
                   source,plan['caps']['currentBuild'])
         artifacts_before=artifact_set(run,build);run.record('CURRENT-ARTIFACTS-BEFORE',artifacts_before)
         current_units=compile_closure(run,source,old,build,'CURRENT',cc,cxx,sdk)
@@ -809,7 +809,7 @@ def main():
             run,source,old,build,current_units,mapping,catalog,cxx)
         run.stage('OLD-CONFIGURE',['cmake','-G','Unix Makefiles','-S',old,'-B',old_build,*common],
                   old,plan['caps']['oldConfigure'])
-        run.stage('OLD-BUILD',['cmake','--build',old_build,'--parallel','2','--verbose',
+        run.stage('OLD-BUILD',['cmake','--build',old_build,'--parallel',str(plan['resources']['buildJobs']),'--verbose',
             '--target',plan['helperTarget'],'--','-k'],old,plan['caps']['oldBuild'])
         old_binary=old_build/plan['helperTarget'];old_binary_before=run.stable(old_binary)
         old_units=compile_closure(run,old,source,old_build,'OLD',cc,cxx,sdk,mapping)

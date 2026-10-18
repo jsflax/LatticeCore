@@ -3,6 +3,7 @@
 #ifdef __cplusplus
 
 #include "types.hpp"
+#include "detail/observer_delivery_values.hpp"
 #include <string>
 #include <vector>
 #include <typeinfo>
@@ -221,6 +222,13 @@ struct schema_registrar {
 #define LATTICE_BIND_PROP(cls, prop) \
     prop.bind_to_parent(this, #prop);
 
+#define LATTICE_DELIVERY_ADOPT_PROP(cls, prop) \
+    prop.row_id = actual_row;
+
+#define LATTICE_DELIVERY_MATERIALIZE_PROP(cls, prop) \
+    ::lattice::detail::observer_delivery_value_detail::materialize<decltype(cls::prop)>(this->prop, row, #prop, \
+        std::array<std::string_view,4>{#prop "_minLat",#prop "_maxLat",#prop "_minLon",#prop "_maxLon"});
+
 // Helper to set unmanaged value, skipping links
 namespace lattice { namespace detail {
     template<typename OriginalType, typename ManagedType, typename SrcType>
@@ -346,12 +354,30 @@ namespace lattice { namespace detail {
 #define LATTICE_PROP_DESC(cls, prop) \
     ::lattice::detail::add_property_descriptor<decltype(cls::prop)>(props, #prop);
 
+// Immutable producer DATA: builtin member pointers and literal names, never
+// a collector function selected by a same-spelled callable on a custom model.
+#define LATTICE_DELIVERY_MEMBER(cls, prop) \
+    ::lattice::detail::observer_delivery_member{std::string_view{#prop}, &cls::prop, \
+        std::array<std::string_view,4>{#prop "_minLat",#prop "_maxLat",#prop "_minLon",#prop "_maxLon"}},
+
+#define LATTICE_DELIVERY_OUTPUT_MEMBER(cls, prop) \
+    ::lattice::detail::observer_delivery_output_member<::lattice::managed<cls>,decltype(cls::prop)>{ \
+        std::string_view{#prop}, &::lattice::managed<cls>::prop, \
+        std::array<std::string_view,4>{#prop "_minLat",#prop "_maxLat",#prop "_minLon",#prop "_maxLon"}},
+
 // Main schema registration macro
 #define LATTICE_SCHEMA(cls, ...) \
     template<> \
     struct lattice::managed<cls> : ::lattice::model_base { \
+        inline static constexpr std::string_view observer_delivery_table = #cls; \
+        inline static constexpr auto observer_delivery_members = std::tuple{ \
+            L_FOR_EACH(LATTICE_DELIVERY_MEMBER, cls, __VA_ARGS__) \
+        }; \
         /* Property members */ \
         L_FOR_EACH(LATTICE_DECLARE_MANAGED, cls, __VA_ARGS__) \
+        inline static constexpr auto observer_delivery_outputs = std::tuple{ \
+            L_FOR_EACH(LATTICE_DELIVERY_OUTPUT_MEMBER, cls, __VA_ARGS__) \
+        }; \
         \
         /* Default constructor */ \
         managed() = default; \
@@ -364,6 +390,17 @@ namespace lattice { namespace detail {
         /* Bind all properties to database */ \
         void bind_to_db() { \
             L_FOR_EACH(LATTICE_BIND_PROP, cls, __VA_ARGS__) \
+        } \
+        \
+        /* Closed immutable row image, after credit and before BEGIN. */ \
+        void observer_delivery_materialize(::lattice::detail::observer_delivery_values::row_view row) { \
+            L_FOR_EACH(LATTICE_DELIVERY_MATERIALIZE_PROP, cls, __VA_ARGS__) \
+        } \
+        \
+        /* Strings/property custody are prepared before the owned SQL unit. */ \
+        void observer_delivery_adopt_row(::lattice::primary_key_t actual_row) noexcept { \
+            this->id_ = actual_row; \
+            L_FOR_EACH(LATTICE_DELIVERY_ADOPT_PROP, cls, __VA_ARGS__) \
         } \
         \
         /* Get unmanaged values for insert (skips link properties) */ \
@@ -406,6 +443,7 @@ namespace lattice { namespace detail {
             }); \
         } \
     }; \
+    template<> struct lattice::detail::observer_delivery_generated_schema<cls> : std::true_type {}; \
     static ::lattice::schema_registrar<cls> _lattice_registrar_##cls { \
         ::lattice::managed<cls>::schema() \
     }

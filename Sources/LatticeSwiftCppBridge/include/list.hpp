@@ -31,6 +31,9 @@ struct link_list {
     using RefType = dynamic_object_ref;
     
     swift_lattice* lattice = nullptr;
+    // Captured from the actual parent owner at managed-list construction;
+    // failure reporting never looks up an owner from the raw pointer.
+    bridge_owner_identity owner_identity_;
     
     link_list() : lattice(nullptr) {
         new (&unmanaged_) std::vector<std::shared_ptr<dynamic_object>>();
@@ -44,7 +47,7 @@ struct link_list {
         }
     }
 
-    link_list(const link_list& o) : lattice(o.lattice) {
+    link_list(const link_list& o) : lattice(o.lattice), owner_identity_(o.owner_identity_) {
         if (lattice) {
             new (&managed_) managed(o.managed_);
         } else {
@@ -52,7 +55,7 @@ struct link_list {
         }
     }
 
-    link_list(link_list&& o) : lattice(o.lattice) {
+    link_list(link_list&& o) : lattice(o.lattice), owner_identity_(o.owner_identity_) {
         if (lattice) {
             new (&managed_) managed(std::move(o.managed_));
         } else {
@@ -70,6 +73,7 @@ struct link_list {
             }
             // Copy new
             lattice = o.lattice;
+            owner_identity_ = o.owner_identity_;
             if (lattice) {
                 new (&managed_) managed(o.managed_);
             } else {
@@ -89,6 +93,7 @@ struct link_list {
             }
             // Move new
             lattice = o.lattice;
+            owner_identity_ = o.owner_identity_;
             if (lattice) {
                 new (&managed_) managed(std::move(o.managed_));
             } else {
@@ -98,7 +103,8 @@ struct link_list {
         return *this;
     }
     
-    link_list(const managed<std::vector<swift_dynamic_object*>>& o);
+    link_list(const managed<std::vector<swift_dynamic_object*>>& o,
+              const std::shared_ptr<swift_lattice>& owner);
     
     struct element_proxy {
 #if LATTICE_HAS_FRT
@@ -109,11 +115,16 @@ struct link_list {
         using ActualType = std::shared_ptr<dynamic_object>;
 
         std::shared_ptr<dynamic_object> object;
-        size_t idx;
-        link_list* list;
+        size_t idx = 0;
+        link_list* list = nullptr;
 
         element_proxy& operator=(const dynamic_object_ref& o);
-        void assign(const dynamic_object_ref& o) SWIFT_NAME(assign(_:)) { sealed([&] { this->operator=(o); }); }
+        void assign(const dynamic_object_ref& o) SWIFT_NAME(assign(_:)) {
+            sealed([&] {
+                if (!list) throw std::runtime_error("List mutation requires a valid element proxy");
+                this->operator=(o);
+            });
+        }
 
         // Access the underlying object
         std::shared_ptr<dynamic_object> operator->() { return object; }
@@ -121,9 +132,14 @@ struct link_list {
         operator dynamic_object&() { return *object; }
         operator const dynamic_object&() const { return *object; }
 #if LATTICE_HAS_FRT
-        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED { return dynamic_object_ref::wrap(object); }
+        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED { return sealed([&] { return dynamic_object_ref::wrap(object); }); }
 #else
-        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY { return dynamic_object_ref::wrap(object); }
+        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY {
+            // wrap({}) is a nonallocating empty value on this value-only path.
+            auto result = dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>{});
+            sealed([&] { result = dynamic_object_ref::wrap(object); });
+            return result;
+        }
 #endif
     };
 
@@ -246,8 +262,9 @@ public:
     }
 
     // Create an owning link_list_ref from a managed vector
-    static LATTICE_LLREF_RET create(const managed<std::vector<swift_dynamic_object*>>& m) LATTICE_LLREF_UNRETAINED {
-        return _make(std::make_shared<link_list>(m));
+    static LATTICE_LLREF_RET create(const managed<std::vector<swift_dynamic_object*>>& m,
+                                  const std::shared_ptr<swift_lattice>& owner) LATTICE_LLREF_UNRETAINED {
+        return _make(std::make_shared<link_list>(m, owner));
     }
 #undef LATTICE_LLREF_RET
 #undef LATTICE_LLREF_UNRETAINED
@@ -264,6 +281,10 @@ public:
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
 #endif
+
+    bridge_owner_identity owner_identity() const noexcept SWIFT_NAME(ownerIdentity()) {
+        return impl_ ? impl_->owner_identity_ : bridge_owner_identity{};
+    }
 
     // Delegate common operations to impl_
 #if LATTICE_HAS_FRT
@@ -287,6 +308,16 @@ public:
         return sealed([&] { return (*impl_)[idx]; });
     }
 
+    // Lookup and assignment are one exception boundary. A failed predecessor
+    // never produces an invalid proxy that a second call dereferences.
+    void assign_at(size_t idx, const dynamic_object_ref& obj) const SWIFT_NAME(assign(at:_:)) {
+        sealed([&] {
+            if (!impl_) throw std::runtime_error("List mutation requires a valid list");
+            auto proxy = (*impl_)[idx];
+            proxy = obj;
+        });
+    }
+
     // const (shallow): these mutate the pointee through the shared_ptr, so on
     // the value path they import non-mutating and are callable on a `let`.
     void push_back(const dynamic_object_ref& obj) const SWIFT_NAME(pushBack(_:)) {
@@ -306,19 +337,19 @@ public:
     }
 
     std::optional<size_t> find_index(const dynamic_object_ref& obj) const SWIFT_NAME(findIndex(_:)) {
-        return impl_->find_index(obj);
+        return sealed([&] { return impl_->find_index(obj); });
     }
 
     std::vector<size_t> find_where(const std::string& sql_predicate) const
         SWIFT_NAME(findWhere(_:)) {
-        return impl_->find_where(sql_predicate);
+        return sealed([&] { return impl_->find_where(sql_predicate); });
     }
 
     std::vector<size_t> find_indices(const std::string& sql_predicate,
                                      const std::string& order_column,
                                      bool ascending) const
         SWIFT_NAME(findIndices(predicate:orderBy:ascending:)) {
-        return impl_->find_indices(sql_predicate, order_column, ascending);
+        return sealed([&] { return impl_->find_indices(sql_predicate, order_column, ascending); });
     }
 
     link_list::iterator begin() {

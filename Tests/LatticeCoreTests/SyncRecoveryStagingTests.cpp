@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "../../Sources/LatticeCore/src/recovery_staging.hpp"
+#include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
 #include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
 #include <limits>
 
@@ -57,7 +58,7 @@ int64_t integer(lattice::lattice_db& owner,const std::string& sql) {
     return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));
 }
 void count_fault(lattice::lattice_db& owner,int& count) {
-    ASSERT_EQ(sqlite3_create_function(owner.db().handle(),"staging_fault_hit",0,SQLITE_UTF8,&count,
+    ASSERT_EQ(sqlite3_create_function(recovery_writer_access::active_handle(owner,owner.db()),"staging_fault_hit",0,SQLITE_UTF8,&count,
         [](sqlite3_context* ctx,int,sqlite3_value**) noexcept {
             ++*static_cast<int*>(sqlite3_user_data(ctx)); sqlite3_result_int(ctx,1);
         },nullptr,nullptr),SQLITE_OK);
@@ -194,7 +195,7 @@ TEST_F(SyncRecoveryStaging, PageInsertAndStateUpdateAreOneSavepointForAbortAndIg
         EXPECT_EQ(s.resume(token,value.offer.identity).state.next_page,0);
         EXPECT_EQ(s.usage().stored_bytes,before.stored_bytes);
         owner.db().execute("DROP TRIGGER reject_staging_state");
-        ASSERT_EQ(sqlite3_create_function(owner.db().handle(),"staging_fault_hit",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
+        ASSERT_EQ(sqlite3_create_function(recovery_writer_access::active_handle(owner,owner.db()),"staging_fault_hit",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
         tx.commit(); // committing after caught helper failure cannot persist a page prefix
     }
     OwnedTransaction retry(owner); auto s=staging();
@@ -208,14 +209,14 @@ TEST_F(SyncRecoveryStaging, OuterRollbackAndFailedCommitPublishNoProvisionalPage
     { OwnedTransaction tx(owner); EXPECT_EQ(staging().append(token,value.pages[0]).state.next_page,1); tx.rollback(); }
     {
         OwnedTransaction tx(owner); staging().append(token,value.pages[0]); int attempts=0;
-        ASSERT_EQ(sqlite3_set_authorizer(owner.db().handle(),[](void* context,int action,const char* first,const char*,const char*,const char*) noexcept {
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(owner,owner.db()),[](void* context,int action,const char* first,const char*,const char*,const char*) noexcept {
             if (action==SQLITE_TRANSACTION && first && std::strcmp(first,"COMMIT")==0) {
                 ++*static_cast<int*>(context); return SQLITE_DENY;
             }
             return SQLITE_OK;
         },&attempts),SQLITE_OK);
         EXPECT_THROW(tx.commit(),lattice::db_error); EXPECT_EQ(attempts,1);
-        ASSERT_EQ(sqlite3_set_authorizer(owner.db().handle(),nullptr,nullptr),SQLITE_OK); tx.rollback();
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(owner,owner.db()),nullptr,nullptr),SQLITE_OK); tx.rollback();
     }
     OwnedTransaction check(owner);
     EXPECT_EQ(staging().resume(token,value.offer.identity).state.next_page,0);
@@ -229,7 +230,7 @@ TEST_F(SyncRecoveryStaging, CleanupFailureRetainsBothErrorsAndRequiresOuterRollb
         owner.db().execute("CREATE TRIGGER reject_staging_state BEFORE UPDATE OF state ON _lattice_recovery_attempt "
             "BEGIN SELECT RAISE(ABORT,'injected state failure'); END");
         int cleanup=0;
-        ASSERT_EQ(sqlite3_set_authorizer(owner.db().handle(),[](void* context,int action,const char* first,const char* second,const char*,const char*) noexcept {
+        ASSERT_EQ(sqlite3_set_authorizer(recovery_writer_access::active_handle(owner,owner.db()),[](void* context,int action,const char* first,const char* second,const char*,const char*) noexcept {
             if (action==SQLITE_SAVEPOINT && first && second && std::strcmp(first,"ROLLBACK")==0 && std::strcmp(second,"lattice_recovery_staging")==0) {
                 ++*static_cast<int*>(context); return SQLITE_DENY;
             }
@@ -239,7 +240,7 @@ TEST_F(SyncRecoveryStaging, CleanupFailureRetainsBothErrorsAndRequiresOuterRollb
         try { staging().append(token,value.pages[0]); }
         catch (const recovery_staging_error& e) { caught=true; EXPECT_EQ(e.code,code::cleanup_failed); EXPECT_TRUE(e.primary_error); EXPECT_TRUE(e.cleanup_error); }
         catch (...) { ADD_FAILURE() << "expected structured cleanup refusal"; }
-        sqlite3_set_authorizer(owner.db().handle(),nullptr,nullptr);
+        sqlite3_set_authorizer(recovery_writer_access::active_handle(owner,owner.db()),nullptr,nullptr);
         EXPECT_TRUE(caught); EXPECT_EQ(cleanup,1); tx.rollback();
     }
     OwnedTransaction check(owner);
@@ -512,7 +513,7 @@ TEST_F(SyncRecoveryStaging, CounterWriteFailureRollsBackBeginPageAndVerification
             if (phase==2) EXPECT_THROW(s.verify_end(token,value.end()),lattice::db_error);
             EXPECT_EQ(hits,1) << "fault reached counter write after attempt/page/state mutation";
             owner.db().execute("DROP TRIGGER reject_staging_counters");
-            ASSERT_EQ(sqlite3_create_function(owner.db().handle(),"staging_fault_hit",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
+            ASSERT_EQ(sqlite3_create_function(recovery_writer_access::active_handle(owner,owner.db()),"staging_fault_hit",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
             const auto after=s.usage();
             EXPECT_EQ(after.channels,before.channels); EXPECT_EQ(after.pages,before.pages); EXPECT_EQ(after.rows,before.rows);
             EXPECT_EQ(after.canonical_bytes,before.canonical_bytes); EXPECT_EQ(after.stored_bytes,before.stored_bytes);
@@ -544,7 +545,7 @@ TEST_F(SyncRecoveryStaging, AppendAndVerifiedPointReadsDoNotScanRetainedPageMeta
     // Setup and required full verification are outside the work ceiling.
     OwnedTransaction tx(owner); auto s=staging(); s.begin(token,value.offer,value.offer.identity);
     for (size_t i=0;i<2048;++i) s.append(token,value.pages[i]);
-    auto* handle=owner.db().handle(); int callbacks=0;
+    auto* handle=recovery_writer_access::active_handle(owner,owner.db()); int callbacks=0;
     const auto install_ceiling=[&] {
         callbacks=0;
         sqlite3_progress_handler(handle,10,[](void* context) noexcept {

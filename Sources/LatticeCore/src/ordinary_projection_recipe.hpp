@@ -18,7 +18,8 @@ struct ordinary_projection_recipe final {
             retained.add(sizeof(std::string)+name.size());frame.models.push_back(name);append(frame.scope,name,retained);
             schema.bytes(name);schema.number(catalog.swift_models.count(name));
             const auto& model=*catalog.find(name);schema.number(model.properties.size());
-            for(const auto& p:model.properties) {
+            for(const auto* property:ordinary_projection_property_order(model,catalog.swift_models.count(name),[&](size_t bytes){retained.add(bytes);})) {
+                const auto& p=*property;
                 std::ostringstream out;serialize(out,p);const auto encoded=out.str();retained.add(encoded.size());schema.bytes(encoded);
                 // kind==union_type is meaningful even in catalogs whose
                 // independent is_union convenience flag was not set.

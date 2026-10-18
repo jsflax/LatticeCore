@@ -1,4 +1,5 @@
 #include "sqlite-vec.h"
+#include "sqlite-vec-registration.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -10070,6 +10071,20 @@ int vec0Update_UpdateVectorColumn(vec0_vtab *p, i64 chunk_id, i64 chunk_offset,
     goto cleanup;
   }
 
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+  if (p->vector_columns[i].index_type == VEC0_INDEX_TYPE_IVF) {
+    // IVF INSERT stores this column in cells and its optional full-precision
+    // KV table; it never creates a flat _vector_chunks BLOB for the column.
+    // Replace only its IVF entry under the same original rowid/xUpdate.
+    rc = ivf_delete(p, i, rowid);
+    if (rc == SQLITE_OK)
+      rc = ivf_insert(p, i, rowid, vector,
+                      (int)vector_column_byte_size(p->vector_columns[i]));
+    if (rc != SQLITE_OK) ivf_first_error(p, rc);
+    goto cleanup;
+  }
+#endif
+
 #if SQLITE_VEC_ENABLE_RESCORE
   if (p->vector_columns[i].index_type == VEC0_INDEX_TYPE_RESCORE) {
     // For rescore columns, update _rescore_vectors and _rescore_chunks
@@ -10253,15 +10268,12 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv) {
       continue;
     }
 
-    // Block vector UPDATE for index types that don't implement it —
-    // the DiskANN graph / IVF lists would become stale.
+    // DiskANN still has no implemented vector replacement. IVF replacement
+    // below updates its checked cell/map entry and optional full-precision KV.
     {
       enum Vec0IndexType idx_type = p->vector_columns[vector_idx].index_type;
       const char *idx_name = NULL;
       if (idx_type == VEC0_INDEX_TYPE_DISKANN) idx_name = "DiskANN";
-#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
-      else if (idx_type == VEC0_INDEX_TYPE_IVF) idx_name = "IVF";
-#endif
       if (idx_name) {
         vtab_set_error(
           &p->base,
@@ -10276,7 +10288,7 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv) {
     rc = vec0Update_UpdateVectorColumn(p, chunk_id, chunk_offset, vector_idx,
                                        valueVector, rowid);
     if (rc != SQLITE_OK) {
-      return SQLITE_ERROR;
+      return rc;
     }
   }
 
@@ -10410,8 +10422,33 @@ static int vec0Commit(sqlite3_vtab *pVTab) {
   UNUSED_PARAMETER(pVTab);
   return SQLITE_OK;
 }
-static int vec0Rollback(sqlite3_vtab *pVTab) {
+/* SQL rollback restores shadow rows, not this connection-local DATA cache.
+** Forget the flags only; the next normal lookup reads the restored SQL state. */
+static void vec0InvalidateIvfTrainedCache(sqlite3_vtab *pVTab) {
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+  vec0_vtab *p = (vec0_vtab *)pVTab;
+  for (int i = 0; i < p->numVectorColumns; i++) p->ivfTrainedCache[i] = -1;
+#else
   UNUSED_PARAMETER(pVTab);
+#endif
+}
+static int vec0Rollback(sqlite3_vtab *pVTab) {
+  vec0InvalidateIvfTrainedCache(pVTab);
+  return SQLITE_OK;
+}
+static int vec0Savepoint(sqlite3_vtab *pVTab, int savepoint) {
+  UNUSED_PARAMETER(pVTab);
+  UNUSED_PARAMETER(savepoint);
+  return SQLITE_OK;
+}
+static int vec0Release(sqlite3_vtab *pVTab, int savepoint) {
+  UNUSED_PARAMETER(pVTab);
+  UNUSED_PARAMETER(savepoint);
+  return SQLITE_OK;
+}
+static int vec0RollbackTo(sqlite3_vtab *pVTab, int savepoint) {
+  UNUSED_PARAMETER(savepoint);
+  vec0InvalidateIvfTrainedCache(pVTab);
   return SQLITE_OK;
 }
 
@@ -10593,9 +10630,9 @@ static sqlite3_module vec0Module = {
     /* xRollback     */ vec0Rollback,
     /* xFindFunction */ 0,
     /* xRename       */ vec0Rename,
-    /* xSavepoint    */ 0,
-    /* xRelease      */ 0,
-    /* xRollbackTo   */ 0,
+    /* xSavepoint    */ vec0Savepoint,
+    /* xRelease      */ vec0Release,
+    /* xRollbackTo   */ vec0RollbackTo,
     /* xShadowName   */ vec0ShadowName,
 #if SQLITE_VERSION_NUMBER >= 3044000
     /* xIntegrity    */ 0, // https://github.com/asg017/sqlite-vec/issues/44
@@ -10643,24 +10680,66 @@ static sqlite3_module vec0Module = {
   "Commit: " SQLITE_VEC_SOURCE "\n"                                            \
   "Build flags: " SQLITE_VEC_DEBUG_BUILD
 
-SQLITE_VEC_API int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg,
-                                    const sqlite3_api_routines *pApi) {
+#if defined(__APPLE__) || defined(__linux__)
+#include <unistd.h>
+#endif
+static int vec_lattice_cookie_current(const struct sqlite_vec_lattice_cookie *cookie) {
+#if defined(__APPLE__) || defined(__linux__)
+  return cookie && cookie->creator == (uint64_t)getpid();
+#else
+  UNUSED_PARAMETER(cookie); return 0; /* no closed resource issuer on this target */
+#endif
+}
+static void vec_lattice_cookie_destroy(void *data) {
+  struct sqlite_vec_lattice_cookie *cookie = data;
+  if (vec_lattice_cookie_current(cookie) && cookie->retire) cookie->retire(cookie->payload);
+}
+static void vec_lattice_static_text(sqlite3_context *context, int argc,
+                                    sqlite3_value **argv) {
+  UNUSED_PARAMETER(argc); UNUSED_PARAMETER(argv);
+  const struct sqlite_vec_lattice_cookie *cookie = sqlite3_user_data(context);
+  if (!vec_lattice_cookie_current(cookie)) return;
+  sqlite3_result_text(context, cookie->text, -1, SQLITE_STATIC);
+}
+static int vec_init_with_receipts(sqlite3 *db, char **pzErrMsg,
+    const sqlite3_api_routines *pApi, const struct sqlite_vec_lattice_issuer *issuer) {
+
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT2(pApi);
 #endif
   int rc = SQLITE_OK;
+  unsigned int receipt_slot = 0;
+  if (issuer && (!issuer->payload || !issuer->take || !issuer->returned)) return SQLITE_MISUSE;
 
 #define DEFAULT_FLAGS (SQLITE_UTF8 | SQLITE_INNOCUOUS | SQLITE_DETERMINISTIC)
 
+  if (issuer) {
+    struct sqlite_vec_lattice_cookie *cookie = issuer->take(issuer->payload, receipt_slot);
+    if (!cookie) return SQLITE_MISUSE;
+    cookie->text = SQLITE_VEC_VERSION;
+    rc = sqlite3_create_function_v2(db, "vec_version", 0, DEFAULT_FLAGS,
+                                  cookie, vec_lattice_static_text, NULL, NULL, vec_lattice_cookie_destroy);
+    if (!issuer->returned(issuer->payload, receipt_slot++, rc)) return rc == SQLITE_OK ? SQLITE_ABORT : rc;
+  } else {
   rc = sqlite3_create_function_v2(db, "vec_version", 0, DEFAULT_FLAGS,
                                   SQLITE_VEC_VERSION, _static_text_func, NULL,
                                   NULL, NULL);
+  }
   if (rc != SQLITE_OK) {
     return rc;
   }
+  if (issuer) {
+    struct sqlite_vec_lattice_cookie *cookie = issuer->take(issuer->payload, receipt_slot);
+    if (!cookie) return SQLITE_MISUSE;
+    cookie->text = SQLITE_VEC_DEBUG_STRING;
+    rc = sqlite3_create_function_v2(db, "vec_debug", 0, DEFAULT_FLAGS,
+                                  cookie, vec_lattice_static_text, NULL, NULL, vec_lattice_cookie_destroy);
+    if (!issuer->returned(issuer->payload, receipt_slot++, rc)) return rc == SQLITE_OK ? SQLITE_ABORT : rc;
+  } else {
   rc = sqlite3_create_function_v2(db, "vec_debug", 0, DEFAULT_FLAGS,
                                   SQLITE_VEC_DEBUG_STRING, _static_text_func,
                                   NULL, NULL, NULL);
+  }
   if (rc != SQLITE_OK) {
     return rc;
   }
@@ -10704,27 +10783,55 @@ SQLITE_VEC_API int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg,
       // clang-format on
   };
 
+  if (issuer && 2 + countof(aFunc) + countof(aMod) != SQLITE_VEC_LATTICE_REGISTRATION_COUNT) return SQLITE_MISUSE;
+
   for (unsigned long i = 0; i < countof(aFunc) && rc == SQLITE_OK; i++) {
+    if (issuer) {
+      struct sqlite_vec_lattice_cookie *cookie = issuer->take(issuer->payload, receipt_slot);
+      if (!cookie) return SQLITE_MISUSE;
+      rc = sqlite3_create_function_v2(db, aFunc[i].zFName, aFunc[i].nArg,
+                                    aFunc[i].flags, cookie, aFunc[i].xFunc, NULL, NULL, vec_lattice_cookie_destroy);
+      if (!issuer->returned(issuer->payload, receipt_slot++, rc)) return rc == SQLITE_OK ? SQLITE_ABORT : rc;
+    } else {
     rc = sqlite3_create_function_v2(db, aFunc[i].zFName, aFunc[i].nArg,
                                     aFunc[i].flags, NULL, aFunc[i].xFunc, NULL,
                                     NULL, NULL);
+    }
     if (rc != SQLITE_OK) {
-      *pzErrMsg = sqlite3_mprintf("Error creating function %s: %s",
+      if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("Error creating function %s: %s",
                                   aFunc[i].zFName, sqlite3_errmsg(db));
       return rc;
     }
   }
 
   for (unsigned long i = 0; i < countof(aMod) && rc == SQLITE_OK; i++) {
+    if (issuer) {
+      struct sqlite_vec_lattice_cookie *cookie = issuer->take(issuer->payload, receipt_slot);
+      if (!cookie) return SQLITE_MISUSE;
+      rc = sqlite3_create_module_v2(db, aMod[i].name, aMod[i].module, cookie, vec_lattice_cookie_destroy);
+      if (!issuer->returned(issuer->payload, receipt_slot++, rc)) return rc == SQLITE_OK ? SQLITE_ABORT : rc;
+    } else {
     rc = sqlite3_create_module_v2(db, aMod[i].name, aMod[i].module, NULL, NULL);
+    }
     if (rc != SQLITE_OK) {
-      *pzErrMsg = sqlite3_mprintf("Error creating module %s: %s", aMod[i].name,
+      if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("Error creating module %s: %s", aMod[i].name,
                                   sqlite3_errmsg(db));
       return rc;
     }
   }
 
+  if (issuer && receipt_slot != SQLITE_VEC_LATTICE_REGISTRATION_COUNT) return SQLITE_MISUSE;
   return SQLITE_OK;
 }
 
 
+
+SQLITE_VEC_API int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg,
+                                    const sqlite3_api_routines *pApi) {
+  return vec_init_with_receipts(db, pzErrMsg, pApi, NULL);
+}
+SQLITE_VEC_API int sqlite3_vec_init_with_lattice_receipts(sqlite3 *db, char **pzErrMsg,
+    const sqlite3_api_routines *pApi, const struct sqlite_vec_lattice_issuer *issuer) {
+  if (!issuer) return SQLITE_MISUSE;
+  return vec_init_with_receipts(db, pzErrMsg, pApi, issuer);
+}

@@ -1,6 +1,7 @@
 #pragma once
 #ifdef __cplusplus
 #include <lattice/ordinary_sync.hpp>
+#include <error.hpp>
 #include <lattice/ordinary_history.hpp>
 #include <bridging.hpp>
 #include <cstring>
@@ -67,8 +68,8 @@ class ordinary_sync_export_ref {
     static ordinary_sync_export_ref capture(lattice_db& owner,const std::vector<std::string>& models)noexcept {
         ordinary_sync_export_ref result;
         try{result.value_.emplace(capture_ordinary_sync_export(owner,models));}
-        catch(const ordinary_export_capacity_exhausted& error){result.capacity_exhausted_=true;try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
-        catch(const std::exception& error){try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
+        catch(const ordinary_export_capacity_exhausted& error){result.capacity_exhausted_=true;assign_ordinary_bridge_exception(result.failure_,error);}
+        catch(const std::exception& error){assign_ordinary_bridge_exception(result.failure_,error);}
         catch(...){try{result.failure_="ordinary export capture failed";}catch(...){}}
         return result;
     }
@@ -135,7 +136,7 @@ class ordinary_sync_observation_ref {
     static ordinary_sync_observation_ref select(lattice_db& owner,const std::vector<std::string>& models)noexcept {
         ordinary_sync_observation_ref result;
         try{result.tables_=ordinary_sync_observation_tables(owner,models);result.valid_=true;}
-        catch(const std::exception& error){try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
+        catch(const std::exception& error){assign_ordinary_bridge_exception(result.failure_,error);}
         catch(...){try{result.failure_="ordinary observation selection failed";}catch(...){}}
         return result;
     }
@@ -176,8 +177,8 @@ class ordinary_history_export_ref {
     static ordinary_history_export_ref capture(lattice_db& owner,const std::vector<std::string>& models)noexcept{
         ordinary_history_export_ref result;
         try{result.value_.emplace(capture_ordinary_history_export(owner,models));}
-        catch(const ordinary_export_capacity_exhausted& error){result.capacity_exhausted_=true;try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
-        catch(const std::exception& error){try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
+        catch(const ordinary_export_capacity_exhausted& error){result.capacity_exhausted_=true;assign_ordinary_bridge_exception(result.failure_,error);}
+        catch(const std::exception& error){assign_ordinary_bridge_exception(result.failure_,error);}
         catch(...){try{result.failure_="ordinary history capture failed";}catch(...){}}
         return result;
     }
@@ -213,8 +214,8 @@ class ordinary_mounted_history_source_ref {
     static ordinary_mounted_history_source_ref issue(std::shared_ptr<lattice_db> owner,const std::vector<std::string>& mounted)noexcept{
         ordinary_mounted_history_source_ref result;
         try{result.value_.emplace(ordinary_mounted_history_source::issue(std::move(owner),mounted));}
-        catch(const ordinary_export_capacity_exhausted& error){result.capacity_exhausted_=true;try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
-        catch(const std::exception& error){try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
+        catch(const ordinary_export_capacity_exhausted& error){result.capacity_exhausted_=true;assign_ordinary_bridge_exception(result.failure_,error);}
+        catch(const std::exception& error){assign_ordinary_bridge_exception(result.failure_,error);}
         catch(...){try{result.failure_="mounted history source issuance failed";}catch(...){}}
         return result;
     }
@@ -226,14 +227,14 @@ public:
     ordinary_history_export_ref capture_with_lineage_observation(const std::vector<std::string>& selected)const noexcept SWIFT_NAME(captureWithLineageObservation(models:)){
         ordinary_history_export_ref result;if(!value_)return result;
         try{result.value_.emplace(value_->capture_with_lineage_observation(selected));}
-        catch(const std::exception& error){try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
+        catch(const std::exception& error){assign_ordinary_bridge_exception(result.failure_,error);}
         catch(...){try{result.failure_="mounted history capture failed";}catch(...){}}
         return result;
     }
     ordinary_history_export_ref capture(const std::vector<std::string>& selected)const noexcept SWIFT_NAME(capture(models:)){
         ordinary_history_export_ref result;if(!value_)return result;
         try{result.value_.emplace(value_->capture(selected));}
-        catch(const std::exception& error){try{result.failure_.assign(error.what(),strnlen(error.what(),2048));}catch(...){}}
+        catch(const std::exception& error){assign_ordinary_bridge_exception(result.failure_,error);}
         catch(...){try{result.failure_="mounted history capture failed";}catch(...){}}
         return result;
     }

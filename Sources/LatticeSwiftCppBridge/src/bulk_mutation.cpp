@@ -17,19 +17,6 @@ std::string quote_identifier(const std::string& value) {
     throw std::runtime_error("selected batch mutation: " + reason);
 }
 
-// database opens SQLITE_OPEN_FULLMUTEX. Its connection mutex is recursive,
-// including nested prepare/step/finalize and normal execute hook bookkeeping.
-// Keep preflight + writes together against users of this same connection.
-struct connection_guard {
-    sqlite3_mutex* mutex;
-    explicit connection_guard(sqlite3* handle) : mutex(sqlite3_db_mutex(handle)) {
-        if (!mutex) invalid_batch("writer connection is not serialized");
-        sqlite3_mutex_enter(mutex);
-    }
-    ~connection_guard() { sqlite3_mutex_leave(mutex); }
-    connection_guard(const connection_guard&) = delete;
-    connection_guard& operator=(const connection_guard&) = delete;
-};
 
 std::string placeholders(size_t count) {
     std::string result;
@@ -50,13 +37,32 @@ bool same_database_file(const std::string& actual, const std::string& expected) 
 }
 } // namespace
 
+// database opens SQLITE_OPEN_FULLMUTEX. Its connection mutex is recursive,
+// including nested prepare/step/finalize and normal execute hook bookkeeping.
+// Keep preflight + writes together against users of this same connection.
+struct swift_lattice::selected_mutation_connection_guard {
+    detail::store_physical_native_scope physical_call;
+    sqlite3_mutex* mutex;
+    detail::store_physical_mutex_return mutex_return;
+    explicit selected_mutation_connection_guard(database& owner) : physical_call(owner),
+        mutex(physical_call.entered()?sqlite3_db_mutex(owner.internal_handle()):nullptr),
+        mutex_return(owner,mutex) {
+        if(!physical_call.entered())invalid_batch("resource Native caller original unavailable");
+        if (!mutex) invalid_batch("writer connection is not serialized");
+        sqlite3_mutex_enter(mutex);
+    }
+    ~selected_mutation_connection_guard() = default;
+    selected_mutation_connection_guard(const selected_mutation_connection_guard&) = delete;
+    selected_mutation_connection_guard& operator=(const selected_mutation_connection_guard&) = delete;
+};
+
 int64_t swift_lattice::apply_selected_mutations(const selected_mutation_batch& batch) {
     if (batch.failed_) invalid_batch("a batch builder operation failed");
     // Match attach/detach lock order. No callbacks are delivered by execute
     // while this explicit transaction remains open; commit belongs to Swift.
     std::lock_guard<std::mutex> topology_guard(attach_mutex_);
     if (is_closed() || db().is_closed()) invalid_batch("lattice is closed");
-    connection_guard writer_guard(db().internal_handle());
+    selected_mutation_connection_guard writer_guard(db());
     if (!owns_write_transaction())
         invalid_batch("requires a Core transaction owned by the calling thread");
 
@@ -126,7 +132,8 @@ int64_t swift_lattice::apply_selected_mutations(const selected_mutation_batch& b
             if (!found) invalid_batch("detached or stale attachment handle");
         }
         const std::string route_prefix = schema == "main" ? "main." : quote_identifier(schema) + '.';
-        const SwiftSchema* properties = nullptr;
+        require_runtime_schema_ordinary_();
+        const RuntimeSwiftSchema* properties = nullptr;
         std::string table;
         const auto* route_schemas = &schemas_;
         if (managed.attachment_token_ != 0) {
@@ -135,7 +142,8 @@ int64_t swift_lattice::apply_selected_mutations(const selected_mutation_batch& b
                 invalid_batch("attachment has no captured Swift model schema");
             route_schemas = static_cast<const attached_schema_map*>(source_schemas->second.get());
         }
-        for (const auto& [name, candidate] : *route_schemas) {
+        for (const auto& [stored_name, candidate] : *route_schemas) {
+            const auto name=detail::swift_runtime_ordinary_text_(stored_name);
             if (managed.table_name_ == route_prefix + name ||
                 (schema == "main" && managed.table_name_ == name)) {
                 properties = &candidate;

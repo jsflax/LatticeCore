@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "ordinary_cohort_attachment_qualification.hpp"
 #if defined(LATTICE_MANAGED_ATTACHMENT_QUALIFICATION)
 #include "ordinary_cohort_attachment.hpp"
@@ -29,15 +30,15 @@ struct ordinary_cohort_attachment_qualification_access {
             value.attached_cohort_bindings_.contains(alias);
     }
     static int raw_attach(database& value){
-        return sqlite3_exec(value.internal_handle(),"ATTACH DATABASE ':memory:' AS forbidden_raw",nullptr,nullptr,nullptr);
+        return ::lattice::detail::store_physical_exec(value.internal_handle(),"ATTACH DATABASE ':memory:' AS forbidden_raw",nullptr,nullptr,nullptr);
     }
     static bool attached(database& value,const std::string& alias){
         sqlite3_stmt* raw=nullptr;
-        const auto rc=sqlite3_prepare_v2(value.internal_handle(),"PRAGMA database_list",-1,&raw,nullptr);
-        const std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+        const auto rc=::lattice::detail::store_physical_prepare_v2(value.internal_handle(),"PRAGMA database_list",-1,&raw,nullptr);
+        const std::unique_ptr<sqlite3_stmt,decltype(&::lattice::detail::store_physical_finalize)> statement(raw,&::lattice::detail::store_physical_finalize);
         if(rc!=SQLITE_OK)throw db_error("qualification database list unavailable");
         bool found=false;int step=SQLITE_OK;
-        while((step=sqlite3_step(raw))==SQLITE_ROW){
+        while((step=::lattice::detail::store_physical_step(raw))==SQLITE_ROW){
             const auto* name=sqlite3_column_text(raw,1);
             if(name&&alias==reinterpret_cast<const char*>(name))found=true;
         }

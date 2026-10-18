@@ -1,17 +1,23 @@
 #pragma once
 #include "schema.hpp"
+#include "ordinary_program.hpp"
 #include <set>
 #include <algorithm>
 #include <map>
 #include <vector>
 #include <sstream>
 #include <utility>
+#include <span>
+#include <string_view>
+#include <stdexcept>
+#include <iterator>
 
 namespace lattice { class lattice_db; class swift_lattice; class database; }
 namespace lattice::detail {
 class ordinary_export_access;
 struct ordinary_schema_recipe_test_access;
 struct ordinary_receive_recipe_access;
+struct ordinary_schema_validation_recipe_access;
 
 // Private passive recipe producer shared by the actual normal owner callsites
 // and the future exact-original target channel. SQL text is not an open/current
@@ -20,9 +26,12 @@ class ordinary_schema_recipe final {
     friend class ::lattice::lattice_db;
     friend class ::lattice::database;
     friend class ::lattice::swift_lattice;
+    friend class observer_delivery_initialization_plan;
     friend class ordinary_export_access;
     friend struct ordinary_schema_recipe_test_access;
+    friend struct ordinary_preimage_recipe_test_access;
     friend struct ordinary_receive_recipe_access;
+    friend struct ordinary_schema_validation_recipe_access;
     static const char* metadata_table() noexcept {return R"(
             CREATE TABLE IF NOT EXISTS _lattice_meta (
                 key TEXT PRIMARY KEY,
@@ -30,6 +39,10 @@ class ordinary_schema_recipe final {
             )
         )";}
     static const char* metadata_initial_version() noexcept {return "INSERT OR IGNORE INTO _lattice_meta(key, value) VALUES('schema_version', '1')";}
+    // SAME two normal Core/Swift marker producers. Parameter DATA cannot
+    // choose SQL, a table, a column, a trigger origin or initialization purpose.
+    static const char* metadata_marker_store() noexcept {return "INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)";}
+    static const char* metadata_marker_prune() noexcept {return "DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' AND key <> ? AND value <> ?";}
     static const char* sync_control_table() noexcept {return R"(
             CREATE TABLE IF NOT EXISTS _SyncControl (
                 id INTEGER PRIMARY KEY CHECK(id=1),
@@ -69,6 +82,25 @@ class ordinary_schema_recipe final {
             CREATE INDEX IF NOT EXISTS idx_audit_log_change_lookup
                 ON AuditLog(tableName, rowId, operation)
         )";}
+    // Passive physical order of the SAME actual current AuditLog producer.
+    // Full DDL/index/FK/namespace validation is still required separately.
+    template<class Rows>
+    static bool audit_columns_match(const Rows& rows)noexcept {
+        static constexpr std::string_view expected[]{"id","globalid","tablename","operation","rowid","globalrowid",
+            "changedfields","changedfieldsnames","isfromremote","issynchronized","timestamp","synthesized"};
+        if(rows.size()!=std::size(expected))return false;
+        for(std::size_t i=0;i<rows.size();++i) {
+            const auto n=rows[i].find("name"),c=rows[i].find("cid");
+            if(n==rows[i].end()||c==rows[i].end())return false;
+            const auto* name=std::get_if<std::string>(&n->second);const auto* cid=std::get_if<int64_t>(&c->second);
+            if(!name||!cid||*cid!=int64_t(i)||name->size()!=expected[i].size())return false;
+            for(std::size_t j=0;j<name->size();++j) {
+                const auto value=static_cast<unsigned char>((*name)[j]);
+                if((value>='A'&&value<='Z'?value+('a'-'A'):value)!=static_cast<unsigned char>(expected[i][j]))return false;
+            }
+        }
+        return true;
+    }
     static void append_swift_physical_property(model_schema& schema,const property_descriptor& desc) {
         if (desc.kind == property_kind::union_type) {
             // Union FK column: TEXT storing the union row's globalId
@@ -94,11 +126,11 @@ class ordinary_schema_recipe final {
         for(const auto& desc:declarations.properties)append_swift_physical_property(schema,desc);
         return schema; // SAME catalog order captured by the actual bridge.
     }
-    static std::string model_table(const model_schema& schema,
-        std::vector<std::pair<std::string,column_type>>& columns) {
+    template<class Text,class Schema,class Columns>
+    static Text model_table_storage(const Schema& schema,Columns& columns) {
         // Create table with SQL-generated UUID default for globalId
         // This matches Lattice.swift's table creation
-        std::ostringstream sql;
+        ordinary_program_storage_stream<Text> sql;
         sql << "CREATE TABLE IF NOT EXISTS " << schema.table_name << "(";
         sql << "id INTEGER PRIMARY KEY AUTOINCREMENT, ";
         sql << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
@@ -125,10 +157,10 @@ class ordinary_schema_recipe final {
                 sql << ", " << prop.name << "_minLon REAL";
                 sql << ", " << prop.name << "_maxLon REAL";
                 // Add all 4 columns to trigger list
-                columns.push_back({prop.name + "_minLat", column_type::real});
-                columns.push_back({prop.name + "_maxLat", column_type::real});
-                columns.push_back({prop.name + "_minLon", column_type::real});
-                columns.push_back({prop.name + "_maxLon", column_type::real});
+                columns.push_back({ordinary_program_storage_text<Text>(prop.name) + "_minLat", column_type::real});
+                columns.push_back({ordinary_program_storage_text<Text>(prop.name) + "_maxLat", column_type::real});
+                columns.push_back({ordinary_program_storage_text<Text>(prop.name) + "_minLon", column_type::real});
+                columns.push_back({ordinary_program_storage_text<Text>(prop.name) + "_maxLon", column_type::real});
             } else {
                 sql << ", " << prop.name << " ";
                 switch (prop.type) {
@@ -145,6 +177,10 @@ class ordinary_schema_recipe final {
         }
         sql << ")";
         return sql.str();
+    }
+    static std::string model_table(const model_schema& schema,
+        std::vector<std::pair<std::string,column_type>>& columns) {
+        return model_table_storage<std::string>(schema,columns);
     }
     static std::string column_list(const std::vector<std::string>& resolved_cols) {
         std::ostringstream cols_ss;
@@ -175,8 +211,13 @@ class ordinary_schema_recipe final {
             << " ON " << schema.table_name << "(" << prop.name << ")";
         return sql.str();
     }
+    template<class Text>
+    static Text shadow_column_storage(std::string_view table,std::string_view shadow_col) {
+        return Text("ALTER TABLE ")+ordinary_program_storage_text<Text>(table)+" ADD COLUMN "+
+            ordinary_program_storage_text<Text>(shadow_col)+" TEXT";
+    }
     static std::string shadow_column(const std::string& table,const std::string& shadow_col) {
-        return "ALTER TABLE " + table + " ADD COLUMN " + shadow_col + " TEXT";
+        return shadow_column_storage<std::string>(table,shadow_col);
     }
     static std::string shadow_insert(const std::string& table,const std::string& link_table,
         const std::string& shadow_col,const std::string& ins_trig) {
@@ -589,5 +630,83 @@ class ordinary_schema_recipe final {
             )
         )";}
     static const char* replication_upload_floor() noexcept {return "ALTER TABLE _lattice_replication_slots ADD COLUMN upload_floor INTEGER NOT NULL DEFAULT 0";}
+    // Passive postimage of these SAME two actual normal producers. This does
+    // not run ALTER or infer a historical declaration from observed SQL.
+    template<class Text>
+    static Text replication_slots_after_upload_floor_storage() {
+        Text result=replication_slots();
+        constexpr std::string_view prefix="ALTER TABLE _lattice_replication_slots ADD COLUMN ";
+        const std::string_view alteration=replication_upload_floor();
+        const auto close=result.find_last_of(')');
+        if(!alteration.starts_with(prefix)||close==Text::npos||result.size()>16384||alteration.size()>1024)
+            throw std::runtime_error("compiled replication-slot producer composition differs");
+        result.insert(close,", "+ordinary_program_storage_text<Text>(alteration.substr(prefix.size())));
+        return result;
+    }
+    static std::string replication_slots_after_upload_floor() {return replication_slots_after_upload_floor_storage<std::string>();}
+    // Passive expectation of the one ordinary current history: the normal
+    // CREATE+upload-floor producer, followed by sync.cpp's real observer ALTER.
+    // This does not grant pending startup permission to execute that ALTER.
+    static const char* replication_observer_column()noexcept {
+        return "ALTER TABLE _lattice_replication_slots ADD COLUMN is_observer INTEGER NOT NULL DEFAULT 0";
+    }
+    template<class Text>
+    static Text replication_slots_after_upload_floor_and_observer_storage() {
+        Text result=replication_slots_after_upload_floor_storage<Text>();
+        constexpr std::string_view prefix="ALTER TABLE _lattice_replication_slots ADD COLUMN ";
+        const std::string_view alteration=replication_observer_column();
+        const auto close=result.find_last_of(')');
+        if(!alteration.starts_with(prefix)||close==Text::npos||result.size()>16384||alteration.size()>1024)
+            throw std::runtime_error("compiled observer-slot producer composition differs");
+        result.insert(close,", "+ordinary_program_storage_text<Text>(alteration.substr(prefix.size())));
+        return result;
+    }
+    static std::string replication_slots_after_upload_floor_and_observer() {return replication_slots_after_upload_floor_and_observer_storage<std::string>();}
+    static std::span<const std::string_view> static_sync_column_names(std::string_view table,bool floor)noexcept {
+        static constexpr std::string_view set[]{"sync_id","table_name","global_row_id"};
+        static constexpr std::string_view state[]{"audit_entry_id","sync_id","is_synchronized"};
+        static constexpr std::string_view slots[]{"sync_id","confirmed_audit_id","last_received_event_id","last_active_at","upload_floor"};
+        if(table=="_lattice_sync_set")return set;
+        if(table=="_lattice_sync_state")return state;
+        if(table=="_lattice_replication_slots")return {slots,floor?5u:4u};
+        return {};
+    }
+    // Pure metadata check, never a permission. Strict table/index/FK/namespace
+    // validation remains mandatory after this actual typed xinfo observation.
+    template<class Rows>
+    static bool static_sync_columns_match(std::string_view table,bool floor,const Rows& rows)noexcept {
+        const auto expected=static_sync_column_names(table,floor);
+        if(expected.empty()||rows.size()!=expected.size())return false;
+        for(std::size_t i=0;i<rows.size();++i) {
+            const auto name=rows[i].find("name"),cid=rows[i].find("cid");
+            if(name==rows[i].end()||cid==rows[i].end())return false;
+            const auto* actual=std::get_if<std::string>(&name->second);
+            const auto* ordinal=std::get_if<int64_t>(&cid->second);
+            if(!actual||!ordinal||*ordinal!=int64_t(i)||actual->size()!=expected[i].size())return false;
+            for(std::size_t j=0;j<actual->size();++j) {
+                const auto c=static_cast<unsigned char>((*actual)[j]);
+                if((c>='A'&&c<='Z'?c+('a'-'A'):c)!=static_cast<unsigned char>(expected[i][j]))return false;
+            }
+        }
+        return true;
+    }
+
+    // Exactly the same current five-column prefix, then the actual observer
+    // column. An observer-before-floor or observer-without-floor image refuses.
+    template<class Rows>
+    static bool static_sync_observer_columns_match(std::string_view table,const Rows& rows)noexcept {
+        if(table!="_lattice_replication_slots")return static_sync_columns_match(table,true,rows);
+        if(rows.size()!=6||!static_sync_columns_match(table,true,std::span(rows.data(),size_t(5))))return false;
+        const auto name=rows[5].find("name"),cid=rows[5].find("cid");
+        if(name==rows[5].end()||cid==rows[5].end())return false;
+        const auto* actual=std::get_if<std::string>(&name->second);
+        const auto* ordinal=std::get_if<int64_t>(&cid->second);
+        constexpr std::string_view expected="is_observer";
+        if(!actual||!ordinal||*ordinal!=5||actual->size()!=expected.size())return false;
+        for(std::size_t i=0;i<expected.size();++i){const auto c=static_cast<unsigned char>((*actual)[i]);
+            if((c>='A'&&c<='Z'?c+('a'-'A'):c)!=static_cast<unsigned char>(expected[i]))return false;}
+        return true;
+    }
+
 };
 } // namespace lattice::detail

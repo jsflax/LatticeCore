@@ -31,6 +31,13 @@ struct recovery_continuous_policy {
     recovery_continuous_receiver_profile receiver=recovery_continuous_receiver_profile::disabled;
 };
 class recovery_continuous_producer;
+class observer_delivery_startup;
+class observer_delivery_open_startup;
+struct recovery_continuous_startup_test_access;
+class recovery_obligation_bootstrap_reader;
+class recovery_obligation_bootstrap_statement;
+struct ordinary_schema_projection;
+class store_resource_continuous_startup;
 class recovery_continuous_route;
 class recovery_continuous_work;
 struct recovery_continuous_admission;
@@ -67,6 +74,10 @@ public:
 struct recovery_continuous_open_result {
     recovery_install_result settlement;
     std::shared_ptr<lattice_db> owner;
+    // Actual later owner close failure is distinct from the install's first
+    // rollback cleanup error. With no prior cleanup it also occupies that
+    // existing compatibility slot; both references then describe ONE error.
+    std::exception_ptr owner_close_error;
 };
 struct recovery_continuous_quiescence {
     recovery_install_result settlement;
@@ -105,7 +116,17 @@ public:
     recovery_continuous_route(const recovery_continuous_route&)=delete;
     recovery_continuous_route& operator=(const recovery_continuous_route&)=delete;
 };
+class controller_store_ending;
+class store_deletion_operation;
 class recovery_continuous_producer {
+    friend class observer_delivery_startup;
+    friend class recovery_obligation_bootstrap_reader;
+    friend class recovery_obligation_bootstrap_statement;
+    friend struct recovery_continuous_startup_test_access;
+    friend class store_deletion_operation;
+#ifndef __EMSCRIPTEN__
+    static controller_store_ending retire_controller_for_deletion(const std::shared_ptr<lattice_db>&);
+#endif
     friend class ::lattice::swift_lattice_ref;
     friend struct recovery_continuous_admission;
     // Closed recipe: only native and Swift retained-owner factories construct it.
@@ -129,12 +150,41 @@ class recovery_continuous_producer {
     friend class receive_install_store;
     friend class recovery_obligation_store;
     friend class recovery_obligation_producer_store;
-    friend std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&);
+    friend std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&,const std::shared_ptr<observer_delivery_startup>&,const recovery_owner_schema&);
     friend void require_continuous_legacy_export_absent(database&);
     friend void require_continuous_raw_handle_absent(database&);
+    friend std::shared_ptr<observer_delivery_startup> select_continuous_startup(
+        const configuration&,const recovery_owner_schema&,const std::shared_ptr<recovery_continuous_admission>&);
+    static std::shared_ptr<observer_delivery_startup> select_startup_(
+        const configuration&,const recovery_owner_schema&,const std::shared_ptr<recovery_continuous_admission>&);
+    static std::shared_ptr<recovery_continuous_admission> acquire_(const configuration&,
+        const recovery_continuous_policy&,store_resource_continuous_startup,std::chrono::steady_clock::time_point);
     static void classify_open(database&,bool private_admission,bool writable);
     static std::shared_ptr<database> open_writer(const configuration&,
-        const std::shared_ptr<recovery_continuous_admission>&);
+        const std::shared_ptr<recovery_continuous_admission>&,
+        const std::shared_ptr<observer_delivery_startup>&,const recovery_owner_schema&);
+    // Denial-only exact custody check at the actual post-open owner bind.
+    static bool pending_startup_matches_(const lattice_db&,const observer_delivery_startup&)noexcept;
+    // Genuine pre-enrollment origin, issued by the retained container creator.
+    // Null means existing/noncontinuous; malformed actual custody throws.
+    static const recovery_continuous_admission* pending_fresh_catalog_original_(
+        const lattice_db&,database&,const observer_delivery_startup&);
+    friend class observer_delivery_open_startup;
+    static bool enrollment_startup_matches_(const lattice_db&,const observer_delivery_startup&)noexcept;
+    // DATA-only binding to the actual retained enrollment. The issuer derives
+    // discovery caps/domain from that same admission; callers supply no grant.
+    static const recovery_continuous_admission* enrollment_reader_binding_(
+        const lattice_db&,const database&,recovery_obligation_producer_discovery_limits* =nullptr,bool* =nullptr)noexcept;
+    static bool enrollment_reader_fresh_(const lattice_db&,const database&,const recovery_continuous_admission*)noexcept;
+    static const receive_install_binding& enrollment_receiver_binding_(const lattice_db&,const database&,
+        const recovery_continuous_admission*,std::size_t);
+    // Actual pre-enrollment producer controls, never caller SQL or a model-row
+    // grant. Fixed entries retain this same actual pending Open and budget.
+    static void initialize_connection_durability_(database&);
+    static bool fresh_schema_present_(database&);
+    static void append_initialization_projection_(ordinary_schema_projection&,
+        const recovery_obligation_bootstrap_reader&);
+    static void verify_initializing_lineage_(database&,recovery_continuous_state&);
     static std::shared_ptr<recovery_continuous_route> admit_route(
         std::shared_ptr<lattice_db>,const sync_config&,bool injected);
     static std::shared_ptr<recovery_continuous_work> admit_work(

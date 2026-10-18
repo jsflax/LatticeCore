@@ -2,6 +2,7 @@
 #include <lattice/sync.hpp>
 #include <nlohmann/json.hpp>
 #include "../../Sources/LatticeCore/src/sync_canonical_range.hpp"
+#include "../../Sources/LatticeCore/src/canonical_validated_sequence.hpp"
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -289,4 +290,96 @@ TEST(SyncCanonicalRange, StructuralCompletionDoesNotClaimWholeHashOrAuthority) {
     EXPECT_NE(cr::content_sha256(x.m,x.rows,x.b),x.m.content_digest);const auto s=x.finished();EXPECT_EQ(s.status,cr::phase::sequence_complete_unverified);
     // A durable adapter MUST re-stream the whole C/E digests and validate source,
     // receipt coverage, scope/schema and current route before any installation.
+}
+
+TEST(SyncCanonicalRange, EveryFrameAndRestartAcceptsItsExactParserBoundary) {
+    Bundle x;
+    x.rows[0]=row("A",std::string("{\"name\":{\"kind\":2,\"value\":\"")+std::string(128,'q')+"\"}}");
+    x.seal();
+    const std::vector<cr::message> messages{x.r,x.m,x.page(),x.receipt_page(),cr::end{x.m.manifest_digest}};
+    for(const auto& body:messages){
+        const cr::frame expected{x.a,1,body};
+        const auto raw=cr::encode(expected,x.b);
+        const auto dom=json::parse(raw);
+        auto exact=x.b;exact.depth=containers(dom);exact.nodes=nodes(dom);
+        EXPECT_EQ(cr::decode(raw,exact),expected);
+        EXPECT_EQ(cr::decode_canonical(raw,exact),expected);
+        auto short_nodes=exact;--short_nodes.nodes;
+        exact_error([&]{(void)cr::decode(raw,short_nodes);},"invalid or over-budget canonical JSON");
+        auto short_depth=exact;--short_depth.depth;
+        exact_error([&]{(void)cr::decode(raw,short_depth);},"invalid or over-budget canonical JSON");
+    }
+    const auto state=x.after_content();
+    const auto raw=cr::encode_state(state,x.b);const auto dom=json::parse(raw);
+    auto exact=x.b;exact.depth=containers(dom);exact.nodes=nodes(dom);
+    EXPECT_EQ(cr::decode_state(raw,x.a,exact),state);
+    --exact.nodes;
+    exact_error([&]{(void)cr::decode_state(raw,x.a,exact);},"invalid or over-budget canonical JSON");
+}
+
+TEST(SyncCanonicalRange, DecodedDuplicateKeysRefuseWithinNestedArraysAndRestart) {
+    Bundle x;
+    struct duplicate_case{std::string raw,needle,replacement;};
+    const std::vector<duplicate_case> cases{
+        {cr::encode({x.a,1,x.m},x.b),"\"version\":2","\"version\":2,\"\\u0076ersion\":2"},
+        {cr::encode({x.a,1,x.page()},x.b),"\"id\":\"A\"","\"id\":\"A\",\"\\u0069d\":\"A\""},
+        {cr::encode({x.a,1,x.receipt_page()},x.b),"\"coverage_id\":\"coverage-A\"","\"coverage_id\":\"coverage-A\",\"coverage_\\u0069d\":\"coverage-A\""}
+    };
+    for(auto test:cases){
+        const auto offset=test.raw.find(test.needle);ASSERT_NE(offset,std::string::npos);
+        test.raw.replace(offset,test.needle.size(),test.replacement);
+        exact_error([&]{(void)cr::decode(test.raw,x.b);},"invalid or over-budget canonical JSON");
+    }
+    auto restart=cr::encode_state(x.start(),x.b);
+    const std::string needle="\"rebase_seen\":\"0\"";
+    const auto offset=restart.find(needle);ASSERT_NE(offset,std::string::npos);
+    restart.replace(offset,needle.size(),"\"rebase_seen\":\"0\",\"rebase_\\u0073een\":\"0\"");
+    exact_error([&]{(void)cr::decode_state(restart,x.a,x.b);},"invalid or over-budget canonical JSON");
+    // Repeated field names in distinct sibling objects are valid.
+    EXPECT_EQ(cr::decode(cr::encode({x.a,1,x.page()},x.b),x.b).body,cr::message{x.page()});
+}
+
+TEST(SyncCanonicalRange, ParserPreservesScalarTypesAndStrictCompleteInput) {
+    Bundle x;const cr::frame expected{x.a,1,x.m};const auto original=cr::encode(expected,x.b);
+    const std::string needle="\"version\":2";
+    const auto offset=original.find(needle);ASSERT_NE(offset,std::string::npos);
+    for(const auto* token:{"2.0","2e0","18446744073709551616"}){
+        auto raw=original;raw.replace(offset,needle.size(),std::string("\"version\":")+token);
+        exact_error([&]{(void)cr::decode(raw,x.b);},"invalid or over-budget canonical JSON");
+    }
+    for(const auto* token:{"-2","18446744073709551615","\"2\"","true","null","[]","{}"}){
+        auto raw=original;raw.replace(offset,needle.size(),std::string("\"version\":")+token);
+        exact_error([&]{(void)cr::decode(raw,x.b);},"unsupported canonical version");
+    }
+    for(const auto& suffix:{std::string(" true"),std::string("/*comment*/")}){
+        const auto raw=original+suffix;
+        exact_error([&]{(void)cr::decode(raw,x.b);},"invalid or over-budget canonical JSON");
+    }
+    // The existing vendor lexer treats NUL as EOF; exact canonical spelling
+    // must still refuse those extra raw bytes at the production audit boundary.
+    const auto nul_terminated=original+std::string(1,'\0');
+    EXPECT_EQ(cr::decode(nul_terminated,x.b),expected);
+    exact_error([&]{(void)cr::decode_canonical(nul_terminated,x.b);},"canonical frame bytes differ from exact spelling");
+    auto invalid_utf8=original;const auto channel=invalid_utf8.find("channel-A");ASSERT_NE(channel,std::string::npos);
+    invalid_utf8.replace(channel,9,std::string("channel-")+char(0xff));
+    exact_error([&]{(void)cr::decode(invalid_utf8,x.b);},"invalid or over-budget canonical JSON");
+    auto partial=original;partial.pop_back();
+    exact_error([&]{(void)cr::decode(partial,x.b);},"invalid or over-budget canonical JSON");
+}
+
+TEST(SyncCanonicalRange, MovedStringsNullsAndEmptyArraysKeepExactCanonicalMeaning) {
+    Bundle x;x.r.selection=cr::mode::full;x.r.base.reset();
+    x.r.expected={0,std::nullopt,{cr::frontier_kind::uninitialized,std::nullopt}};
+    x.r.receipts.clear();x.rows.clear();x.receipts.clear();x.seal();
+    const auto state=x.start();const auto restart=cr::encode_state(state,x.b);
+    EXPECT_EQ(cr::decode_state(restart,x.a,x.b),state);
+    const cr::frame expected{x.a,1,x.r};const auto raw=cr::encode(expected,x.b);
+    EXPECT_EQ(cr::decode_canonical(raw,x.b),expected);
+    auto escaped=raw;const auto channel=escaped.find("channel-A");ASSERT_NE(channel,std::string::npos);
+    escaped.replace(channel,9,"channel-\\u0041");
+    EXPECT_EQ(cr::decode(escaped,x.b),expected);
+    exact_error([&]{(void)cr::decode_canonical(escaped,x.b);},"canonical frame bytes differ from exact spelling");
+    x.a.channel="channel-\xc3\xa9";x.seal();
+    const cr::frame unicode{x.a,1,x.r};
+    EXPECT_EQ(cr::decode_canonical(cr::encode(unicode,x.b),x.b),unicode);
 }

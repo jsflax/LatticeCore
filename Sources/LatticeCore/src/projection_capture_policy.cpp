@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "projection_capture_policy.hpp"
 #include <algorithm>
 #include <cstring>
@@ -36,7 +37,7 @@ std::string quoted_name(std::string_view name) {
 }
 struct statement_owner {
     sqlite3_stmt* value = nullptr;
-    ~statement_owner() { if (value) sqlite3_finalize(value); }
+    ~statement_owner() { if (value) ::lattice::detail::store_physical_finalize(value); }
 };
 struct token {
     text value;
@@ -100,7 +101,7 @@ struct projection_capture_policy::state {
     void prepare(statement_owner& stmt, const std::string& sql, unsigned flags = SQLITE_PREPARE_NO_VTAB) {
         check();
         database::record_statement();
-        const int rc = sqlite3_prepare_v3(db(), sql.c_str(), static_cast<int>(sql.size() + 1), flags, &stmt.value, nullptr);
+        const int rc = ::lattice::detail::store_physical_prepare_v3(db(), sql.c_str(), static_cast<int>(sql.size() + 1), flags, &stmt.value, nullptr);
         check();
         if (rc != SQLITE_OK) {
             if ((rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED)
@@ -112,7 +113,7 @@ struct projection_capture_policy::state {
     }
     int step(sqlite3_stmt* stmt) {
         check();
-        const int rc = sqlite3_step(stmt);
+        const int rc = ::lattice::detail::store_physical_step(stmt);
         check();
         if ((rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED)
             throw projection_capture_failure(projection_status::admission_rejected, "capture catalog is busy");
@@ -418,9 +419,9 @@ projection_capture_policy::projection_capture_policy(database_projection_capture
 }
 void projection_capture_policy::check() const { capture_.check(); }
 void projection_capture_policy::cleanup() noexcept {
-    if (capture_.statement_) { sqlite3_finalize(capture_.statement_); capture_.statement_ = nullptr; }
+    if (capture_.statement_) { ::lattice::detail::store_physical_finalize(capture_.statement_); capture_.statement_ = nullptr; }
     if (state_) {
-        for (auto* cursor : state_->guards) sqlite3_finalize(cursor);
+        for (auto* cursor : state_->guards) ::lattice::detail::store_physical_finalize(cursor);
         state_->guards.clear();
     }
     if (capture_.policy_ == this) capture_.policy_ = nullptr;
@@ -477,7 +478,7 @@ void projection_capture_policy::prepare_read(const std::string& sql) {
         state_->scan(sql, 0);
         const char* tail = nullptr;
         database::record_statement();
-        const int rc = sqlite3_prepare_v3(capture_.handle(), sql.c_str(), static_cast<int>(sql.size() + 1),
+        const int rc = ::lattice::detail::store_physical_prepare_v3(capture_.handle(), sql.c_str(), static_cast<int>(sql.size() + 1),
             0, &capture_.statement_, &tail);
         check();
         if (rc != SQLITE_OK) {

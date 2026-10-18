@@ -1,3 +1,4 @@
+#include <lattice/store_physical_api.hpp>
 #include "recovery_witness.hpp"
 #include "recovery_writer_access.hpp"
 #include <algorithm>
@@ -16,13 +17,13 @@ struct statement {
     sqlite3_stmt* p = nullptr;
     statement(sqlite3* db, const char* sql) {
         database::record_statement();
-        const auto rc = sqlite3_prepare_v2(db, sql, -1, &p, nullptr);
-        if (rc != SQLITE_OK || !p) { sqlite3_finalize(p); p = nullptr; refuse("recovery witness prepare failed"); }
+        const auto rc = ::lattice::detail::store_physical_prepare_v2(db, sql, -1, &p, nullptr);
+        if (rc != SQLITE_OK || !p) { ::lattice::detail::store_physical_finalize(p); p = nullptr; refuse("recovery witness prepare failed"); }
     }
-    ~statement() { sqlite3_finalize(p); }
+    ~statement() { ::lattice::detail::store_physical_finalize(p); }
     statement(const statement&) = delete;
     bool next() {
-        const auto rc = sqlite3_step(p);
+        const auto rc = ::lattice::detail::store_physical_step(p);
         if (rc == SQLITE_ROW) return true;
         require(rc == SQLITE_DONE, "recovery witness step failed"); return false;
     }

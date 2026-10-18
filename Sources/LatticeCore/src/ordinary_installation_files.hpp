@@ -23,6 +23,10 @@ public:
     // No existing object's identity is learned by a catalog caller: expected
     // identity and digest come from its separately committed installation plan.
     static retained_installation_file open_executable(const executable_fact&, ordinary_launch::deadline);
+    // Separate resource-image route only: all original checks remain, with
+    // the already-supported root/admin0775 exception solely for actual
+    // fixed /Applications. Existing primary-MCP callers keep open_executable.
+    static retained_installation_file open_application_image(const executable_fact&, ordinary_launch::deadline);
     // Descriptor-relative variant used for a retained catalog/registration.
     // The parent descriptor remains caller-owned and is duplicated here.
     static retained_installation_file open_record(int parent, const std::string& leaf,

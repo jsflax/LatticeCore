@@ -8,6 +8,7 @@
 #include <type_traits>
 namespace lattice {
 struct database::target_staging_state::history_projection_native {
+    terminal_native_static_tail terminal_static; // FIRST: rows/SQL and actual programme/scope references die before this.
     database* const shell;
     const std::weak_ptr<detail::ordinary_group_target_receiving_owner> owner;
     const std::weak_ptr<detail::ordinary_group_target_schema_original> schema;
@@ -38,13 +39,14 @@ struct database::target_staging_state::history_projection_native {
     history_projection_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
         const std::shared_ptr<detail::ordinary_group_target_schema_original>& original,
         const std::shared_ptr<detail::ordinary_group_target_schema_original::projection_program>& input)
-        :shell(&actual),owner(receiving),schema(original),program(input) {
+        :terminal_static(actual,this,original.get(),2,receiving),shell(&actual),owner(receiving),schema(original),program(input) {
         // All statement/call/ending capacity precedes the genuine BEGIN. Existing
         // header/latest-page originals share the unchanged 24 MiB staging pool.
         const auto held=actual.target_staging_;
         if(!held||!held->history_header)throw db_error("GROUP projection actual header capacity missing");
         add_stage(held->history_header->logical_bytes);
         if(held->history_page)add_stage(held->history_page->logical_bytes);
+        terminal_static.constructor_returned();
     }
     void add_stage(std::size_t bytes) {
         if(bytes>ordinary_history_limits::stage_scratch_bytes-logical_bytes)
@@ -97,7 +99,7 @@ struct database::target_staging_state::history_projection_native {
         if(statement.prepare_entered||sql.empty())throw db_error("GROUP projection statement reissue refused");
         require(actual,unwind);auto& call=reserve(kind::prepare,index,unwind);require(actual,unwind);
         const char* tail=nullptr;statement.prepare_entered=true;call.entered=true;
-        statement.prepare_rc=sqlite3_prepare_v2(actual.db_,sql.data(),static_cast<int>(sql.size()),&statement.held,&tail);
+        statement.prepare_rc=::lattice::detail::store_physical_prepare_v2(actual.db_,sql.data(),static_cast<int>(sql.size()),&statement.held,&tail);
         statement.prepared_identity=statement.held;statement.prepare_returned=true;returned(call,statement.prepare_rc);
         require(actual,unwind);
         if(statement.prepare_rc!=SQLITE_OK||!statement.held||tail!=sql.data()+sql.size())throw db_error("GROUP projection actual Native preparation failed/changed");
@@ -117,7 +119,7 @@ struct database::target_staging_state::history_projection_native {
     }
     int step(database& actual,std::size_t index,bool unwind=false) {
         auto& statement=statements[index];require(actual,unwind);auto& call=reserve(kind::step,index,unwind);require(actual,unwind);call.entered=true;
-        const int rc=sqlite3_step(statement.held);returned(call,rc);
+        const int rc=::lattice::detail::store_physical_step(statement.held);returned(call,rc);
         if(!statement.first_step_returned){statement.first_step_rc=rc;statement.first_step_returned=true;}
         if(rc!=SQLITE_ROW){statement.terminal_rc=rc;statement.terminal_returned=true;}
         if(index==begin)scope->record_schema_begin(actual,rc);
@@ -129,7 +131,7 @@ struct database::target_staging_state::history_projection_native {
         auto& statement=statements[index];if(!statement.held||statement.finalize_entered)return;
         require(actual,unwind);auto& call=reserve(kind::finalize,index,unwind);require(actual,unwind);
         statement.finalized_identity=statement.held;statement.finalize_entered=true;call.entered=true;
-        statement.finalize_rc=sqlite3_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
+        statement.finalize_rc=::lattice::detail::store_physical_finalize(statement.held);statement.finalize_returned=true;returned(call,statement.finalize_rc);
         if((statement.finalize_rc&0xff)!=SQLITE_MISUSE){statement.destruction_known=true;statement.held=nullptr;}
         scope->record_schema_finalized(actual,statement.finalize_rc);require(actual,unwind);
         if(statement.finalize_rc!=SQLITE_OK||!statement.destruction_known)throw db_error("GROUP projection actual VM ending failed/unknown");
@@ -266,12 +268,12 @@ void database::require_target_history_complete_(const detail::ordinary_target_st
         throw db_error("GROUP actual empty history/header content differs");
 }
 bool database::target_history_projection_cleanup_ending_()const noexcept {
-    const auto state=target_staging_;if(!state||!state->current_creator())return false;
+    const auto state=target_staging_;if(!state||!state->current_creator()||state->terminal_native_statics_attempted)return false;
     return !state->history_projection||state->history_projection->cleanup_known();
 }
 bool database::target_history_projection_native_ending_()const noexcept {
     const auto state=target_staging_;const auto native=state?state->history_projection:nullptr;
-    return state&&state->current_creator()&&native&&native->shell==this&&native->ending_known();
+    return state&&state->current_creator()&&!state->terminal_native_statics_attempted&&native&&native->shell==this&&native->ending_known();
 }
 void database::require_target_history_projection_ending_(const detail::ordinary_target_staging_connection& connection,
     const detail::ordinary_group_target_receiving_owner& receiving)const {

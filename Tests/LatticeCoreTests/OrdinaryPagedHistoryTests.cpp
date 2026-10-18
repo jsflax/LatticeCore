@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "ExceptionObservation.hpp"
 #include <lattice/ordinary_history.hpp>
 #include "../../Sources/LatticeCore/src/ordinary_source_upload.hpp"
 #include "../../Sources/LatticeCore/src/ordinary_wire_test_hooks.hpp"
@@ -25,20 +26,59 @@ int64_t history_usage(lattice_db& owner){const auto rows=owner.db().query("SELEC
 }
 
 TEST(OrdinaryPagedHistory, NineThousandTwoKiBRowsAndOriginalsUseBoundedDurablePages) {
+    const char* phase="construct-source";int seed_row=-1;uint64_t observed_page=0;bool page_observed=false;
+    try {
     TempDB path{"ordinary_history_9000"};lattice_db source{history_config(path)};
-    source.begin_transaction();for(int n=0;n<9000;++n)source.add(TestPerson{std::string(2048,'x'),n,std::nullopt});source.commit();
-    const auto flags=source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog");
-    EXPECT_THROW((void)capture_ordinary_sync_export(source,{"TestPerson"}),db_error); // strict-v2 limit unchanged
-    const auto issued=capture_ordinary_history_export(source,{"TestPerson"});const auto header=decoded(issued,0);
+    phase="seed-begin";source.begin_transaction();
+    phase="seed-add";for(int n=0;n<9000;++n){seed_row=n;source.add(TestPerson{std::string(2048,'x'),n,std::nullopt});}
+    phase="seed-commit";source.commit();
+    phase="seed-flags";const auto flags=source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog");
+    phase="strict-refusal";EXPECT_THROW((void)capture_ordinary_sync_export(source,{"TestPerson"}),db_error); // strict-v2 limit unchanged
+    phase="history-capture";const auto issued=capture_ordinary_history_export(source,{"TestPerson"});phase="history-header";const auto header=decoded(issued,0);
     EXPECT_EQ(header["profile"],"paged-history-v1");EXPECT_EQ(header["rows"],"9000");EXPECT_EQ(header["knownOriginals"],"9000");EXPECT_EQ(header["unknownOriginals"],"0");
     const auto columns=header["tables"][0]["columns"];const auto name_column=std::find(columns.begin(),columns.end(),"name")-columns.begin();ASSERT_LT(size_t(name_column),columns.size());
     size_t rows=0,originals=0;std::string previous;
-    for(uint64_t n=1;n<issued.frame_count();++n){auto lease=issued.page(n);const auto bytes=lease.bytes();EXPECT_LE(bytes.size(),ordinary_history_limits{}.page_bytes);
-        const auto page=json::parse(bytes.begin(),bytes.end())["latticeOrdinarySync"];EXPECT_EQ(page["previousDigest"],previous);EXPECT_EQ(page["index"],std::to_string(n-1));EXPECT_LE(page["records"].size(),64u);
+    for(uint64_t n=1;n<issued.frame_count();++n){page_observed=true;observed_page=n;phase="history-page";auto lease=issued.page(n);const auto bytes=lease.bytes();EXPECT_LE(bytes.size(),ordinary_history_limits{}.page_bytes);
+        phase="history-page-decode";const auto page=json::parse(bytes.begin(),bytes.end())["latticeOrdinarySync"];EXPECT_EQ(page["previousDigest"],previous);EXPECT_EQ(page["index"],std::to_string(n-1));EXPECT_LE(page["records"].size(),64u);
         for(const auto& record:page["records"]){if(record.contains("row")){++rows;EXPECT_EQ(record["row"]["values"][size_t(name_column)][1].get<std::string>().size(),2048u);}else if(record.contains("original"))++originals;else ADD_FAILURE()<<"unexpected unknown record";}
         previous=picosha2::hash256_hex_string(bytes.begin(),bytes.end());}
-    EXPECT_EQ(rows,9000u);EXPECT_EQ(originals,9000u);EXPECT_EQ(header["contentDigest"],complete_hash(issued));EXPECT_EQ(source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog"),flags);
-    EXPECT_LT(issued.durable_bytes(),ordinary_history_limits{}.durable_stage_bytes);
+    EXPECT_EQ(rows,9000u);EXPECT_EQ(originals,9000u);phase="content-digest";EXPECT_EQ(header["contentDigest"],complete_hash(issued));phase="final-audit";EXPECT_EQ(source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog"),flags);
+    phase="durable-extent";EXPECT_LT(issued.durable_bytes(),ordinary_history_limits{}.durable_stage_bytes);
+    } catch (...) {
+        const auto original=std::current_exception();
+        const auto text=lattice_test::actual_exception_text(original);
+        try {
+            ::testing::Test::RecordProperty("historyFailurePhase",phase);
+            ::testing::Test::RecordProperty("historyFailureSeedRow",std::to_string(seed_row));
+            ::testing::Test::RecordProperty("historyFailurePageObserved",page_observed?"true":"false");
+            ::testing::Test::RecordProperty("historyFailurePage",std::to_string(observed_page));
+            ::testing::Test::RecordProperty("historyFirstError",text);
+        } catch (...) {
+            std::fprintf(stderr,"LATTICE_HISTORY_ERROR_PROPERTY_UNAVAILABLE phase=%s seed_row=%d page_observed=%d page=%llu first_error=%s\n",
+                phase,seed_row,page_observed?1:0,static_cast<unsigned long long>(observed_page),text.c_str());
+        }
+        throw; // The exact original type/settlement/first errors still reach GoogleTest.
+    }
+}
+TEST(OrdinaryPagedHistory, MultiPageCaptureKeepsInstalledGuardAcrossLiveSourceRowCursor) {
+    TempDB path{"ordinary_history_live_cursor_guard"};lattice_db source{history_config(path)};
+    source.begin_transaction();
+    for(int n=0;n<65;++n)source.add(TestPerson{std::string(2048,'p'),n,std::nullopt});
+    source.commit();
+    const auto before=source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog");
+    const auto issued=capture_ordinary_history_export(source,{"TestPerson"});
+    const auto header=decoded(issued,0);
+    EXPECT_EQ(header["rows"],"65");EXPECT_EQ(header["knownOriginals"],"65");
+    ASSERT_GT(issued.frame_count(),2u); // A page must flush before its live source cursor finishes.
+    size_t rows=0,originals=0;
+    for(uint64_t n=1;n<issued.frame_count();++n){
+        const auto page=decoded(issued,n);EXPECT_LE(page["records"].size(),64u);
+        for(const auto& record:page["records"]){if(record.contains("row"))++rows;else if(record.contains("original"))++originals;else ADD_FAILURE()<<"unexpected unknown record";}
+    }
+    EXPECT_EQ(rows,65u);EXPECT_EQ(originals,65u);
+    EXPECT_EQ(header["contentDigest"],complete_hash(issued));
+    EXPECT_EQ(source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog"),before);
+    EXPECT_EQ(source.db().query("SELECT id FROM TestPerson").size(),65u);
 }
 TEST(OrdinaryPagedHistory, UnknownLegacyRemoteAndMalformedAgeNeverBecomeKnownOriginals) {
     TempDB up{"ordinary_history_unknown_up"},path{"ordinary_history_unknown_source"};lattice_db uploader{history_config(up)},source{history_config(path)};
@@ -132,8 +172,8 @@ struct history_fresh_process {
             try{(void)capture_ordinary_history_export(source,{"TestPerson"});}catch(const db_error&){refused=true;}
             database_retirement_test_hooks::current=previous;
             ok=refused&&actual_opened==2&&ordinary_export_slots.load()==baseline&&source.db().query("SELECT * FROM TestPerson")==before;
-            ::_exit(ok?0:19); // Every actual partial constructor open is recorded before entry and physically closed on unwind.
-        }
+            // Reach the common exit only after source and TempDB leave scope.
+        } else {
         std::shared_ptr<database> reader,xproc;
         std::shared_ptr<const database_retirement_state> writer_fact,reader_fact,xproc_fact;
         {
@@ -160,6 +200,7 @@ struct history_fresh_process {
             // The real last owning deleter now completes both tracked readers;
             // only then does the original charged tail reclaim its same slot.
             ok=ok&&ordinary_export_slots.load()==baseline;
+        }
         }
     }catch(...){ok=false;}
     ::_exit(ok?0:19);
@@ -346,4 +387,252 @@ TEST(OrdinaryHistoryOpenLedger, ActualCutControlBlockFailureWithoutEscapeReclaim
     const auto successor=capture_ordinary_history_export(source,{"TestPerson"});
     EXPECT_EQ(successor.cut(),2);EXPECT_FALSE(successor.page(0).bytes().empty());
 }
+#endif
+
+#ifndef __EMSCRIPTEN__
+#include "../../Sources/LatticeCore/src/ordinary_history_refund_test_access.hpp"
+#include "CanonicalWriterTestAccess.hpp"
+namespace {
+using refund_access=lattice::detail::ordinary_history_refund_test_access;
+using refund_status=lattice::detail::ordinary_history_refund_status;
+struct refund_blocked_destructor {
+    std::promise<void> entered,release;
+    std::shared_future<void> resumed=release.get_future().share();
+    std::atomic<bool> armed{false},timed_out{false},returned{false};
+};
+struct refund_join_guard {
+    std::shared_ptr<refund_blocked_destructor> state;
+    std::thread& worker;
+    ~refund_join_guard(){
+        try{state->release.set_value();}catch(...){}
+        if(worker.joinable())worker.join();
+    }
+};
+}
+TEST(OrdinaryHistoryRefundObservation, ObservingIsDataOnlyAndPreservesActualFrames) {
+    TempDB path{"history_refund_data"};lattice_db source{history_config(path)};
+    source.add(TestPerson{"preserved",12,std::nullopt});
+    const auto baseline=ordinary_export_slots.load();
+    ordinary_history_refund_observation receipt,alias;
+    std::shared_ptr<const database_retirement_state> native;
+    {
+        history_child_hook child([&](lattice_db& original){native=database_retirement_access::retain(original.db());});
+        auto cut=capture_ordinary_history_export(source,{"TestPerson"});
+        EXPECT_FALSE(refund_access::has_observation(cut));
+        const auto header=decoded(cut,0);
+        const auto digest=complete_hash(cut);
+        receipt=refund_access::observe(cut);alias=refund_access::observe(cut);
+        EXPECT_TRUE(receipt.same_reservation(alias));
+        EXPECT_EQ(receipt.status(),refund_status::held);
+        EXPECT_EQ(ordinary_export_slots.load(),baseline+1);
+        EXPECT_EQ(decoded(cut,0),header);EXPECT_EQ(complete_hash(cut),digest);
+        alias={};EXPECT_EQ(receipt.status(),refund_status::held);
+    }
+    ASSERT_TRUE(native);EXPECT_EQ(native->state(),database_retirement_state::phase::closed);
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);
+    EXPECT_EQ(receipt.status(),refund_status::refunded);
+    EXPECT_EQ(ordinary_history_refund_observation{}.status(),refund_status::unavailable);
+}
+TEST(OrdinaryHistoryRefundObservation, RealOffListReadersDelayTheSameReservationReceipt) {
+    TempDB path{"history_refund_readers"};lattice_db source{history_config(path)};
+    source.add(TestPerson{"readers",13,std::nullopt});const auto baseline=ordinary_export_slots.load();
+    std::shared_ptr<database> reader,xproc;
+    std::shared_ptr<const database_retirement_state> reader_fact,xproc_fact;
+    ordinary_history_refund_observation receipt;
+    {
+        history_child_hook child([&](lattice_db& original){
+            reader=original.borrow_read_connection();xproc=original.borrow_xproc_read_connection();
+            reader_fact=database_retirement_access::retain(*reader);xproc_fact=database_retirement_access::retain(*xproc);
+        });
+        auto cut=capture_ordinary_history_export(source,{"TestPerson"});receipt=refund_access::observe(cut);
+    }
+    ASSERT_TRUE(reader);ASSERT_TRUE(xproc);EXPECT_EQ(receipt.status(),refund_status::held);
+    EXPECT_EQ(ordinary_export_slots.load(),baseline+1);
+    std::thread first([original=std::move(reader)]()mutable{original.reset();});first.join();
+    EXPECT_EQ(reader_fact->state(),database_retirement_state::phase::closed);
+    EXPECT_EQ(xproc_fact->state(),database_retirement_state::phase::live);
+    EXPECT_EQ(receipt.status(),refund_status::held);EXPECT_EQ(ordinary_export_slots.load(),baseline+1);
+    std::thread last([original=std::move(xproc)]()mutable{original.reset();});last.join();
+    EXPECT_EQ(xproc_fact->state(),database_retirement_state::phase::closed);
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);EXPECT_EQ(receipt.status(),refund_status::refunded);
+}
+TEST(OrdinaryHistoryRefundObservation, BlockedActualSQLiteDestructorCannotPublishRefundEarly) {
+    TempDB path{"history_refund_blocked"};lattice_db source{history_config(path)};
+    source.add(TestPerson{"blocked",14,std::nullopt});const auto baseline=ordinary_export_slots.load();
+    auto state=std::make_shared<refund_blocked_destructor>();auto entered=state->entered.get_future();
+    std::shared_ptr<database> reader;std::shared_ptr<const database_retirement_state> native;
+    ordinary_history_refund_observation receipt;
+    {
+        history_child_hook child([&](lattice_db& original){
+            reader=original.borrow_read_connection();native=database_retirement_access::retain(*reader);
+            auto* context=new std::shared_ptr<refund_blocked_destructor>(state);
+            const int rc=sqlite3_create_function_v2(reader->handle(),"history_refund_block",0,SQLITE_UTF8,context,
+                [](sqlite3_context* context,int,sqlite3_value**){sqlite3_result_null(context);},nullptr,nullptr,
+                [](void* raw)noexcept{
+                    auto held=std::unique_ptr<std::shared_ptr<refund_blocked_destructor>>(static_cast<std::shared_ptr<refund_blocked_destructor>*>(raw));
+                    const auto state=*held;
+                    if(!state->armed.load(std::memory_order_acquire))return;
+                    try{state->entered.set_value();}catch(...){state->timed_out.store(true);}
+                    if(state->resumed.wait_for(std::chrono::seconds(2))!=std::future_status::ready)state->timed_out.store(true);
+                    state->returned.store(true,std::memory_order_release);
+                });
+            if(rc!=SQLITE_OK)throw db_error("actual SQLite destruction control registration failed");
+            state->armed.store(true,std::memory_order_release);
+        });
+        auto cut=capture_ordinary_history_export(source,{"TestPerson"});receipt=refund_access::observe(cut);
+    }
+    ASSERT_TRUE(reader);
+    std::thread worker([original=std::move(reader)]()mutable{original.reset();});
+    refund_join_guard ending{state,worker};
+    const bool blocked=entered.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+    EXPECT_TRUE(blocked);
+    EXPECT_FALSE(state->returned.load(std::memory_order_acquire));
+    EXPECT_EQ(receipt.status(),refund_status::held);EXPECT_EQ(ordinary_export_slots.load(),baseline+1);
+    state->release.set_value();worker.join();
+    EXPECT_FALSE(state->timed_out.load());EXPECT_TRUE(state->returned.load());
+    ASSERT_TRUE(native);EXPECT_EQ(native->state(),database_retirement_state::phase::closed);
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);EXPECT_EQ(receipt.status(),refund_status::refunded);
+}
+TEST(OrdinaryHistoryRefundObservation, NoObserverNormalEndingKeepsOriginalNativeAccounting) {
+    TempDB path{"history_refund_absent"};lattice_db source{history_config(path)};
+    source.add(TestPerson{"unobserved",15,std::nullopt});const auto baseline=ordinary_export_slots.load();
+    std::shared_ptr<const database_retirement_state> native;
+    {
+        history_child_hook child([&](lattice_db& original){native=database_retirement_access::retain(original.db());});
+        auto cut=capture_ordinary_history_export(source,{"TestPerson"});
+        EXPECT_FALSE(refund_access::has_observation(cut));
+        EXPECT_FALSE(cut.page(0).bytes().empty());
+    }
+    ASSERT_TRUE(native);EXPECT_EQ(native->state(),database_retirement_state::phase::closed);
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);
+}
+#if GTEST_HAS_DEATH_TEST && (defined(__APPLE__) || defined(__linux__))
+TEST(OrdinaryHistoryRefundObservation, ActualNativeCloseUnprovedNeverBecomesARefundAfterFinalize) {
+    history_fresh_process fresh;
+    ASSERT_EXIT({
+        bool ok=true;try{
+            TempDB path{"history_refund_busy"};lattice_db source{history_config(path)};
+            source.add(TestPerson{"busy",16,std::nullopt});const auto baseline=ordinary_export_slots.load();
+            sqlite3_stmt* statement=nullptr;std::shared_ptr<const database_retirement_state> native;
+            ordinary_history_refund_observation receipt;
+            {
+                history_child_hook child([&](lattice_db& original){
+                    native=database_retirement_access::retain(original.db());
+                    if(sqlite3_prepare_v2(original.db().handle(),"SELECT name FROM TestPerson",-1,&statement,nullptr)!=SQLITE_OK)
+                        throw db_error("actual history close-failure statement refused");
+                });
+                auto cut=capture_ordinary_history_export(source,{"TestPerson"});receipt=refund_access::observe(cut);
+            }
+            ok=ok&&native&&native->state()==database_retirement_state::phase::close_unproved;
+            ok=ok&&native->checked_close_result()==SQLITE_BUSY;
+            ok=ok&&statement&&ordinary_export_slots.load()==baseline+1&&receipt.status()!=refund_status::refunded;
+            if(statement)ok=ok&&sqlite3_finalize(statement)==SQLITE_OK;
+            ok=ok&&native->state()==database_retirement_state::phase::close_unproved;
+            ok=ok&&ordinary_export_slots.load()==baseline+1&&receipt.status()!=refund_status::refunded;
+        }catch(...){ok=false;}
+        ::_exit(ok?0:29);
+    },::testing::ExitedWithCode(0),"");
+}
+TEST(OrdinaryHistoryRefundObservation, ActualCheckedCloseCleanupFailureQuarantinesObservedReservation) {
+    history_fresh_process fresh;
+    ASSERT_EXIT({
+        bool ok=true;try{
+            TempDB path{"history_refund_checked_failure"};lattice_db source{history_config(path)};
+            source.add(TestPerson{"cleanup",17,std::nullopt});const auto baseline=ordinary_export_slots.load();
+            ordinary_history_refund_observation receipt;
+            {
+                auto cut=capture_ordinary_history_export(source,{"TestPerson"});receipt=refund_access::observe(cut);
+                auto reader=refund_access::borrow_actual_xproc(cut);
+                auto* native=lattice::detail::canonical_writer_custody_test_access::fault_handle(*reader);
+                if(!native)throw db_error("actual observed child reader unavailable");
+                if(sqlite3_set_authorizer(native,
+                    [](void*,int action,const char* operation,const char*,const char*,const char*){
+                        return action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"ROLLBACK")==0?SQLITE_DENY:SQLITE_OK;
+                    },nullptr)!=SQLITE_OK)throw db_error("actual rollback fault registration failed");
+                auto operation=refund_access::catalog_actual_child(cut,R"({"version":1,"tables":["TestPerson"]})",5'000'000'000LL);
+                int actual_tables=0;
+                const auto failed=operation.capture(&actual_tables,
+                    [](void* context,int32_t kind,const uint8_t*,int64_t){
+                        if(kind==0){++*static_cast<int*>(context);return false;}return true;
+                    });
+                ok=ok&&actual_tables==1&&!failed.success()&&failed.cleanup_failed()&&failed.rollback_code()==SQLITE_AUTH;
+                ok=ok&&sqlite3_get_autocommit(native)==0;
+                const auto closed=refund_access::close_actual_child(cut);
+                ok=ok&&bool(closed.error)&&bool(closed.cleanup_error)&&!closed.cleanup_complete;
+                // Restore no Native authority and perform no post-quarantine
+                // rollback/query. The fresh process retains actual debt.
+            }
+            ok=ok&&receipt.status()==refund_status::quarantined&&ordinary_export_slots.load()==baseline+1;
+        }catch(...){ok=false;}
+        ::_exit(ok?0:29);
+    },::testing::ExitedWithCode(0),"");
+}
+#endif
+#ifndef __linux__
+#include <lattice.hpp>
+namespace {
+std::shared_ptr<lattice::swift_lattice> refund_actual_swift_owner(const TempDB& path) {
+    lattice::property_descriptor value;value.name="value";value.type=column_type::text;
+    value.kind=lattice::property_kind::primitive;value.nullable=false;
+    lattice::swift_schema_entry entry;entry.table_name="HistoryRefundItem";entry.properties["value"]=value;
+    lattice::swift_configuration config(path.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    auto owner=lattice::detail::LatticeCache::instance().get_or_create(config,lattice::SchemaVector{entry});
+    lattice::swift_dynamic_object row;row.table_name=entry.table_name;row.properties=entry.properties;
+    row.values["value"]=std::string("actual");lattice::dynamic_object object(row);owner->add(object);
+    return owner;
+}
+}
+TEST(OrdinaryHistoryRefundObservation, CompletedMountedCutDoesNotRefundALiveRegistration) {
+    TempDB path{"history_refund_mount"};auto owner=refund_actual_swift_owner(path);
+    const auto baseline=ordinary_export_slots.load();ordinary_history_refund_observation receipt;
+    {
+        auto mounted=refund_access::register_actual_swift_mount(owner,{"HistoryRefundItem"});
+        receipt=refund_access::observe(mounted);
+        {
+            auto cut=mounted.capture({"HistoryRefundItem"});auto alias=refund_access::observe(cut);
+            EXPECT_TRUE(receipt.same_reservation(alias));EXPECT_EQ(receipt.status(),refund_status::held);
+        }
+        EXPECT_EQ(ordinary_export_slots.load(),baseline+1);EXPECT_EQ(receipt.status(),refund_status::held);
+        {auto successor=mounted.capture({"HistoryRefundItem"});EXPECT_FALSE(successor.page(0).bytes().empty());}
+        EXPECT_EQ(receipt.status(),refund_status::held);
+    }
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);EXPECT_EQ(receipt.status(),refund_status::refunded);
+    EXPECT_TRUE(owner->close_checked().cleanup_complete);
+}
+TEST(OrdinaryHistoryRefundObservation, ActualPageAliasKeepsObservedMountSlotAfterParentClose) {
+    TempDB path{"history_refund_page"};auto owner=refund_actual_swift_owner(path);
+    const auto baseline=ordinary_export_slots.load();ordinary_history_refund_observation receipt;
+    std::optional<ordinary_history_page> page;std::vector<uint8_t> bytes;
+    {
+        auto mounted=refund_access::register_actual_swift_mount(owner,{"HistoryRefundItem"});
+        auto cut=mounted.capture({"HistoryRefundItem"});receipt=refund_access::observe(cut);
+        page.emplace(cut.page(0));const auto actual=page->bytes();bytes.assign(actual.begin(),actual.end());
+        EXPECT_TRUE(owner->close_checked().cleanup_complete);
+    }
+    EXPECT_EQ(ordinary_export_slots.load(),baseline+1);EXPECT_EQ(receipt.status(),refund_status::held);
+    const auto retained=page->bytes();EXPECT_EQ(std::vector<uint8_t>(retained.begin(),retained.end()),bytes);
+    std::thread last([original=std::move(page)]()mutable{original.reset();});last.join();
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);EXPECT_EQ(receipt.status(),refund_status::refunded);
+}
+TEST(OrdinaryHistoryRefundObservation, FailedMountedFactoryPrefixKeepsSameReceiptUntilReaderReturn) {
+    TempDB path{"history_refund_prefix"};auto owner=refund_actual_swift_owner(path);
+    const auto baseline=ordinary_export_slots.load();ordinary_history_refund_observation receipt;
+    std::shared_ptr<database> reader;std::shared_ptr<const database_retirement_state> native;
+    {
+        auto mounted=refund_access::register_actual_swift_mount(owner,{"HistoryRefundItem"});
+        receipt=refund_access::observe(mounted);
+        history_child_hook child([&](lattice_db& original){
+            reader=original.borrow_xproc_read_connection();native=database_retirement_access::retain(*reader);
+            throw db_error("actual observed history child factory failure");
+        });
+        EXPECT_THROW((void)mounted.capture({"HistoryRefundItem"}),db_error);
+    }
+    ASSERT_TRUE(reader);EXPECT_EQ(ordinary_export_slots.load(),baseline+1);
+    EXPECT_EQ(receipt.status(),refund_status::held);
+    std::thread last([original=std::move(reader)]()mutable{original.reset();});last.join();
+    ASSERT_TRUE(native);EXPECT_EQ(native->state(),database_retirement_state::phase::closed);
+    EXPECT_EQ(ordinary_export_slots.load(),baseline);EXPECT_EQ(receipt.status(),refund_status::refunded);
+    EXPECT_TRUE(owner->close_checked().cleanup_complete);
+}
+#endif
 #endif

@@ -3,7 +3,16 @@
 #include <LatticeCore.hpp>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
+
+namespace lattice {
+struct database_query_test_access {
+    static void set(std::function<void(sqlite3_stmt*)> hook) {
+        database::test_hook_query_row_ = std::move(hook);
+    }
+};
+} // namespace lattice
 
 using namespace lattice;
 
@@ -86,6 +95,46 @@ TEST(GroupedCounts, ConflictOnlyRepresentativeIsUnspecifiedWithOrWithoutCovering
         // Both APIs promise one representative, not which physical copy a
         // bare-column GROUP BY picks under a different query plan.
     }
+}
+
+TEST(GroupedCounts, ClosedOwnerOrBorrowRefusesEmptySuccess) {
+    for (bool close_owner : {false, true}) {
+        SCOPED_TRACE(close_owner);
+        lattice_db owner;
+        owner.db().execute("CREATE TABLE GroupedCloseProbe(topic TEXT)");
+        EXPECT_TRUE(owner.grouped_counts("GroupedCloseProbe", "topic").empty());
+        owner.db().execute("INSERT INTO GroupedCloseProbe VALUES('one')");
+        const auto rows = owner.grouped_counts("GroupedCloseProbe", "topic");
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(rows[0].at("cnt")), 1);
+        const auto retained = owner.borrow_read_connection();
+        if (close_owner) owner.close();
+        else retained->close();
+        EXPECT_EQ(owner.is_closed(), close_owner);
+        EXPECT_TRUE(retained->is_closed());
+        EXPECT_THROW(owner.grouped_counts("GroupedCloseProbe", "topic"), db_error);
+    }
+}
+
+TEST(GroupedCounts, ConnectionClosedDuringQueryRefusesCompletedRows) {
+    lattice_db owner;
+    owner.db().execute("CREATE TABLE GroupedCloseProbe(topic TEXT)");
+    owner.db().execute("INSERT INTO GroupedCloseProbe VALUES('one')");
+    const auto retained = owner.borrow_read_connection();
+    int rows_seen = 0;
+    struct ClearRowHook {
+        ~ClearRowHook() { database_query_test_access::set(nullptr); }
+    } clear_hook;
+    database_query_test_access::set([&](sqlite3_stmt*) {
+        ++rows_seen;
+        // Logical close only: the retained borrow keeps the physical handle
+        // alive while the query finishes extracting this row.
+        retained->close();
+    });
+    EXPECT_THROW(owner.grouped_counts("GroupedCloseProbe", "topic"), db_error);
+    EXPECT_EQ(rows_seen, 1);
+    EXPECT_FALSE(owner.is_closed());
+    EXPECT_TRUE(retained->is_closed());
 }
 
 TEST(DatabaseText, BindingPreservesBytesAgainstRawSQLiteOracle) {

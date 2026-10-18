@@ -3238,8 +3238,17 @@ public:
         const std::optional<std::string>& where_clause = std::nullopt,
         const std::optional<std::string>& distinct_by = std::nullopt,
         const std::vector<column_value_t>& params = {}) {
-        return query_read(build_grouped_counts_sql(table_name, group_by,
-                                                   where_clause, distinct_by), params);
+        // Keep the same borrow through the query and both close checks. The
+        // legacy database::query API tolerates logical close by returning no
+        // rows, but this throwing scalar API must not report an empty success.
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed())
+            throw db_error("Grouped count connection is closed");
+        auto rows = connection->query(build_grouped_counts_sql(table_name, group_by,
+                                                               where_clause, distinct_by), params);
+        if (is_closed() || connection->is_closed())
+            throw db_error("Grouped count connection is closed");
+        return rows;
     }
 
     size_t count(const std::string& table_name,

@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.2.1] - 2026-10-18
+
+### Fixed
+- Refuse grouped-count reads when the owning store or its retained read
+  connection closes before or during the query, rather than returning an
+  empty success. Keep the same connection borrow and transaction routing.
+- Preserve the existing tolerant behavior of other query APIs. Persistent
+  schema, sync wire format and public C ABI signatures are unchanged.
+
 ## [2.2.0] - 2026-10-18
 
 ### Added

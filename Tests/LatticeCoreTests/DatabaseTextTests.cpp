@@ -101,9 +101,10 @@ TEST(GroupedCounts, ClosedOwnerOrBorrowRefusesEmptySuccess) {
     for (bool close_owner : {false, true}) {
         SCOPED_TRACE(close_owner);
         lattice_db owner;
-        owner.db().execute("CREATE TABLE GroupedCloseProbe(topic TEXT)");
+        // The real owner's update hook requires model identity columns.
+        owner.db().execute("CREATE TABLE GroupedCloseProbe(id INTEGER PRIMARY KEY,globalId TEXT,topic TEXT)");
         EXPECT_TRUE(owner.grouped_counts("GroupedCloseProbe", "topic").empty());
-        owner.db().execute("INSERT INTO GroupedCloseProbe VALUES('one')");
+        owner.db().execute("INSERT INTO GroupedCloseProbe VALUES(1,'grouped-close-one','one')");
         const auto rows = owner.grouped_counts("GroupedCloseProbe", "topic");
         ASSERT_EQ(rows.size(), 1u);
         EXPECT_EQ(std::get<int64_t>(rows[0].at("cnt")), 1);
@@ -118,8 +119,8 @@ TEST(GroupedCounts, ClosedOwnerOrBorrowRefusesEmptySuccess) {
 
 TEST(GroupedCounts, ConnectionClosedDuringQueryRefusesCompletedRows) {
     lattice_db owner;
-    owner.db().execute("CREATE TABLE GroupedCloseProbe(topic TEXT)");
-    owner.db().execute("INSERT INTO GroupedCloseProbe VALUES('one')");
+    owner.db().execute("CREATE TABLE GroupedCloseProbe(id INTEGER PRIMARY KEY,globalId TEXT,topic TEXT)");
+    owner.db().execute("INSERT INTO GroupedCloseProbe VALUES(1,'grouped-close-one','one')");
     const auto retained = owner.borrow_read_connection();
     int rows_seen = 0;
     struct ClearRowHook {

@@ -159,6 +159,12 @@ struct checkpoint_outcome {
     int64_t checkpointed = -1;   // frames folded back (< log_frames = partial)
 };
 
+/// Scalar group result. No managed object or model payload is hydrated.
+struct grouped_count_entry {
+    std::string key;
+    int64_t count = 0;
+};
+
 /// One audit row's HEADER — the columns that precede `changedFields` in the
 /// row, so reading them never walks the payload's overflow chain. What
 /// `Lattice.changeHeaders` yields per delivered change.
@@ -839,6 +845,34 @@ public:
         }
     }
     
+    std::vector<grouped_count_entry> grouped_counts(
+        const std::string& table_name, const std::string& group_by,
+        OptionalString where_clause = std::nullopt,
+        OptionalString distinct_by = std::nullopt,
+        const ColumnValueVector& params = {}) {
+        last_bridge_error().clear();
+        try {
+            const auto rows = lattice_db::grouped_counts(table_name, group_by,
+                                                        where_clause, distinct_by, params);
+            std::vector<grouped_count_entry> result;
+            result.reserve(rows.size());
+            for (const auto& row : rows) {
+                const auto& key = row.at("key");
+                const auto& count = row.at("cnt");
+                if (!std::holds_alternative<std::string>(key)
+                    || !std::holds_alternative<int64_t>(count)
+                    || std::get<int64_t>(count) < 0) {
+                    throw std::runtime_error("Invalid grouped count row");
+                }
+                result.push_back({std::get<std::string>(key), std::get<int64_t>(count)});
+            }
+            return result;
+        } catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
     // count overloads: never throw into Swift — 0 on failure.
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
@@ -3636,6 +3670,14 @@ public:
         OptionalString distinct_by = std::nullopt,
         const ColumnValueVector& params = {}) const {
         return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
+    }
+
+    std::vector<grouped_count_entry> grouped_counts(
+        const std::string& table_name, const std::string& group_by,
+        OptionalString where_clause = std::nullopt,
+        OptionalString distinct_by = std::nullopt,
+        const ColumnValueVector& params = {}) const {
+        return impl().grouped_counts(table_name, group_by, where_clause, distinct_by, params);
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema

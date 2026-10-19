@@ -2,22 +2,54 @@ name: macOS
 
 on:
   workflow_call:
+    inputs:
+      release_profile:
+        type: string
+        required: false
+        default: 'main'
+      source_sha:
+        type: string
+        required: false
+        default: ''
+      source_tree:
+        type: string
+        required: false
+        default: ''
+      control_sha:
+        type: string
+        required: false
+        default: ''
+      candidate_sha256:
+        type: string
+        required: false
+        default: ''
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
 jobs:
   build-and-test:
     runs-on: macos-26
     env:
-      CORE_SOURCE_SHA: ${{ github.sha }}
+      CORE_SOURCE_SHA: ${{ inputs.release_profile == 'maintenance-1.4' && inputs.source_sha || github.sha }}
       CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      CORE_RELEASE_PROFILE: ${{ inputs.release_profile || 'main' }}
+      CORE_SOURCE_TREE: ${{ inputs.source_tree }}
+      CORE_CONTROL_SHA: ${{ inputs.control_sha || github.sha }}
+      MAINTENANCE_CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
     steps:
       - name: Fetch exact source into owned localdev directory
         shell: bash
         run: |
           set -euo pipefail
+          case "$CORE_RELEASE_PROFILE" in main|maintenance-1.4) ;; *) exit 1 ;; esac
           [[ "$CORE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           CORE_JOB_ROOT="$HOME/localdev/lattice-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
@@ -39,10 +71,128 @@ jobs:
           git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SOURCE_SHA"
           test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SOURCE_SHA"
 
+      - name: Prepare isolated maintenance control and evidence
+        if: ${{ inputs.release_profile == 'maintenance-1.4' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CORE_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MAINTENANCE_CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$CORE_CONTROL_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_REPOSITORY" = jsflax/LatticeCore
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD^{tree})" = "$CORE_SOURCE_TREE"
+          git -C "$CORE_JOB_ROOT/source" remote add origin "https://github.com/$CORE_SOURCE_REPOSITORY.git"
+          git init "$CORE_JOB_ROOT/control"
+          git -C "$CORE_JOB_ROOT/control" remote add origin "https://github.com/$CORE_SOURCE_REPOSITORY.git"
+          git -C "$CORE_JOB_ROOT/control" fetch --depth=1 origin "$CORE_CONTROL_SHA"
+          git -C "$CORE_JOB_ROOT/control" checkout --detach "$CORE_CONTROL_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/control" rev-parse HEAD)" = "$CORE_CONTROL_SHA"
+          mkdir -p "$CORE_JOB_ROOT/maintenance"/{test-logs,commands,scripts,symbols}
+          cat > "$CORE_JOB_ROOT/tmp/maintenance-command.sh" <<'BASH'
+          maintenance_command() {
+            local stage="$1"; shift
+            { printf 'Command:'; printf ' %q' "$@"; printf '\n'; "$@"; } 2>&1 \
+              | tee "$CORE_JOB_ROOT/maintenance/test-logs/$stage.log"
+            python3 - "$CORE_JOB_ROOT/maintenance" "$stage" "$@" <<'PY'
+          import json, pathlib, sys
+          root, stage = pathlib.Path(sys.argv[1]), sys.argv[2]
+          result = {'argv': sys.argv[3:], 'exitCode': 0, 'timedOut': False,
+                    'signal': None, 'log': f'test-logs/{stage}.log'}
+          (root / 'commands' / f'{stage}.json').write_text(json.dumps(result, sort_keys=True) + '\n')
+          PY
+          }
+          BASH
+
+      - name: Download exact maintenance candidate from this run attempt
+        if: ${{ inputs.release_profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: maintenance-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/maintenance/candidate
+
+      - name: Verify maintenance candidate transport and source before native execution
+        if: ${{ inputs.release_profile == 'maintenance-1.4' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$CORE_JOB_ROOT/maintenance/candidate" <<'PY'
+          import hashlib, os, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          if not (sorted(p.name for p in root.iterdir()) == ['candidate.json']): raise SystemExit('maintenance workflow identity check failed')
+          path = root / 'candidate.json'
+          if not (path.is_file() and not path.is_symlink()): raise SystemExit('maintenance workflow identity check failed')
+          if not (hashlib.sha256(path.read_bytes()).hexdigest() == os.environ['MAINTENANCE_CANDIDATE_SHA256']): raise SystemExit('maintenance workflow identity check failed')
+          PY
+          python3 "$CORE_JOB_ROOT/control/release-train/maintenance_release.py" verify-source \
+            --candidate "$CORE_JOB_ROOT/maintenance/candidate/candidate.json" \
+            --control-root "$CORE_JOB_ROOT/control" --product-root "$CORE_JOB_ROOT/source" \
+            --output "$CORE_JOB_ROOT/maintenance/source-verification.json"
+          { swift --version; clang --version; uname -a; } > "$CORE_JOB_ROOT/maintenance/toolchain.txt"
+
       - name: Build and run C++ tests
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
+          if [ "$CORE_RELEASE_PROFILE" = maintenance-1.4 ]; then
+            bash -euo pipefail <<'MAINTENANCE'
+            source "$CORE_JOB_ROOT/tmp/maintenance-command.sh"
+            cat > "$CORE_JOB_ROOT/maintenance/scripts/core.sh" <<'STAGE'
+          set -euo pipefail
+          swift run --package-path "$CORE_JOB_ROOT/source" \
+            --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
+            --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
+            LatticeCoreTests --gtest_list_tests > "$CORE_JOB_ROOT/maintenance/test-logs/core.discovery.txt"
+          export GTEST_OUTPUT="xml:$CORE_JOB_ROOT/maintenance/test-logs/core.xml"
           swift run --package-path "$CORE_JOB_ROOT/source" \
             --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
             --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
             LatticeCoreTests
+          STAGE
+            maintenance_command core bash "$CORE_JOB_ROOT/maintenance/scripts/core.sh"
+          MAINTENANCE
+          else
+            swift run --package-path "$CORE_JOB_ROOT/source" \
+              --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
+              --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
+              LatticeCoreTests
+          fi
+
+      - name: Emit maintenance source-bound gate receipt
+        if: ${{ inputs.release_profile == 'maintenance-1.4' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$CORE_JOB_ROOT/maintenance" <<'PY'
+          import json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          stages = ['core']
+          manifest = {
+              'schemaVersion': 1, 'gate': 'core-macos',
+              'suites': {'core': {'xml': 'test-logs/core.xml', 'discovery': 'test-logs/core.discovery.txt'}},
+              'commands': {s: json.loads((root / 'commands' / f'{s}.json').read_text()) for s in stages},
+              'artifacts': {'toolchain': 'toolchain.txt', **{f'{s}-script': f'scripts/{s}.sh' for s in stages}},
+          }
+          (root / 'gate-manifest.json').write_text(json.dumps(manifest, sort_keys=True) + '\n')
+          PY
+          python3 "$CORE_JOB_ROOT/control/release-train/maintenance_release.py" gate-receipt \
+            --candidate "$CORE_JOB_ROOT/maintenance/candidate/candidate.json" --gate core-macos \
+            --product-root "$CORE_JOB_ROOT/source" --artifact-root "$CORE_JOB_ROOT/maintenance" \
+            --gate-manifest "$CORE_JOB_ROOT/maintenance/gate-manifest.json" \
+            --output "$CORE_JOB_ROOT/maintenance/receipt.json"
+
+      - name: Retain maintenance gate evidence
+        if: ${{ inputs.release_profile == 'maintenance-1.4' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maintenance-core-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CORE_JOB_ROOT }}/maintenance/receipt.json
+            ${{ env.CORE_JOB_ROOT }}/maintenance/test-logs
+            ${{ env.CORE_JOB_ROOT }}/maintenance/scripts
+            ${{ env.CORE_JOB_ROOT }}/maintenance/symbols
+            ${{ env.CORE_JOB_ROOT }}/maintenance/toolchain.txt
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "source": {"sha": null, "tree": null},
+  "gates": {
+    "core-linux": {"platform": "Linux", "suites": {"core": null}},
+    "core-macos": {"platform": "macOS", "suites": {"core": null}},
+    "capi-linux": {"platform": "Linux", "suites": {"swiftpm": null, "cmake": null}, "symbols": null},
+    "capi-macos": {"platform": "macOS", "suites": {"swiftpm": null, "cmake": null}, "symbols": null}
+  },
+  "highFd": {
+    "attestationSHA256": null, "owner": null, "review": null,
+    "runId": null, "runAttempt": null, "artifactId": null, "artifactName": null,
+    "archiveSHA256": null, "attestationPath": null, "shutdownLimitMilliseconds": null
+  }
+}

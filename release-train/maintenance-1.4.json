@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "profile": "maintenance-1.4",
+  "enabled": false,
+  "repository": "jsflax/LatticeCore",
+  "controlBranch": "main",
+  "sourceBranch": "codex/linux-notifier-1-4-backport-20260929",
+  "version": "1.4.3",
+  "base": {
+    "tag": "1.4.2",
+    "sha": "36b828864cbb1543e945898be31589f9c04d6384",
+    "tree": "d7b353a9bb7067ea0250f5e86484ce4406fd6a88"
+  },
+  "reviewedBackport": {
+    "sha": "bcf43a8cc789d5330a103fcf1e97ebdfbf7e2b84",
+    "tree": "915ca2e5f4a4b8f4bd6429f2dcb65feec9c43538"
+  },
+  "registration": null,
+  "controlRegistration": null
+}

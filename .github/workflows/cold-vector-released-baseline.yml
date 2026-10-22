@@ -1,0 +1,151 @@
+name: Released cold vector baseline
+
+on:
+  push:
+    branches: [codex/cold-vector-baseline-20261022]
+
+permissions:
+  contents: read
+
+jobs:
+  released-baseline:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Fetch exact tests-only released source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = jsflax/LatticeCore
+          ACTUAL_HOME="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.geteuid()).pw_dir)')"
+          BASELINE_JOB_ROOT="$ACTUAL_HOME/localdev/cold-vector-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$BASELINE_JOB_ROOT"
+          mkdir -p "$BASELINE_JOB_ROOT"/{tmp,build,cache,config,security,modules,evidence}
+          {
+            echo "BASELINE_JOB_ROOT=$BASELINE_JOB_ROOT"
+            echo "TMPDIR=$BASELINE_JOB_ROOT/tmp"
+            echo "TMP=$BASELINE_JOB_ROOT/tmp"
+            echo "TEMP=$BASELINE_JOB_ROOT/tmp"
+            echo "CLANG_MODULE_CACHE_PATH=$BASELINE_JOB_ROOT/modules"
+            echo "SWIFT_MODULECACHE_PATH=$BASELINE_JOB_ROOT/modules"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$BASELINE_JOB_ROOT/modules"
+            echo "LATTICE_TEST_LOG_PATH=$BASELINE_JOB_ROOT/evidence/native.log"
+          } >> "$GITHUB_ENV"
+          git init "$BASELINE_JOB_ROOT/source"
+          git -C "$BASELINE_JOB_ROOT/source" fetch --depth=1 https://github.com/jsflax/LatticeCore.git "$GITHUB_SHA"
+          git -C "$BASELINE_JOB_ROOT/source" checkout --detach "$GITHUB_SHA"
+          git -C "$BASELINE_JOB_ROOT/source" fetch --depth=1 https://github.com/jsflax/LatticeCore.git 829ee40e0dc04a00ca42182d382bb0074caa05b0
+          test "$(git -C "$BASELINE_JOB_ROOT/source" rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Observe exact released negative population
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,re,resource,shutil,signal,stat,subprocess,time
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root=Path(os.environ['BASELINE_JOB_ROOT']);source=root/'source';out=root/'evidence'
+          base='829ee40e0dc04a00ca42182d382bb0074caa05b0'
+          tests={
+            'Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp':'d96e8966c7db1d545cae364c7ca2965a670acd03cda4254c083cbed56702c9f3',
+            'Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp':'fa3164cc39289c716323d0991b8d6a8c5aa2c17ac3bd19ee76f760df8eb6b08c'}
+          workflow='.github/workflows/cold-vector-released-baseline.yml'
+          def git(*args):return subprocess.check_output(['git',*args],cwd=source)
+          changed=set(git('diff','--name-only',base,'HEAD').decode().splitlines())
+          assert changed==set(tests)|{workflow},changed
+          for name,sha in tests.items():
+            data=(source/name).read_bytes()
+            assert hashlib.sha256(data).hexdigest()==sha
+            assert data.startswith(git('show',base+':'+name))
+          def census():
+            rows=[]
+            for raw in git('ls-files','-s','-z').split(b'\0'):
+              if not raw:continue
+              header,name=raw.split(b'\t',1);name=name.decode();mode,blob,stage=header.decode().split()
+              assert stage=='0' and mode in ('100644','100755')
+              p=source/name;s=p.lstat();assert stat.S_ISREG(s.st_mode)
+              assert stat.S_IMODE(s.st_mode)==(0o755 if mode=='100755' else 0o644)
+              rows.append({'path':name,'mode':mode,'physicalMode':oct(stat.S_IMODE(s.st_mode)),
+                           'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+            return rows
+          before=census();(out/'source-before.json').write_text(json.dumps(before,indent=2)+'\n')
+          names=['ColdCombinedVectorInitialization.FirstFullCosineQueryFillsSyncShapedRowsWithoutReopen',
+                 'ColdCombinedVectorInitialization.FirstCountRepairsExistingPreProtocolEmptyIndex']
+          def expected_failures(name,case):
+            failures=case.findall('failure')
+            wanted=[301] if name==names[0] else [324,86] if name==names[1] else []
+            if not wanted or len(failures)!=len(wanted):return False
+            for failure,line in zip(failures,wanted):
+              message=failure.attrib.get('message','')
+              if not re.search(r'SyncOnlyVecReconcileTests\.cpp:'+str(line)+r'\b',message):return False
+              pattern=(r'Expected equality of these values:\s+rows\.size\(\)\s+Which is:\s+0\s+1u\b' if line==301 else
+                       r'Expected equality of these values:\s+count\s+Which is:\s+0\s+1\b' if line==324 else
+                       r'index_ids\s+Which is:\s+\{\s*\}\s+model_ids\s+Which is:\s+\{\s*"[^"]+"\s*\}')
+              if not re.search(pattern,message):return False
+            return not case.findall('error') and not case.findall('skipped')
+          command=['swift','run','--package-path',str(source),'--scratch-path',str(root/'build'),
+                   '--cache-path',str(root/'cache'),'--config-path',str(root/'config'),
+                   '--security-path',str(root/'security'),'LatticeCoreTests',
+                   '--gtest_filter='+':'.join(names),'--gtest_output=xml:'+str(out/'baseline.xml'),'--gtest_color=no']
+          environment={k:v for k,v in os.environ.items() if not k.startswith('GTEST_')}
+          resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+          started=time.monotonic();free_before=shutil.disk_usage(root).free
+          if free_before<4*1024**3:raise RuntimeError('insufficient baseline admission disk')
+          record={'scope':'two exact released-vector negative diagnostics, not full suite or release acceptance',
+                  'base':base,'head':git('rev-parse','HEAD').decode().strip(),
+                  'tree':git('rev-parse','HEAD^{tree}').decode().strip(),'command':command,
+                  'names':names,'signals':[],'stopReason':None,'globalDescendantEndingClaimed':False}
+          (out/'INPUT.json').write_text(json.dumps(record,indent=2)+'\n')
+          with (out/'baseline.stdout').open('wb') as stdout,(out/'baseline.stderr').open('wb') as stderr:
+            proc=subprocess.Popen(command,cwd=source,env=environment,stdout=stdout,stderr=stderr,start_new_session=True)
+            pgid=os.getpgid(proc.pid);record.update(pid=proc.pid,pgid=pgid,sid=os.getsid(proc.pid))
+            while proc.poll() is None:
+              elapsed=time.monotonic()-started;free=shutil.disk_usage(root).free
+              logs=sum((out/n).stat().st_size for n in ('baseline.stdout','baseline.stderr'))
+              reason=('2400 second cap' if elapsed>2400 else '2 GiB disk floor' if free<2*1024**3
+                      else '8 GiB observed disk growth' if free_before-free>8*1024**3
+                      else '1 GiB log cap' if logs>1024**3 else None)
+              if reason:
+                record['stopReason']=reason
+                # Signal only the still-unreaped original process group.
+                for sig,wait in ((signal.SIGTERM,10),(signal.SIGKILL,10)):
+                  if proc.poll() is not None:break
+                  try:os.killpg(pgid,sig);record['signals'].append(int(sig))
+                  except ProcessLookupError:pass
+                  try:proc.wait(timeout=wait)
+                  except subprocess.TimeoutExpired:continue
+                break
+              time.sleep(0.5)
+            code=proc.poll();record['exitCode']=code
+          try:os.killpg(pgid,0);group_gone=False
+          except ProcessLookupError:group_gone=True
+          record['knownOriginalEnding']=code is not None and group_gone
+          record['elapsedSeconds']=time.monotonic()-started
+          record['negativePopulationObserved']=False
+          if record['knownOriginalEnding']:
+            after=census();record['completeTrackedSourceUnchanged']=after==before
+            (out/'source-after.json').write_text(json.dumps(after,indent=2)+'\n')
+            xml=out/'baseline.xml'
+            if xml.exists() and 0<xml.stat().st_size<8*1024**2:
+              cases=list(ET.parse(xml).getroot().iter('testcase'))
+              actual=[c.attrib.get('classname','')+'.'+c.attrib.get('name','') for c in cases]
+              record['cases']=[{'name':n,'failures':[{'message':f.attrib.get('message'),'text':f.text} for f in c.findall('failure')],
+                                'errors':len(c.findall('error')),'skips':len(c.findall('skipped'))}
+                               for n,c in zip(actual,cases)]
+              record['negativePopulationObserved']=(code==1 and not record['stopReason'] and after==before
+                and len(cases)==2 and set(actual)==set(names)
+                and all(expected_failures(n,c) for n,c in zip(actual,cases)))
+          (out/'RESULT.json').write_text(json.dumps(record,indent=2)+'\n')
+          print(json.dumps(record,indent=2))
+          if not record['negativePopulationObserved']:raise SystemExit(1)
+          PY
+
+      - name: Retain original negative evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-vector-released-baseline-${{ github.run_attempt }}
+          path: ${{ env.BASELINE_JOB_ROOT }}/evidence
+          include-hidden-files: true
+          if-no-files-found: error

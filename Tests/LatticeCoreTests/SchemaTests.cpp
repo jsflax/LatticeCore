@@ -573,3 +573,248 @@ TEST(Schema, CoreUniquePassDeduplicatesPreexistingRowsKeepingNewest) {
         "WHERE type='index' AND name='unique_CoreUniqueGadget_0'");
     EXPECT_EQ(idx.size(), 1u);
 }
+
+namespace {
+
+struct UnionMigrationDB : lattice::lattice_db {
+    using lattice::lattice_db::lattice_db;
+    using lattice::lattice_db::create_model_table_public;
+};
+
+lattice::union_descriptor migration_union(const std::string& table, bool expanded) {
+    lattice::union_descriptor descriptor;
+    descriptor.union_table_name = table;
+    descriptor.cases.push_back({"text", {{"", lattice::column_type::text}}});
+    if (expanded) descriptor.cases.push_back({"amount", {{"", lattice::column_type::integer}}});
+    return descriptor;
+}
+
+void migration_parent(UnionMigrationDB& db, const std::string& table,
+                      std::initializer_list<const char*> fields) {
+    lattice::model_schema schema;
+    schema.table_name = table;
+    for (const auto* name : fields) {
+        lattice::property_descriptor field;
+        field.name = name;
+        field.type = lattice::column_type::text;
+        field.nullable = true;
+        schema.properties.push_back(field);
+    }
+    db.create_model_table_public(schema);
+}
+
+void seed_union_migration(UnionMigrationDB& db) {
+    // Apple SQLite may default to legacy rename semantics. Exercise the modern
+    // reference-rewriting path used by Linux explicitly on every connection.
+    db.db().execute("PRAGMA legacy_alter_table=OFF");
+    migration_parent(db, "MigrationOwner", {"first", "second"});
+    migration_parent(db, "MigrationSharedOwner", {"item"});
+    migration_parent(db, "MigrationLateOwner", {"item"});
+    db.ensure_union_table("_MigrationChoiceA", migration_union("_MigrationChoiceA", false), "MigrationOwner", "first");
+    db.create_union_cascade_trigger("MigrationOwner", "first", "_MigrationChoiceA");
+    db.ensure_union_table("_MigrationChoiceA", migration_union("_MigrationChoiceA", false), "MigrationSharedOwner", "item");
+    db.create_union_cascade_trigger("MigrationSharedOwner", "item", "_MigrationChoiceA");
+    db.ensure_union_table("_MigrationChoiceB", migration_union("_MigrationChoiceB", false), "MigrationOwner", "second");
+    db.create_union_cascade_trigger("MigrationOwner", "second", "_MigrationChoiceB");
+    db.db().execute("INSERT INTO _MigrationChoiceA(id,globalId,\"case\",text) VALUES "
+                    "(41,'choice-a-1','text','first'),(42,'choice-a-2','text','shared')");
+    db.db().execute("INSERT INTO _MigrationChoiceB(id,globalId,\"case\",text) VALUES "
+                    "(61,'choice-b-1','text','second')");
+    db.db().execute("INSERT INTO MigrationOwner(id,globalId,first,second) "
+                    "VALUES(11,'owner-1','choice-a-1','choice-b-1')");
+    db.db().execute("INSERT INTO MigrationSharedOwner(id,globalId,item) "
+                    "VALUES(12,'owner-2','choice-a-2')");
+    db.db().execute("INSERT INTO _lattice_sync_state(audit_entry_id,sync_id,is_synchronized) "
+                    "SELECT id,'migration-channel',1 FROM AuditLog");
+    db.db().execute("INSERT INTO _lattice_replication_slots(sync_id,confirmed_audit_id,last_active_at,upload_floor) "
+                    "SELECT 'migration-channel',MAX(id),'2026-10-22T00:00:00Z',MAX(id) FROM AuditLog");
+    db.db().execute("INSERT INTO _lattice_sync_set(sync_id,table_name,global_row_id) "
+                    "VALUES('migration-channel','_MigrationChoiceA','choice-a-1')");
+    db.db().execute("CREATE TABLE MigrationProbe(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "globalId TEXT UNIQUE DEFAULT (lower(hex(randomblob(16)))),kind TEXT)");
+    // One external reference and one trigger attached to the rebuilt union.
+    // Neither is generated/known to Lattice; spaces require quoted DROP names.
+    db.db().execute(R"(CREATE TRIGGER "custom union reference" AFTER UPDATE OF first ON MigrationOwner
+        BEGIN INSERT INTO MigrationProbe(kind) SELECT 'parent'
+        WHERE EXISTS(SELECT 1 FROM _MigrationChoiceA WHERE globalId=NEW.first); END)");
+    db.db().execute(R"(CREATE TRIGGER "custom union insert" AFTER INSERT ON _MigrationChoiceA
+        BEGIN INSERT INTO MigrationProbe(kind) VALUES('insert'); END)");
+    // A similar-looking name is not a license to erase an unknown trigger.
+    db.db().execute(R"(CREATE TRIGGER _cascade_delete_custom_union AFTER DELETE ON MigrationOwner
+        BEGIN INSERT INTO MigrationProbe(kind) VALUES('custom'); END)");
+}
+
+using MigrationRows = std::map<std::string, std::vector<lattice::database::row_t>>;
+
+MigrationRows union_migration_rows(lattice::database& db) {
+    MigrationRows rows;
+    const std::pair<const char*, const char*> queries[] = {
+        {"owner", "SELECT id,globalId,first,second FROM MigrationOwner ORDER BY id"},
+        {"shared", "SELECT id,globalId,item FROM MigrationSharedOwner ORDER BY id"},
+        {"late", "SELECT id,globalId,item FROM MigrationLateOwner ORDER BY id"},
+        {"first", "SELECT id,globalId,\"case\",text FROM _MigrationChoiceA ORDER BY id"},
+        {"second", "SELECT id,globalId,\"case\",text FROM _MigrationChoiceB ORDER BY id"},
+        {"probe", "SELECT * FROM MigrationProbe ORDER BY id"},
+        {"audit", "SELECT * FROM AuditLog ORDER BY id"},
+        {"sync", "SELECT * FROM _lattice_sync_state ORDER BY audit_entry_id,sync_id"},
+        {"slots", "SELECT * FROM _lattice_replication_slots ORDER BY sync_id"},
+        {"set", "SELECT * FROM _lattice_sync_set ORDER BY sync_id,table_name,global_row_id"},
+        {"meta", "SELECT * FROM _lattice_meta ORDER BY key"}
+    };
+    for (const auto& [name, sql] : queries) rows.emplace(name, db.query(sql));
+    return rows;
+}
+
+auto union_migration_schema(lattice::database& db) {
+    return db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name");
+}
+
+auto union_migration_cascades_and_custom(lattice::database& db) {
+    return db.query("SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' "
+                    "AND (name LIKE '_cascade_delete_%' OR name LIKE 'custom union %') ORDER BY name");
+}
+
+void expand_migration_unions(lattice::lattice_db& db) {
+    db.ensure_union_table("_MigrationChoiceA", migration_union("_MigrationChoiceA", true), "MigrationOwner", "first");
+    // On SQLite with modern ALTER TABLE semantics, this second rename used to
+    // fail because the first union's parent cascades still referenced _old.
+    db.ensure_union_table("_MigrationChoiceB", migration_union("_MigrationChoiceB", true), "MigrationOwner", "second");
+}
+
+struct UnionMigrationIndexDenial {
+    sqlite3* connection;
+    bool fired = false;
+    static int authorize(void* context, int action, const char* name,
+                         const char*, const char*, const char*) {
+        auto& self = *static_cast<UnionMigrationIndexDenial*>(context);
+        if (action == SQLITE_CREATE_INDEX && name && std::strcmp(name, "idx__MigrationChoiceA_case") == 0) {
+            self.fired = true;
+            return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+    ~UnionMigrationIndexDenial() { sqlite3_set_authorizer(connection, nullptr, nullptr); }
+};
+
+} // namespace
+
+TEST(Schema, UnionMigrationRestoresEveryParentAndCustomTrigger) {
+    TempDB tmp{"union_cascades"};
+    {
+        UnionMigrationDB old(tmp.str());
+        ASSERT_NO_THROW(seed_union_migration(old));
+    }
+    lattice::lattice_db db(tmp.str());
+    db.db().execute("PRAGMA legacy_alter_table=OFF");
+    const auto rows = union_migration_rows(db.db());
+    const auto triggers = union_migration_cascades_and_custom(db.db());
+    ASSERT_NO_THROW(expand_migration_unions(db));
+    EXPECT_EQ(union_migration_rows(db.db()), rows) << "schema copies must preserve IDs, audit and sync state";
+    EXPECT_EQ(union_migration_cascades_and_custom(db.db()), triggers);
+    EXPECT_FALSE(db.db().table_exists("_MigrationChoiceA_old"));
+    EXPECT_FALSE(db.db().table_exists("_MigrationChoiceB_old"));
+    EXPECT_TRUE(db.db().get_table_info("_MigrationChoiceA").contains("amount"));
+    EXPECT_TRUE(db.db().get_table_info("_MigrationChoiceB").contains("amount"));
+
+    // Restored custom triggers remain functional, and were NOT fired by copy.
+    ASSERT_NO_THROW(db.db().execute("UPDATE MigrationOwner SET first=first WHERE id=11"));
+    ASSERT_NO_THROW(db.db().execute("INSERT INTO _MigrationChoiceA(globalId,\"case\",amount) "
+                                    "VALUES('new-choice','amount',9)"));
+    const auto probes = db.db().query("SELECT kind FROM MigrationProbe ORDER BY id");
+    ASSERT_EQ(probes.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(probes[0].at("kind")), "parent");
+    EXPECT_EQ(std::get<std::string>(probes[1].at("kind")), "insert");
+
+    ASSERT_NO_THROW(db.db().execute("DELETE FROM MigrationOwner WHERE id=11"));
+    EXPECT_TRUE(db.db().query("SELECT id FROM _MigrationChoiceA WHERE globalId='choice-a-1'").empty());
+    EXPECT_TRUE(db.db().query("SELECT id FROM _MigrationChoiceB WHERE globalId='choice-b-1'").empty());
+    EXPECT_EQ(db.db().query("SELECT id FROM _MigrationChoiceA WHERE globalId='choice-a-2'").size(), 1u);
+    ASSERT_NO_THROW(db.db().execute("DELETE FROM MigrationSharedOwner WHERE id=12"));
+    EXPECT_TRUE(db.db().query("SELECT id FROM _MigrationChoiceA WHERE globalId='choice-a-2'").empty());
+    EXPECT_EQ(db.db().query("SELECT kind FROM MigrationProbe WHERE kind='custom'").size(), 1u);
+}
+
+TEST(Schema, UnionMigrationFailureRollsBackMetadataAndDDLThenRetries) {
+    for (const bool outer_transaction : {false, true}) {
+        SCOPED_TRACE(outer_transaction ? "caller transaction" : "direct Core call");
+        TempDB tmp{"union_rollback"};
+        UnionMigrationDB db(tmp.str());
+        ASSERT_NO_THROW(seed_union_migration(db));
+        const auto initial_rows = union_migration_rows(db.db());
+        const auto initial_schema = union_migration_schema(db.db());
+        if (outer_transaction) {
+            db.begin_transaction();
+            db.db().execute("INSERT INTO MigrationProbe(kind) VALUES('caller-owned')");
+        }
+        const auto rows = union_migration_rows(db.db());
+        const auto schema = union_migration_schema(db.db());
+        {
+            // Deny the index recreation AFTER data copy, trigger restoration
+            // and DROP _old. Also register a previously unseen parent: rollback
+            // must undo metadata as well as the complete schema/data rebuild.
+            UnionMigrationIndexDenial denial{db.db().handle()};
+            ASSERT_EQ(sqlite3_set_authorizer(denial.connection, UnionMigrationIndexDenial::authorize, &denial), SQLITE_OK);
+            EXPECT_THROW(db.ensure_union_table("_MigrationChoiceA", migration_union("_MigrationChoiceA", true),
+                                               "MigrationLateOwner", "item"), lattice::db_error);
+            EXPECT_TRUE(denial.fired);
+        }
+        EXPECT_EQ(db.db().is_in_transaction(), outer_transaction);
+        EXPECT_EQ(union_migration_rows(db.db()), rows);
+        EXPECT_EQ(union_migration_schema(db.db()), schema);
+        ASSERT_NO_THROW(expand_migration_unions(db));
+        EXPECT_EQ(db.db().is_in_transaction(), outer_transaction);
+        if (outer_transaction) {
+            // Releasing the migration savepoint must not commit the caller's
+            // unrelated work, nor prevent rolling back the successful retry.
+            db.rollback();
+            EXPECT_EQ(union_migration_rows(db.db()), initial_rows);
+            EXPECT_EQ(union_migration_schema(db.db()), initial_schema);
+            ASSERT_NO_THROW(expand_migration_unions(db));
+        }
+        EXPECT_FALSE(db.db().is_in_transaction());
+        EXPECT_EQ(union_migration_rows(db.db()), initial_rows);
+        EXPECT_FALSE(db.db().table_exists("_MigrationChoiceA_old"));
+        EXPECT_FALSE(db.db().table_exists("_MigrationChoiceB_old"));
+    }
+}
+
+TEST(Schema, UnionMigrationRefusesRewrittenViewOrForeignKeyWithoutDataLoss) {
+    for (const bool foreign_key : {false, true}) {
+        SCOPED_TRACE(foreign_key ? "foreign key with delete cascade" : "view");
+        TempDB tmp{"union_dependency"};
+        UnionMigrationDB db(tmp.str());
+        ASSERT_NO_THROW(seed_union_migration(db));
+        ASSERT_EQ(std::get<int64_t>(db.db().query("PRAGMA foreign_keys")[0].at("foreign_keys")), 1);
+        if (foreign_key) {
+            db.db().execute("CREATE TABLE MigrationDependency(id INTEGER PRIMARY KEY, "
+                            "globalId TEXT UNIQUE DEFAULT (lower(hex(randomblob(16)))), "
+                            "ref TEXT REFERENCES _MigrationChoiceA(globalId) ON DELETE CASCADE)");
+            db.db().execute("INSERT INTO MigrationDependency(id,ref) VALUES(7,'choice-a-1')");
+        } else {
+            db.db().execute("CREATE VIEW MigrationDependency AS SELECT id,globalId FROM _MigrationChoiceA");
+        }
+        const auto dependency_rows = db.db().query("SELECT * FROM MigrationDependency ORDER BY id");
+        const auto rows = union_migration_rows(db.db());
+        const auto schema = union_migration_schema(db.db());
+        std::string migration_error;
+        try {
+            db.ensure_union_table("_MigrationChoiceA", migration_union("_MigrationChoiceA", true),
+                                  "MigrationLateOwner", "item");
+        } catch (const lattice::db_error& error) {
+            migration_error = error.what();
+        }
+        EXPECT_NE(migration_error.find("external table or view"), std::string::npos);
+        EXPECT_FALSE(db.db().is_in_transaction());
+        EXPECT_EQ(union_migration_schema(db.db()), schema);
+        EXPECT_EQ(union_migration_rows(db.db()), rows);
+        EXPECT_EQ(db.db().query("SELECT * FROM MigrationDependency ORDER BY id"), dependency_rows)
+            << "DROP of the renamed union must never reach foreign-key cascade actions";
+        EXPECT_FALSE(db.db().table_exists("_MigrationChoiceA_old"));
+
+        // The refusal leaves a valid, retryable store. Removing the unsupported
+        // dependency is an explicit caller choice, never migration cleanup.
+        db.db().execute(std::string("DROP ") + (foreign_key ? "TABLE " : "VIEW ") + "MigrationDependency");
+        ASSERT_NO_THROW(expand_migration_unions(db));
+        EXPECT_EQ(union_migration_rows(db.db()), rows);
+    }
+}

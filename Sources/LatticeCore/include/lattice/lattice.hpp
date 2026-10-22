@@ -4649,10 +4649,33 @@ public:
                             const union_descriptor& desc,
                             const std::string& parent_table,
                             const std::string& property_name) {
+        store_write_gate_hold gate(*this);
+        // The Swift schema pass already owns a transaction; direct Core callers
+        // may not. A savepoint makes either path atomic without committing the
+        // caller's work, including the parent registration and trigger repair.
+        db_->execute("SAVEPOINT _lattice_union_schema");
+        try {
+            ensure_union_table_in_transaction(union_table_name, desc, parent_table, property_name);
+            db_->execute("RELEASE _lattice_union_schema");
+        } catch (...) {
+            try {
+                db_->execute("ROLLBACK TO _lattice_union_schema");
+                db_->execute("RELEASE _lattice_union_schema");
+            } catch (...) {}
+            throw;
+        }
+    }
+
+private:
+    void ensure_union_table_in_transaction(const std::string& union_table_name,
+                                           const union_descriptor& desc,
+                                           const std::string& parent_table,
+                                           const std::string& property_name) {
         register_union_internal_table(union_table_name, parent_table, property_name);
 
         // Check if table exists and needs migration (new cases added)
         std::vector<std::string> old_col_names;
+        std::vector<database::row_t> original_triggers;
         if (db_->table_exists(union_table_name)) {
             auto existing_cols = db_->get_table_info(union_table_name);
             bool needs_rebuild = false;
@@ -4674,10 +4697,34 @@ public:
             // Collect old column names for data copy
             for (const auto& [col, _] : existing_cols) old_col_names.push_back(col);
 
+            // SQLite rewrites references in OTHER tables' triggers on rename,
+            // including every parent's union-delete cascade. Keep exact SQL;
+            // name-prefix matching would miss shared parents and erase custom
+            // triggers. query() materializes/finalizes before any DDL below.
+            original_triggers = db_->query(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'");
+            const auto external_schema = db_->query(
+                "SELECT type,name,sql FROM sqlite_master "
+                "WHERE type IN ('table','view') AND name != ? ORDER BY type,name",
+                {union_table_name});
+
             // Drop old triggers + rename
             drop_model_table_triggers(union_table_name);
             db_->execute("DROP INDEX IF EXISTS idx_" + union_table_name + "_case");
             db_->execute("ALTER TABLE " + union_table_name + " RENAME TO " + union_table_name + "_old");
+
+            // Rename also rewrites views and foreign-key clauses. Rebuilding
+            // arbitrary dependent tables is outside this union migration's
+            // contract; DROP _old could even cascade-delete their rows. Refuse
+            // before copying/dropping and let the savepoint restore all DDL.
+            const auto renamed_external_schema = db_->query(
+                "SELECT type,name,sql FROM sqlite_master "
+                "WHERE type IN ('table','view') AND name != ? ORDER BY type,name",
+                {union_table_name + "_old"});
+            if (external_schema != renamed_external_schema) {
+                throw db_error("Cannot migrate union table " + union_table_name +
+                               ": rename rewrites an external table or view dependency");
+            }
         }
 
         // Build column info from descriptor
@@ -4759,6 +4806,30 @@ public:
             }
             db_->execute("INSERT INTO " + union_table_name + " (" + common_cols + ") "
                         "SELECT " + common_cols + " FROM " + union_table_name + "_old");
+
+            // Restore only definitions changed by SQLite's rename, while BOTH
+            // table names still exist. Otherwise dropping _old leaves dangling
+            // cascades and the next union rename fails schema validation. This
+            // also moves custom triggers attached to _old back to the live
+            // table, AFTER the copy so they do not fire for migration rows.
+            std::unordered_map<std::string, std::string> renamed_triggers;
+            for (const auto& trigger : db_->query(
+                    "SELECT name, sql FROM sqlite_master WHERE type='trigger'")) {
+                renamed_triggers.emplace(std::get<std::string>(trigger.at("name")),
+                                         std::get<std::string>(trigger.at("sql")));
+            }
+            for (const auto& trigger : original_triggers) {
+                const auto& name = std::get<std::string>(trigger.at("name"));
+                // Owned audit triggers are recreated with the NEW columns below.
+                if (name == "AuditLog_Update_" + union_table_name ||
+                    name == "Audit" + union_table_name + "Insert" ||
+                    name == "Audit" + union_table_name + "Delete") continue;
+                const auto& original_sql = std::get<std::string>(trigger.at("sql"));
+                const auto current = renamed_triggers.find(name);
+                if (current != renamed_triggers.end() && current->second == original_sql) continue;
+                db_->execute("DROP TRIGGER IF EXISTS " + history_quote_identifier_(name));
+                db_->execute(original_sql);
+            }
             db_->execute("DROP TABLE " + union_table_name + "_old");
         }
 
@@ -4767,6 +4838,7 @@ public:
         create_model_table_triggers(union_table_name, columns);
     }
 
+public:
     // Register a union table as internal, supporting multiple parents.
     // Format: "Feed:item" or "Feed:item;Post:featured" for multi-parent.
     void register_union_internal_table(const std::string& table_name,

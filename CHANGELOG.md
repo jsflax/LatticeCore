@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.2.3] - 2026-10-22
+
+### Fixed
+- Preserve every parent cascade and custom trigger when expanding a union
+  table. Restore definitions rewritten by SQLite before removing the old
+  table, without firing custom triggers for copied rows.
+- Make union-table preparation atomic for direct Core calls and callers with
+  an existing transaction. Failed upgrades retain the prior schema, data,
+  parent registrations, audit history and replication state for retry.
+- Refuse and roll back a union rebuild when SQLite rewrites an external table
+  or view definition, preserving unsupported foreign-key and view dependencies
+  instead of leaving dangling references or cascading data loss.
+
+### Compatibility
+- No persistent schema, sync wire format or public API signature changes.
+  Rebuild Core and generated C++/Swift bridge consumers together.
+
 ## [2.2.2] - 2026-10-22
 
 ### Fixed

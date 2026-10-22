@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.2.4] - 2026-10-22
+
+### Fixed
+- Initialize vector indexes with their triggers and existing model rows in one
+  transaction, so the first nearest query after cold IPC delivery can find the
+  delivered vectors. Repair missing IDs in older empty or partial indexes.
+- Preserve caller transactions and roll back failed initialization for retry.
+  Propagate initialization errors through both combined query shapes, and refuse
+  reuse when cleanup cannot establish a known ending.
+- Keep completed initialization checks independent of model row count. Multiple
+  vector indexes settle without repeatedly rebuilding one another's triggers.
+- Preserve existing explicit rebuild, vacuum and reconciliation behavior.
+
+### Compatibility
+- No sync wire format or public API signature changes. Initialization records
+  use the existing metadata table. Rebuild Core and generated C++/Swift bridge
+  consumers together.
+
 ## [2.2.3] - 2026-10-22
 
 ### Fixed

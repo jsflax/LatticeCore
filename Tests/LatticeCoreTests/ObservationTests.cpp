@@ -171,14 +171,24 @@ TEST(Observe, StdThreadScheduler) {
     std::mutex m;
 
     sched->invoke([&] {
-        count++;
-        on_thread = sched->is_on_thread();
+        {
+            std::lock_guard<std::mutex> lock(m);
+            count++;
+            on_thread = sched->is_on_thread();
+        }
         cv.notify_one();
     });
 
-    std::unique_lock<std::mutex> lock(m);
-    cv.wait_for(lock, std::chrono::seconds(1), [&] { return count > 0; });
+    bool completed;
+    {
+        std::unique_lock<std::mutex> lock(m);
+        completed = cv.wait_for(lock, std::chrono::seconds(1), [&] { return count > 0; });
+    }
+    // The result predicate is published under the same mutex after both stores. Join before
+    // assertions/teardown as notify_one() can still be pending when the predicate is already true.
+    sched->shutdown();
 
+    EXPECT_TRUE(completed);
     EXPECT_EQ(count.load(), 1);
     EXPECT_TRUE(on_thread.load());
 }

@@ -5,7 +5,7 @@
 #include <LatticeCore.hpp>
 #include <bridging.hpp>
 #include <cassert>
-#include <bit>
+#include <cstring>
 #include <chrono>
 #include <concepts>
 #include <filesystem>
@@ -3116,6 +3116,15 @@ using swift_migration_block_t = std::function<void(swift_migration_context_ref*)
 // Cache key for swift_lattice_ref - defined at namespace scope to avoid
 // Swift-C++ interop issues with nested types
 namespace detail {
+    // Swift consumers can import this header as C++17 even when Core itself builds as C++20.
+    // Copy the representation without aliasing or arithmetic, preserving signed zero and NaN payloads.
+    inline uint64_t cache_double_bits(const double& value) {
+        static_assert(sizeof(double) == sizeof(uint64_t), "cache tuning requires 64-bit doubles");
+        uint64_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
     // Length-prefix strings and mark optionals explicitly. Filter SQL/channel names can contain every
     // delimiter; concatenating them with punctuation made distinct configurations share an instance.
     inline void append_cache_string(std::string& out, const std::string& value) {
@@ -3165,8 +3174,8 @@ inline std::string sync_tuning_fingerprint(const lattice::configuration& c) {
     fp += t.chunk_size ? std::to_string(*t.chunk_size) : "-"; fp += "|";
     fp += t.max_reconnect_attempts ? std::to_string(*t.max_reconnect_attempts) : "-"; fp += "|";
     // Decimal to_string rounds to six places, aliasing distinct valid sub-microsecond settings.
-    fp += t.base_delay_seconds ? std::to_string(std::bit_cast<uint64_t>(*t.base_delay_seconds)) : "-"; fp += "|";
-    fp += t.max_delay_seconds ? std::to_string(std::bit_cast<uint64_t>(*t.max_delay_seconds)) : "-"; fp += "|";
+    fp += t.base_delay_seconds ? std::to_string(cache_double_bits(*t.base_delay_seconds)) : "-"; fp += "|";
+    fp += t.max_delay_seconds ? std::to_string(cache_double_bits(*t.max_delay_seconds)) : "-"; fp += "|";
     fp += t.stable_connection_ms ? std::to_string(*t.stable_connection_ms) : "-"; fp += "|";
     fp += t.upload_coalesce_ms ? std::to_string(*t.upload_coalesce_ms) : "-"; fp += "|";
     fp += t.checkpoint_passive_interval_ms ? std::to_string(*t.checkpoint_passive_interval_ms) : "-"; fp += "|";

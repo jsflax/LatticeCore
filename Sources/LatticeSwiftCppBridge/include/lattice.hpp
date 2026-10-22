@@ -5,6 +5,7 @@
 #include <LatticeCore.hpp>
 #include <bridging.hpp>
 #include <cassert>
+#include <bit>
 #include <chrono>
 #include <concepts>
 #include <filesystem>
@@ -3115,6 +3116,40 @@ using swift_migration_block_t = std::function<void(swift_migration_context_ref*)
 // Cache key for swift_lattice_ref - defined at namespace scope to avoid
 // Swift-C++ interop issues with nested types
 namespace detail {
+    // Length-prefix strings and mark optionals explicitly. Filter SQL/channel names can contain every
+    // delimiter; concatenating them with punctuation made distinct configurations share an instance.
+    inline void append_cache_string(std::string& out, const std::string& value) {
+        out += std::to_string(value.size()); out += ':'; out += value;
+    }
+
+    inline void append_cache_optional_string(std::string& out, const std::optional<std::string>& value) {
+        out += value ? 'V' : 'N';
+        if (value) append_cache_string(out, *value);
+    }
+
+    inline void append_cache_filter(std::string& out,
+                                    const std::optional<std::vector<sync_filter_entry>>& filter) {
+        out += filter ? 'V' : 'N';
+        if (!filter) return;
+        out += std::to_string(filter->size()); out += ':';
+        for (const auto& entry : *filter) {
+            append_cache_string(out, entry.table_name);
+            append_cache_optional_string(out, entry.where_clause);
+        }
+    }
+
+    // The cache must honor access/authority and maintenance settings, not just the file and scheduler.
+    // Tokens remain private in-memory key data; neither this encoding nor its contents are logged.
+    inline std::string connection_fingerprint(const configuration& config) {
+        std::string fp = config.read_only ? "R" : "W";
+        fp += config.sync_is_observer ? 'O' : 'P';
+        fp += std::to_string(config.busy_timeout_ms); fp += '|';
+        fp += std::to_string(config.audit_retention_seconds); fp += '|';
+        append_cache_string(fp, config.authorization_token);
+        append_cache_filter(fp, config.sync_filter);
+        return fp;
+    }
+
     /// Deterministic fingerprint of a config's IPC targets (channel, socket
     /// path, filter tables + WHERE clauses). Without this in the cache key, an
     /// open WITHOUT ipc targets (e.g. a maintenance/compact connection) would
@@ -3129,8 +3164,9 @@ inline std::string sync_tuning_fingerprint(const lattice::configuration& c) {
     std::string fp;
     fp += t.chunk_size ? std::to_string(*t.chunk_size) : "-"; fp += "|";
     fp += t.max_reconnect_attempts ? std::to_string(*t.max_reconnect_attempts) : "-"; fp += "|";
-    fp += t.base_delay_seconds ? std::to_string(*t.base_delay_seconds) : "-"; fp += "|";
-    fp += t.max_delay_seconds ? std::to_string(*t.max_delay_seconds) : "-"; fp += "|";
+    // Decimal to_string rounds to six places, aliasing distinct valid sub-microsecond settings.
+    fp += t.base_delay_seconds ? std::to_string(std::bit_cast<uint64_t>(*t.base_delay_seconds)) : "-"; fp += "|";
+    fp += t.max_delay_seconds ? std::to_string(std::bit_cast<uint64_t>(*t.max_delay_seconds)) : "-"; fp += "|";
     fp += t.stable_connection_ms ? std::to_string(*t.stable_connection_ms) : "-"; fp += "|";
     fp += t.upload_coalesce_ms ? std::to_string(*t.upload_coalesce_ms) : "-"; fp += "|";
     fp += t.checkpoint_passive_interval_ms ? std::to_string(*t.checkpoint_passive_interval_ms) : "-"; fp += "|";
@@ -3141,20 +3177,12 @@ inline std::string sync_tuning_fingerprint(const lattice::configuration& c) {
 
 template <typename ConfigT>
     inline std::string ipc_targets_fingerprint(const ConfigT& config) {
-        std::string fp;
+        std::string fp = std::to_string(config.ipc_targets.size()) + ":";
         for (const auto& t : config.ipc_targets) {
-            fp += t.channel;
-            if (t.socket_path) { fp += '@'; fp += *t.socket_path; }
-            if (t.sync_filter) {
-                fp += '[';
-                for (const auto& e : *t.sync_filter) {
-                    fp += e.table_name;
-                    if (e.where_clause) { fp += ':'; fp += *e.where_clause; }
-                    fp += ',';
-                }
-                fp += ']';
-            }
-            fp += ';';
+            append_cache_string(fp, t.channel);
+            append_cache_optional_string(fp, t.socket_path);
+            append_cache_filter(fp, t.sync_filter);
+            fp += t.narrowing_emits_removals ? '1' : '0';
         }
         return fp;
     }
@@ -3167,6 +3195,7 @@ template <typename ConfigT>
         int32_t schema_version;     // Target schema version (differentiates pre/post migration)
         std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
         std::string tuning_fingerprint; // sync_tuning overlay (different tuning must not share an instance)
+        std::string connection_fingerprint; // access, authority, filters and maintenance; never logged
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
@@ -3175,6 +3204,7 @@ template <typename ConfigT>
             if (schema_version != other.schema_version) return schema_version < other.schema_version;
             if (ipc_fingerprint != other.ipc_fingerprint) return ipc_fingerprint < other.ipc_fingerprint;
             if (tuning_fingerprint != other.tuning_fingerprint) return tuning_fingerprint < other.tuning_fingerprint;
+            if (connection_fingerprint != other.connection_fingerprint) return connection_fingerprint < other.connection_fingerprint;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3190,6 +3220,7 @@ template <typename ConfigT>
             if (schema_version != other.schema_version) return false;
             if (ipc_fingerprint != other.ipc_fingerprint) return false;
             if (tuning_fingerprint != other.tuning_fingerprint) return false;
+            if (connection_fingerprint != other.connection_fingerprint) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3243,7 +3274,8 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config)};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version,
+                                  ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), connection_fingerprint(config)};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,

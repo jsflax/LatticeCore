@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.2.2] - 2026-10-22
+
+### Fixed
+- Contain remote-apply receipt-table and cursor-probe setup failures before
+  processing entries. Return no acknowledgement candidates and release the
+  applying flag so a later delivery can retry.
+- Give each active apply exclusive ownership of its instance's applying flag.
+  Reentrant or overlapping applies return no acknowledgement candidates without
+  clearing the active delivery's flag.
+
+### Compatibility
+- Existing chunk retry, committed-prefix acknowledgements and receive-cursor
+  handling are preserved. Persistent schema, sync wire format and public API
+  signatures are unchanged.
+
 ## [2.2.1] - 2026-10-18
 
 ### Fixed

@@ -617,3 +617,241 @@ TEST(AuditHygiene, ChunkFailureRetriesOnceAndRecovers) {
     ASSERT_FALSE(slot.empty());
     EXPECT_EQ(std::get<std::string>(slot[0].at("lid")), "h3-audit-119");
 }
+
+// ===========================================================================
+// Remote-apply preamble failures own neither a transaction nor an ACK. These
+// cases deny real SQLite prepares rather than throwing through a C callback.
+// The returned IDs below are Core's ACK candidates, not a transport ACK test.
+// ===========================================================================
+
+namespace {
+
+struct ApplyPreambleSnapshot {
+    std::vector<lattice::database::row_t> persons;
+    std::vector<lattice::database::row_t> audit;
+    std::vector<lattice::database::row_t> sync_state;
+    std::vector<lattice::database::row_t> slots;
+    std::vector<lattice::database::row_t> sync_control;
+};
+
+ApplyPreambleSnapshot apply_preamble_snapshot(lattice::database& db) {
+    return {
+        db.query("SELECT * FROM TestPerson ORDER BY id", {}),
+        db.query("SELECT * FROM AuditLog ORDER BY id", {}),
+        db.query("SELECT * FROM _lattice_sync_state ORDER BY audit_entry_id, sync_id", {}),
+        db.query("SELECT * FROM _lattice_replication_slots ORDER BY sync_id", {}),
+        db.query("SELECT * FROM _SyncControl ORDER BY id", {})};
+}
+
+struct ApplyPreambleDenial {
+    enum class Point { receipts_create, cursor_probe } point;
+    int denied = 0;
+    int rollback_attempts = 0;
+
+    static int authorize(void* context, int action, const char* first,
+                         const char* second, const char*, const char*) noexcept {
+        auto& state = *static_cast<ApplyPreambleDenial*>(context);
+        if (action == SQLITE_TRANSACTION && first &&
+            std::strcmp(first, "ROLLBACK") == 0) {
+            ++state.rollback_attempts;
+        }
+        const bool receipts = state.point == Point::receipts_create &&
+            action == SQLITE_CREATE_TABLE && first &&
+            std::strcmp(first, "_lattice_applied_receipts") == 0;
+        const bool cursor = state.point == Point::cursor_probe &&
+            action == SQLITE_PRAGMA && first && second &&
+            std::strcmp(first, "table_info") == 0 &&
+            std::strcmp(second, "_lattice_replication_slots") == 0;
+        if (receipts || cursor) {
+            ++state.denied;
+            return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+};
+
+struct ApplyPreambleAuthorizerReset {
+    sqlite3* connection;
+    ~ApplyPreambleAuthorizerReset() {
+        sqlite3_set_authorizer(connection, nullptr, nullptr);
+    }
+};
+
+void expect_apply_preamble_denial(ApplyPreambleDenial::Point point) {
+    TempDB tmp{point == ApplyPreambleDenial::Point::receipts_create
+                   ? "apply_cold_receipts_denial" : "apply_cursor_probe_denial"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.add(TestPerson{"ExistingLocalRow", 64, std::nullopt});
+    lattice::register_replication_slot(db.db(), "chan-a");
+    lattice::register_replication_slot(db.db(), "relay-chan");
+    db.db().execute(
+        "UPDATE _lattice_replication_slots SET last_received_event_id = ?, "
+        "last_active_at = '2026-08-13 11:59:00' WHERE sync_id = 'chan-a'",
+        {std::string("sentinel-before-apply")});
+    db.db().execute(
+        "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized) "
+        "SELECT id, 'chan-a', 0 FROM AuditLog ORDER BY id LIMIT 1", {});
+
+    auto receipts_schema = db.db().query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name = '_lattice_applied_receipts'", {});
+    ASSERT_TRUE(receipts_schema.empty()) << "cold fixture must reach actual CREATE";
+    if (point == ApplyPreambleDenial::Point::cursor_probe) {
+        // Isolate the later PRAGMA denial: its preceding CREATE is already a
+        // no-op, so this failure must leave all existing rows and DDL intact.
+        db.db().execute(
+            "CREATE TABLE _lattice_applied_receipts (globalId TEXT PRIMARY KEY)", {});
+        db.db().execute(
+            "INSERT INTO _lattice_applied_receipts VALUES ('existing-receipt')", {});
+    }
+    const auto receipt_rows_before = point == ApplyPreambleDenial::Point::cursor_probe
+        ? db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId", {})
+        : std::vector<lattice::database::row_t>{};
+    const auto before = apply_preamble_snapshot(db.db());
+    ASSERT_FALSE(before.persons.empty());
+    ASSERT_FALSE(before.audit.empty());
+    ASSERT_FALSE(before.sync_state.empty());
+    ASSERT_EQ(before.slots.size(), 2u);
+    ASSERT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
+    auto* connection = db.db().handle();
+    ASSERT_EQ(sqlite3_get_autocommit(connection), 1);
+
+    ApplyPreambleDenial denial{point};
+    ASSERT_EQ(sqlite3_set_authorizer(connection, ApplyPreambleDenial::authorize, &denial),
+              SQLITE_OK);
+    ApplyPreambleAuthorizerReset reset{connection};
+    const auto entries = h3_insert_entries(1);
+    std::vector<std::string> acked;
+    ASSERT_NO_THROW(acked = lattice::apply_remote_changes_for(db, entries, "chan-a"));
+    EXPECT_GT(denial.denied, 0) << "the intended real preamble prepare must be denied";
+    EXPECT_EQ(denial.rollback_attempts, 0)
+        << "preamble failure has not acquired a transaction to roll back";
+    EXPECT_TRUE(acked.empty()) << "an unstarted apply has no ACK candidates";
+    EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
+    EXPECT_EQ(sqlite3_get_autocommit(connection), 1);
+    ASSERT_EQ(sqlite3_set_authorizer(connection, nullptr, nullptr), SQLITE_OK);
+
+    const auto after = apply_preamble_snapshot(db.db());
+    EXPECT_EQ(after.persons, before.persons);
+    EXPECT_EQ(after.audit, before.audit);
+    EXPECT_EQ(after.sync_state, before.sync_state);
+    EXPECT_EQ(after.slots, before.slots) << "including the exact sentinel download cursor";
+    EXPECT_EQ(after.sync_control, before.sync_control);
+    if (point == ApplyPreambleDenial::Point::receipts_create) {
+        EXPECT_TRUE(db.db().query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = '_lattice_applied_receipts'", {}).empty());
+    } else {
+        EXPECT_EQ(db.db().query(
+            "SELECT * FROM _lattice_applied_receipts ORDER BY globalId", {}),
+            receipt_rows_before);
+    }
+
+    // Exactly the same entry must remain retryable after the actual denial
+    // is removed; a second delivery then hits dedup rather than minting twice.
+    ASSERT_NO_THROW(acked = lattice::apply_remote_changes_for(db, entries, "chan-a"));
+    ASSERT_EQ(acked, std::vector<std::string>{entries[0].global_id});
+    const auto applied_once = apply_preamble_snapshot(db.db());
+    ASSERT_EQ(applied_once.persons.size(), before.persons.size() + 1);
+    ASSERT_EQ(applied_once.audit.size(), before.audit.size() + 1);
+    const auto cursor = db.db().query(
+        "SELECT last_received_event_id AS c FROM _lattice_replication_slots "
+        "WHERE sync_id = 'chan-a'", {});
+    ASSERT_EQ(cursor.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(cursor[0].at("c")), entries[0].global_id);
+    ASSERT_NO_THROW(acked = lattice::apply_remote_changes_for(db, entries, "chan-a"));
+    EXPECT_EQ(acked, std::vector<std::string>{entries[0].global_id});
+    const auto redelivered = apply_preamble_snapshot(db.db());
+    EXPECT_EQ(redelivered.persons, applied_once.persons);
+    EXPECT_EQ(redelivered.audit, applied_once.audit);
+    EXPECT_EQ(redelivered.sync_state, applied_once.sync_state);
+    EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
+    EXPECT_EQ(sqlite3_get_autocommit(connection), 1);
+}
+
+struct ApplyObserverReset {
+    lattice::lattice_db& db;
+    lattice::lattice_db::observer_id id;
+    ~ApplyObserverReset() { db.remove_table_observer("TestPerson", id); }
+};
+
+} // namespace
+
+TEST(AuditHygiene, ColdReceiptsCreateDenialLeavesApplyRetryableAndCursorUnchanged) {
+    expect_apply_preamble_denial(ApplyPreambleDenial::Point::receipts_create);
+}
+
+TEST(AuditHygiene, CursorProbeDenialLeavesApplyRetryableAndCursorUnchanged) {
+    expect_apply_preamble_denial(ApplyPreambleDenial::Point::cursor_probe);
+}
+
+TEST(AuditHygiene, NestedObserverApplyCannotClearTheOuterApplyFlag) {
+    TempDB tmp{"apply_nested_observer"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.add(TestPerson{"ExistingLocalRow", 65, std::nullopt});
+    lattice::register_replication_slot(db.db(), "chan-a");
+    auto entries = h3_insert_entries(2);
+    const std::vector<lattice::audit_log_entry> outer{entries[0]};
+    const std::vector<lattice::audit_log_entry> nested{entries[1]};
+
+    int outer_observer_calls = 0;
+    bool active_before_nested = false;
+    bool active_after_nested = false;
+    bool observer_saw_settled_transaction = false;
+    std::vector<std::string> nested_acked;
+    auto observer = db.add_table_observer("TestPerson",
+        [&](const std::vector<lattice::lattice_db::change_event>& events) {
+            bool saw_outer = false;
+            for (const auto& event : events) {
+                if (std::get<3>(event) == outer[0].global_row_id) saw_outer = true;
+            }
+            if (!saw_outer || outer_observer_calls++ != 0) return;
+            // This is real unlocked, transaction-settled delivery. It runs
+            // while the enclosing Core apply still owns its remote flag.
+            observer_saw_settled_transaction =
+                sqlite3_get_autocommit(db.db().handle()) == 1 &&
+                !db.db().is_in_transaction();
+            active_before_nested = db.applying_remote_changes_.load(std::memory_order_acquire);
+            nested_acked = lattice::apply_remote_changes_for(db, nested, "chan-a");
+            active_after_nested = db.applying_remote_changes_.load(std::memory_order_acquire);
+        });
+    ApplyObserverReset reset{db, observer};
+
+    auto outer_acked = lattice::apply_remote_changes_for(db, outer, "chan-a");
+    EXPECT_EQ(outer_acked, std::vector<std::string>{outer[0].global_id});
+    ASSERT_EQ(outer_observer_calls, 1) << "must enter through actual outer row delivery";
+    EXPECT_TRUE(observer_saw_settled_transaction);
+    EXPECT_TRUE(active_before_nested);
+    EXPECT_TRUE(nested_acked.empty()) << "an active outer apply refuses nested ACK candidates";
+    EXPECT_TRUE(active_after_nested) << "nested refusal must not release the outer owner";
+    EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
+    auto nested_rows = db.db().query(
+        "SELECT * FROM TestPerson WHERE globalId = ?", {nested[0].global_row_id});
+    EXPECT_TRUE(nested_rows.empty());
+    auto cursor = db.db().query(
+        "SELECT last_received_event_id AS c FROM _lattice_replication_slots "
+        "WHERE sync_id = 'chan-a'", {});
+    ASSERT_EQ(cursor.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(cursor[0].at("c")), outer[0].global_id);
+
+    auto retry_acked = lattice::apply_remote_changes_for(db, nested, "chan-a");
+    EXPECT_EQ(retry_acked, std::vector<std::string>{nested[0].global_id});
+    nested_rows = db.db().query(
+        "SELECT * FROM TestPerson WHERE globalId = ?", {nested[0].global_row_id});
+    ASSERT_EQ(nested_rows.size(), 1u);
+    const auto audit_once = db.db().query(
+        "SELECT * FROM AuditLog WHERE globalId = ? ORDER BY id", {nested[0].global_id});
+    ASSERT_EQ(audit_once.size(), 1u);
+    EXPECT_EQ(lattice::apply_remote_changes_for(db, nested, "chan-a"), retry_acked);
+    EXPECT_EQ(db.db().query(
+        "SELECT * FROM TestPerson WHERE globalId = ?", {nested[0].global_row_id}), nested_rows);
+    EXPECT_EQ(db.db().query(
+        "SELECT * FROM AuditLog WHERE globalId = ? ORDER BY id", {nested[0].global_id}), audit_once);
+    cursor = db.db().query(
+        "SELECT last_received_event_id AS c FROM _lattice_replication_slots "
+        "WHERE sync_id = 'chan-a'", {});
+    ASSERT_EQ(cursor.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(cursor[0].at("c")), nested[0].global_id);
+    EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
+    EXPECT_EQ(sqlite3_get_autocommit(db.db().handle()), 1);
+}

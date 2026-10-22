@@ -3435,9 +3435,26 @@ static std::vector<std::string> apply_remote_changes_impl(
     if (entries.empty()) return applied_ids;
 
     // Signal flush_changes to look up changedFieldsNames from AuditLog for
-    // object observers. Without this, IPC sync changes bypass Swift setters
-    // and the Observation registrar is never triggered.
-    db.applying_remote_changes_.store(true, std::memory_order_release);
+    // object observers. Only this delivery may clear its flag: an observer
+    // can reenter apply, and other callers need not use our scheduler.
+    struct applying_flag_scope {
+        std::atomic<bool>& flag;
+        bool acquired;
+
+        explicit applying_flag_scope(std::atomic<bool>& value) noexcept
+            : flag(value), acquired(false) {
+            bool expected = false;
+            acquired = flag.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+        ~applying_flag_scope() noexcept {
+            if (acquired) flag.store(false, std::memory_order_release);
+        }
+    } applying_flag(db.applying_remote_changes_);
+    if (!applying_flag.acquired) {
+        LOG_WARN("apply_remote", "another delivery is still applying; returning no ACKable entries");
+        return applied_ids;
+    }
 
     // Process in chunks to avoid holding the write lock for too long.
     const size_t chunk_size = 50;
@@ -3452,25 +3469,34 @@ static std::vector<std::string> apply_remote_changes_impl(
     // intervening local edit would re-apply stale values and relay the
     // reversion fleet-wide. Receipts are globalId-only (~tens of bytes vs a
     // full audit row) and pruned by bounded rowid horizon in compaction.
-    db.db().execute(
-        "CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
-        "  globalId TEXT PRIMARY KEY)", {});
-
     // Download-resume cursor (externalized): advanced per chunk to the last
     // CONTIGUOUSLY-acked entry of the delivery. Only meaningful in per-sync
     // mode (clients resuming a download stream); the column is added by
     // register_replication_slot, so probe rather than assume.
     bool cursor_column_ok = false;
-    if (receiving_sync_id) {
-        auto cols = db.db().query("PRAGMA table_info(_lattice_replication_slots)", {});
-        for (const auto& row : cols) {
-            auto it = row.find("name");
-            if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
-                std::get<std::string>(it->second) == "last_received_event_id") {
-                cursor_column_ok = true;
-                break;
+    try {
+        db.db().execute(
+            "CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+            "  globalId TEXT PRIMARY KEY)", {});
+        if (receiving_sync_id) {
+            auto cols = db.db().query("PRAGMA table_info(_lattice_replication_slots)", {});
+            for (const auto& row : cols) {
+                auto it = row.find("name");
+                if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+                    std::get<std::string>(it->second) == "last_received_event_id") {
+                    cursor_column_ok = true;
+                    break;
+                }
             }
         }
+    } catch (const std::exception& e) {
+        // No apply transaction or entry effects exist yet. Do not roll back
+        // an unrelated caller's transaction or ACK an unprocessed entry.
+        LOG_WARN("apply_remote", "delivery setup failed (%s); returning no ACKable entries", e.what());
+        return applied_ids;
+    } catch (...) {
+        LOG_WARN("apply_remote", "delivery setup failed (non-std exception); returning no ACKable entries");
+        return applied_ids;
     }
     std::optional<std::string> cursor_candidate;
     bool cursor_halted = false;
@@ -3919,8 +3945,6 @@ static std::vector<std::string> apply_remote_changes_impl(
         chunk_start = chunk_end;
         chunk_retried = false;
     }
-
-    db.applying_remote_changes_.store(false, std::memory_order_release);
 
     // vec0 INSERT/UPDATE/DELETE triggers fire inside the transaction above on
     // THIS connection, so the shadow table is already up-to-date. Other

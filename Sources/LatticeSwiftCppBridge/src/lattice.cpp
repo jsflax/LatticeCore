@@ -929,18 +929,16 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 int dimensions = bytes / static_cast<int>(sizeof(float));
                 if (dimensions <= 0) continue;
                 lattice_db::ensure_vec0_table(schema.table_name, prop.name, dimensions);
-                // Backfill vec0 from existing data
-                db().execute(
-                    "INSERT OR REPLACE INTO " + vec_table + "(global_id, embedding) "
-                    "SELECT globalId, " + prop.name + " FROM " + schema.table_name +
-                    " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+                // ensure_vec0_table atomically installs all triggers, fills
+                // historical main rows and publishes its durable marker.
+                // A second INSERT OR REPLACE would duplicate that work.
             } else {
                 // Table exists — ensure triggers are up to date (pass 0 dimensions, ignored)
                 lattice_db::ensure_vec0_table(schema.table_name, prop.name, 0);
-                // Gap reconciliation (rows inserted by other connections whose
-                // vec0 triggers fired elsewhere) moved off the open path — it
-                // scans the model table. dispatch_vec0_reconcile() heals gaps
-                // in the background after the transaction commits.
+                // Old/pre-protocol indices receive one atomic missing-ID
+                // initialization. Once marked at the current schema cookie,
+                // ordinary open/add/query checks do not scan model rows.
+                // Background reconciliation retains its separate repair role.
             }
         }
     }
@@ -1507,8 +1505,8 @@ void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std:
                 // dims from), then hydrated by sync-apply — which never creates
                 // vec0 or its triggers. Every later open takes the fast path, so
                 // bailing here would leave the DB semantically unsearchable
-                // forever. Create the index (dims from a sample row); the gap
-                // fill below then backfills every row.
+                // forever. The atomic initializer creates the index (dims
+                // from a sample row) and fills every historical main row.
                 auto sample = db().query(
                     "SELECT length(" + prop + ") as len FROM main." + table +
                     " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0 LIMIT 1");
@@ -1518,6 +1516,10 @@ void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std:
                     !std::holds_alternative<int64_t>(len_it->second)) return;
                 int dims = static_cast<int>(std::get<int64_t>(len_it->second) / sizeof(float));
                 if (dims <= 0) return;
+                // The full initializer now owns this missing-index fill. Keep
+                // the existing passive reconcile barrier on its actual fill
+                // window while the complete maintenance scope remains held.
+                notify_vec0_maintenance_test_hook("reconcile", "before-fill");
                 ensure_vec0_table(table, prop, dims);
             }
             // Qualify the model table with `main.`: this task runs async after

@@ -278,3 +278,90 @@ TEST(SyncOnlyVecReconcile, FileObserverReentryRejectsWithoutSqlAndRecovers) {
 }
 
 #endif  // __linux__
+
+#ifndef __linux__
+namespace {
+lattice::VectorConstraintVector cold_combined_vectors() {
+    return {lattice::vector_constraint("embedding", pack_floats({1, 0, 0, 0}), 1, 1)};
+}
+lattice::sort_descriptor cold_combined_sort() {
+    return {lattice::sort_descriptor::Type::vector_distance, "embedding", true};
+}
+} // namespace
+
+TEST(ColdCombinedVectorInitialization, FirstFullCosineQueryFillsSyncShapedRowsWithoutReopen) {
+    TempDB path{"cold_combined_first_rows"};
+    auto l = quiescent_recon_fixture(path);
+    raw_hydrate(*l, "ReconDoc", "delivered", {1, 0, 0, 0});
+    ASSERT_FALSE(l->db().table_exists("_ReconDoc_embedding_vec"));
+    const auto rows = l->combined_nearest_query("ReconDoc", {}, cold_combined_vectors(), {}, {},
+                                               std::nullopt, cold_combined_sort(), 1);
+    const std::string error = lattice::last_bridge_error(); // independently captured before assertions
+    EXPECT_EQ(error, "");
+    ASSERT_EQ(rows.size(), 1u);
+    ASSERT_EQ(rows[0].distances.size(), 1u);
+    EXPECT_LT(rows[0].distances[0].distance, 0.001);
+    expect_index_identities_match_model(*l);
+    raw_hydrate(*l, "ReconDoc", "later-delivered", {0, 1, 0, 0});
+    EXPECT_EQ(vec_index_count(*l, "ReconDoc"), 2);
+    expect_index_identities_match_model(*l);
+}
+
+TEST(ColdCombinedVectorInitialization, FirstCountRepairsExistingPreProtocolEmptyIndex) {
+    TempDB path{"cold_combined_existing_empty"};
+    auto l = quiescent_recon_fixture(path);
+    raw_hydrate(*l, "ReconDoc", "delivered", {1, 0, 0, 0});
+    l->ensure_vec0_table("ReconDoc", "embedding", 4);
+    // Deterministic emulation of the bad existing 2.2.2 state. The public
+    // SDK cold-IPC control deliberately performs no such setup/priming.
+    l->db().execute("DELETE FROM _lattice_meta WHERE key='vec0_initialized_v1:_ReconDoc_embedding_vec'");
+    l->db().execute("DELETE FROM _ReconDoc_embedding_vec");
+    ASSERT_EQ(vec_index_count(*l, "ReconDoc"), 0);
+    const auto count = l->combined_nearest_query_count("ReconDoc", {}, cold_combined_vectors(), {}, {},
+                                                      std::nullopt, cold_combined_sort(), 1);
+    const std::string error = lattice::last_bridge_error();
+    EXPECT_EQ(error, "");
+    EXPECT_EQ(count, 1);
+    expect_index_identities_match_model(*l);
+}
+
+TEST(ColdCombinedVectorInitialization, FillFailureSurfacesErrorThenBothQueryShapesRetryOnSameOwner) {
+    for (const bool count_first : {false, true}) {
+        SCOPED_TRACE(count_first);
+        TempDB path{count_first ? "cold_combined_count_retry" : "cold_combined_rows_retry"};
+        auto l = quiescent_recon_fixture(path);
+        raw_hydrate(*l, "ReconDoc", "delivered", {1, 0, 0, 0});
+        lattice::vec0_maintenance_test_access::set(*l, [](const char* operation, const char* phase) {
+            if (std::string(operation) == "ensure" && std::string(phase) == "after-fill")
+                throw lattice::db_error("test combined initializer rollback");
+        });
+        int64_t failed_count = -1;
+        size_t failed_rows = 1;
+        if (count_first) {
+            failed_count = l->combined_nearest_query_count("ReconDoc", {}, cold_combined_vectors(), {}, {},
+                                                          std::nullopt, cold_combined_sort(), 1);
+        } else {
+            failed_rows = l->combined_nearest_query("ReconDoc", {}, cold_combined_vectors(), {}, {},
+                                                   std::nullopt, cold_combined_sort(), 1).size();
+        }
+        const std::string error = lattice::last_bridge_error();
+        lattice::vec0_maintenance_test_access::set(*l, {});
+        EXPECT_NE(error.find("test combined initializer rollback"), std::string::npos);
+        if (count_first) EXPECT_EQ(failed_count, 0);
+        else EXPECT_EQ(failed_rows, 0u);
+        EXPECT_FALSE(l->db().table_exists("_ReconDoc_embedding_vec"));
+        EXPECT_FALSE(l->db().is_in_transaction());
+        const auto rows = l->combined_nearest_query("ReconDoc", {}, cold_combined_vectors(), {}, {},
+                                                   std::nullopt, cold_combined_sort(), 1);
+        const std::string rows_error = lattice::last_bridge_error();
+        const auto count = l->combined_nearest_query_count("ReconDoc", {}, cold_combined_vectors(), {}, {},
+                                                          std::nullopt, cold_combined_sort(), 1);
+        const std::string count_error = lattice::last_bridge_error();
+        EXPECT_EQ(rows_error, "");
+        EXPECT_EQ(count_error, "");
+        EXPECT_EQ(rows.size(), 1u);
+        EXPECT_EQ(count, 1);
+        expect_index_identities_match_model(*l);
+    }
+}
+#endif // __linux__

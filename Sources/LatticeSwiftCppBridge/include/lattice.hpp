@@ -2301,11 +2301,10 @@ public:
         // Ensure vec0 tables exist — they may not have been created yet if
         // data arrived via sync after ensure_swift_tables ran with no vector data.
         for (const auto& vc : vectors) {
-            std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
             int dims = static_cast<int>(vc.query_vector.size() / sizeof(float));
-            if (dims > 0 && !db().table_exists(vec_table)) {
-                ensure_vec0_table(table_name, vc.column, dims);
-            }
+            // Existing empty/partial 2.2.2 sidecars also need the atomic
+            // initializer. Its durable current marker makes hot calls O(1).
+            if (dims > 0) ensure_vec0_table(table_name, vc.column, dims);
         }
 
         // Build the SQL query with CTEs for each constraint type

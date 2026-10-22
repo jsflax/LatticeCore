@@ -1,0 +1,19 @@
+{
+  "format": "lattice-observer-delivery-startup-v1",
+  "clients": 8,
+  "waiters": 64,
+  "guaranteedCount": 131200,
+  "guaranteedBytes": 4328521728,
+  "burstCount": 0,
+  "burstBytes": 0,
+  "events": 128,
+  "eventBytes": 2097152,
+  "workspaceBytes": 8388608,
+  "readWorkspaceBytes": 33554432,
+  "readColumns": 262144,
+  "readRows": 262144,
+  "admissionWaitMs": 60000,
+  "readDurationMs": 60000,
+  "initializationStatements": 65536,
+  "initializationWorkspaceBytes": 2147483648
+}

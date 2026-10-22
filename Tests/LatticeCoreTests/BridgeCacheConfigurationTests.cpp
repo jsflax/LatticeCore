@@ -162,3 +162,27 @@ TEST(BridgeCacheConfiguration, FilterAndIPCEncodingPreserveOptionalBoundariesAnd
     b.ipc_targets[0].socket_path = "";
     EXPECT_FALSE(lattice::detail::ipc_targets_fingerprint(a) == lattice::detail::ipc_targets_fingerprint(b));
 }
+
+TEST(BridgeCacheConfiguration, TuningFingerprintPreservesEveryDoubleBitAndOptionalAbsence) {
+    // Pure fingerprint checks: non-finite tuning is never supplied to a running synchronizer.
+    const uint64_t representations[] = {
+        0x0000000000000000ULL, 0x8000000000000000ULL, // positive and negative zero
+        0x3ff0000000000000ULL, 0x3ff0000000000001ULL, // adjacent finite values
+        0x7ff0000000000000ULL,                       // infinity
+        0x7ff8000000000001ULL, 0x7ff8000000000002ULL, // distinct quiet NaN payloads
+    };
+    for (bool base_delay : {true, false}) {
+        lattice::configuration config;
+        std::vector<std::string> fingerprints{lattice::detail::sync_tuning_fingerprint(config)};
+        auto& delay = base_delay ? config.tuning.base_delay_seconds : config.tuning.max_delay_seconds;
+        delay.emplace(0.0);
+        for (auto bits : representations) {
+            std::memcpy(&*delay, &bits, sizeof(bits));
+            EXPECT_EQ(lattice::detail::cache_double_bits(*delay), bits);
+            const auto fingerprint = lattice::detail::sync_tuning_fingerprint(config);
+            EXPECT_EQ(fingerprint, lattice::detail::sync_tuning_fingerprint(config));
+            for (const auto& previous : fingerprints) EXPECT_NE(fingerprint, previous);
+            fingerprints.push_back(fingerprint);
+        }
+    }
+}

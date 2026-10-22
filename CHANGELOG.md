@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.2.6] - 2026-10-22
+
+### Fixed
+- Keep the public bridge header importable by Swift consumers using C++17.
+  Sync-tuning cache keys still preserve exact double representations, including
+  signed zero and NaN payloads, without requiring C++20 `std::bit_cast` in the header.
+
+### Compatibility
+- No persistent schema, sync wire format, or public API signature changes.
+  Rebuild Core and generated C++/Swift bridge consumers together.
+
 ## [2.2.5] - 2026-10-22
 
 ### Fixed

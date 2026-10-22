@@ -39,6 +39,10 @@ jobs:
           git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SOURCE_SHA"
           test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SOURCE_SHA"
 
+      - name: Check Swift consumption of C++17 bridge headers
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: bash Tests/SwiftHeaderImportCheck/check.sh "$CORE_JOB_ROOT/swift-import-module-cache"
+
       - name: Build and run C++ tests
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |

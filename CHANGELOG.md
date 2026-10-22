@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.2.5] - 2026-10-22
+
+### Fixed
+- Keep cached bridge connections separate when read-only access, authorization,
+  observer mode, sync filters, busy timeout, or audit retention differs. A read-only
+  open can no longer inherit a cached writable connection, or vice versa.
+- Preserve optional filter boundaries, IPC narrowing policy, and exact sync-tuning
+  values in cache identity. Equivalent configurations still share an instance;
+  distinct configurations retain independent close and observer lifetimes.
+
+### Compatibility
+- No persistent schema, sync wire format, or public API signature changes.
+  Rebuild Core and generated C++/Swift bridge consumers together.
+
 ## [2.2.4] - 2026-10-22
 
 ### Fixed

@@ -2034,3 +2034,202 @@ TEST(Sync, ImmediateQueueSerializesFilterAndACKDuringUpload) {
     });
 }
 #endif
+
+// Dedicated sync connections must inherit the actual parent timeout, for both
+// statement admission and database::begin_transaction's finite IMMEDIATE budget.
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace sync_child_timeout_regressions {
+constexpr int parent_timeout_ms = 2000;
+
+void require(bool value, const char* message) {
+    if (!value) throw std::runtime_error(message);
+}
+
+struct network_factory_restore {
+    std::shared_ptr<lattice::network_factory> prior = lattice::get_network_factory();
+    network_factory_restore() {
+        lattice::set_network_factory(std::make_shared<lattice::mock_network_factory>());
+    }
+    ~network_factory_restore() { lattice::set_network_factory(std::move(prior)); }
+};
+
+struct owned_path_cleanup {
+    std::filesystem::path path;
+    ~owned_path_cleanup() {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+};
+
+// All child access stays inside the registry callback's lifetime guard. Use the
+// actual child's existing worker, so the probe cannot join a scheduled sync
+// transaction from another thread. A missing ending exits the fresh test child
+// without unwinding the still-captured stack or destroying a borrowed child.
+struct child_observation {
+    int configured_timeout = -1;
+    int64_t sqlite_timeout_before = -1;
+    int64_t sqlite_timeout_after = -1;
+    bool idle_before = false;
+    bool idle_after = false;
+    bool began = false;
+    std::string begin_error;
+};
+
+child_observation observe_child(lattice::lattice_db& parent, bool attempt_begin) {
+    child_observation result;
+    size_t children = 0;
+    lattice::instance_registry::instance().for_each_alive(parent.config().path,
+        [&](lattice::lattice_db* actual) {
+            if (actual == &parent) return;
+            ++children;
+            require(children == 1, "fixture must have exactly one dedicated child per path");
+            require(actual->config().path == parent.config().path,
+                    "dedicated child must use the actual parent store");
+            require(!actual->config().is_sync_enabled() && !actual->config().is_ipc_enabled(),
+                    "dedicated child must not recursively configure transports");
+            const auto worker = actual->get_scheduler();
+            require(dynamic_cast<lattice::std_thread_scheduler*>(worker.get()) != nullptr &&
+                    worker->can_invoke(), "dedicated child must retain its real worker");
+            std::mutex mutex;
+            std::condition_variable completed;
+            bool done = false;
+            std::exception_ptr failure;
+            worker->invoke([&, actual] {
+                try {
+                    result.configured_timeout = actual->config().busy_timeout_ms;
+                    auto timeout = [&] {
+                        const auto rows = actual->db().query("PRAGMA busy_timeout");
+                        require(rows.size() == 1 && rows[0].size() == 1,
+                                "actual busy_timeout PRAGMA must return one scalar");
+                        const auto* value = std::get_if<int64_t>(&rows[0].begin()->second);
+                        require(value != nullptr, "actual busy_timeout must be an integer");
+                        return *value;
+                    };
+                    result.sqlite_timeout_before = timeout();
+                    result.idle_before = !actual->db().is_in_transaction();
+                    require(result.idle_before, "child must be idle before BEGIN probe");
+                    if (attempt_begin) {
+                        try {
+                            actual->db().begin_transaction();
+                            result.began = true;
+                        } catch (const lattice::db_error& error) {
+                            result.begin_error = error.what(); // before diagnostics/other SQL
+                        }
+                        if (result.began) actual->db().rollback();
+                    }
+                    result.idle_after = !actual->db().is_in_transaction();
+                    result.sqlite_timeout_after = timeout();
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    done = true;
+                    completed.notify_one();
+                }
+            });
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!completed.wait_for(lock, std::chrono::seconds(5), [&] { return done; })) {
+                std::fputs("sync child worker ending unknown\n", stderr);
+                std::fflush(stderr);
+                _exit(3);
+            }
+            if (failure) std::rethrow_exception(failure);
+        });
+    require(children == 1, "automatic setup must construct an actual dedicated child");
+    return result;
+}
+
+void require_timeout(const child_observation& actual) {
+    require(actual.configured_timeout == parent_timeout_ms,
+            "dedicated child configuration lost the parent's 2000ms timeout");
+    require(actual.sqlite_timeout_before == parent_timeout_ms &&
+            actual.sqlite_timeout_after == parent_timeout_ms,
+            "actual child connection lost or failed to restore the 2000ms busy handler");
+    require(actual.idle_before && actual.idle_after,
+            "probe must leave the actual child outside any transaction");
+}
+
+void wss_child_timeout_and_blocked_begin() {
+    network_factory_restore network;
+    TempDB file("sync-timeout-wss");
+    const auto lock_path = file.str() + ".sync.lock";
+    require(!std::filesystem::exists(lock_path), "fixture lock must be fresh");
+    owned_path_cleanup lock_cleanup{lock_path};
+    lattice::configuration config(file.str(), "ws://mock.invalid/timeout", "test-token");
+    config.busy_timeout_ms = parent_timeout_ms;
+    config.tuning.checkpoint_passive_interval_ms = 60000;
+    lattice::lattice_db parent(config); // automatic WSS setup creates the child
+    require(parent.is_sync_connected(), "mock WSS must actually connect");
+    parent.disconnect_sync(); // no mock transport work may join the BEGIN probe
+    require(!parent.is_sync_connected(), "mock WSS must disconnect before probe");
+    require_timeout(observe_child(parent, false));
+
+    lattice::database holder(file.str(), lattice::database::open_mode::read_write,
+                             parent_timeout_ms);
+    lattice::transaction held(holder); // genuine independent BEGIN IMMEDIATE
+    const auto blocked = observe_child(parent, true);
+    require_timeout(blocked);
+    require(!blocked.began &&
+            blocked.begin_error.find("Failed to begin transaction: database is locked") !=
+                std::string::npos,
+            "actual child BEGIN must fail while the other connection owns the writer");
+    require(holder.is_in_transaction(), "failed child BEGIN must not end the holder");
+    held.rollback();
+    const auto retried = observe_child(parent, true);
+    require_timeout(retried);
+    require(retried.began && retried.begin_error.empty(),
+            "same actual child must acquire and roll back after holder release");
+    parent.close();
+}
+
+void ipc_children_inherit_timeout() {
+    network_factory_restore network;
+    TempDB source_file("sync-timeout-source");
+    TempDB target_file("sync-timeout-target");
+    const std::string channel = "child-timeout-" + std::to_string(::getpid());
+    const auto socket = std::filesystem::temp_directory_path() /
+        ("ct-" + std::to_string(::getpid()) + ".sock");
+    const auto socket_lock = socket.string() + ".lock";
+    require(socket.is_absolute() && socket.string().size() < 104,
+            "set TMPDIR to a short isolated directory for portable Unix socket paths");
+    require(!std::filesystem::exists(socket) && !std::filesystem::exists(socket_lock),
+            "IPC socket and lock must be fresh fixture-owned paths");
+    owned_path_cleanup socket_cleanup{socket};
+    owned_path_cleanup lock_cleanup{socket_lock};
+    lattice::configuration source_config(source_file.str());
+    source_config.busy_timeout_ms = parent_timeout_ms;
+    source_config.tuning.checkpoint_passive_interval_ms = 60000;
+    source_config.ipc_targets.push_back({channel, std::nullopt, socket.string()});
+    lattice::configuration target_config(target_file.str());
+    target_config.busy_timeout_ms = parent_timeout_ms;
+    target_config.tuning.checkpoint_passive_interval_ms = 60000;
+    target_config.ipc_targets.push_back({channel, std::nullopt, socket.string()});
+    lattice::lattice_db source(source_config); // actual server endpoint
+    lattice::lattice_db target(target_config); // actual client/probe connection
+    const auto sent = source.add(TestPerson{"child-timeout-delivered", 37, std::nullopt});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool delivered = false;
+    do {
+        const auto rows = target.objects<TestPerson>();
+        delivered = rows.size() == 1 && rows[0].name.detach() == "child-timeout-delivered" &&
+                    rows[0].age.detach() == 37 && rows[0].global_id() == sent.global_id();
+        if (delivered) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    require(delivered, "real IPC must deliver the exact source row before child inspection");
+    require_timeout(observe_child(source, false));
+    require_timeout(observe_child(target, false));
+    target.close();
+    source.close();
+}
+} // namespace sync_child_timeout_regressions
+
+TEST(SyncChildTimeout, WSSActualChildInheritsBusyHandlerAndFiniteBeginBudget) {
+    bounded_mock_case(sync_child_timeout_regressions::wss_child_timeout_and_blocked_begin);
+}
+
+TEST(SyncChildTimeout, RealIPCBothActualChildrenInheritBusyHandler) {
+    bounded_mock_case(sync_child_timeout_regressions::ipc_children_inherit_timeout);
+}
+#endif

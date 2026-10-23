@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.2.7] - 2026-10-22
+
+### Fixed
+- Keep complete vector indexes readable after unrelated schema changes while
+  another connection holds the writer lock. Validate index identity, triggers,
+  and missing rows before caching a bounded readiness proof; incomplete indexes
+  still require repair and report failures for retry.
+- Invalidate read-only readiness proofs after another connection commits, so a
+  removed vector row cannot remain hidden by an earlier successful check.
+- Preserve the configured busy timeout in the independently owned WSS and IPC
+  sync workers, including their retry behavior after writer contention.
+
+### Compatibility
+- No persistent schema, sync wire format, or public API signature changes.
+  Rebuild Core and generated C++/Swift bridge consumers together.
+
 ## [2.2.6] - 2026-10-22
 
 ### Fixed

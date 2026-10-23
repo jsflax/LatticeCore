@@ -4922,6 +4922,21 @@ private:
     bool vec0_initialization_unsettled_ = false; // guarded by the actual vec0 serialization scope
     enum class vec0_initialization_mode { complete_main, artifacts_for_rebuild };
 
+    // A schema change elsewhere in the store must not turn a complete vector
+    // read into a writer. Retain only bounded, owner-local proofs from settled
+    // autocommit reads. Caller transactions never consume or publish these:
+    // their schema cookies and repaired rows can both disappear on rollback.
+    struct vec0_readiness_proof {
+        std::array<char, 128> family{};
+        size_t family_size = 0;
+        int64_t schema_cookie = -1;
+        int64_t marker_cookie = -1;
+        int64_t data_version = -1;
+    };
+    std::array<vec0_readiness_proof, 8> vec0_readiness_proofs_{};
+    size_t next_vec0_readiness_proof_ = 0;
+    std::weak_ptr<database> vec0_readiness_owner_;
+
     struct vec0_maintenance_frame {
         sqlite3* connection;
         vec0_maintenance_frame* previous;
@@ -5023,6 +5038,13 @@ private:
                                 int ivf_nlist, int ivf_nprobe,
                                 vec0_initialization_mode mode) {
         with_vec0_serialization("ensure", true, [&] {
+            // Compare ownership identities without acquiring another strong
+            // reference or relying on a potentially reused raw address.
+            if (vec0_readiness_owner_.owner_before(db_) || db_.owner_before(vec0_readiness_owner_)) {
+                vec0_readiness_proofs_ = {};
+                next_vec0_readiness_proof_ = 0;
+                vec0_readiness_owner_ = db_;
+            }
             const auto dot = model_table.find('.');
             const std::string bare_table = dot == std::string::npos
                 ? model_table : model_table.substr(dot + 1);
@@ -5090,6 +5112,22 @@ private:
                 }
                 return true;
             };
+            const auto read_data_version = [&]() -> int64_t {
+                // Historical readonly owners audit gaps whenever their marker
+                // is stale. Another connection can delete a vector without
+                // changing the schema, marker, or trigger programs. Retain that
+                // check across external commits while caching unchanged reads.
+                if (!config_.read_only) return -1;
+                const auto rows = db_->query("PRAGMA main.data_version");
+                if (rows.size() != 1) throw db_error("vec0 readiness data version missing");
+                const auto found = rows[0].find("data_version");
+                if (found == rows[0].end() || !std::holds_alternative<int64_t>(found->second))
+                    throw db_error("vec0 readiness data version invalid");
+                return std::get<int64_t>(found->second);
+            };
+            const auto gap_select = "SELECT m.globalId,m." + column + " FROM " + model +
+                " AS m LEFT JOIN main." + quote(vec_table + "_rowids") + " AS r ON r.id=m.globalId "
+                "WHERE m." + column + " IS NOT NULL AND length(m." + column + ")>0 AND r.id IS NULL";
             const auto initialized = [&] {
                 if (!exists()) return false;
                 const auto rows = db_->query("SELECT value FROM main._lattice_meta WHERE key=? LIMIT 2", {marker_key});
@@ -5103,11 +5141,48 @@ private:
                     !std::all_of(value.begin(), value.end(), [](char byte) { return byte >= '0' && byte <= '9'; }) ||
                     std::stoll(value) > std::numeric_limits<int32_t>::max())
                     throw db_error("vec0 initialization marker malformed");
-                return value == std::to_string(cookie()) && programs_current();
+                const auto observed_cookie = cookie();
+                if (!programs_current()) return false;
+                if (value == std::to_string(observed_cookie)) return true;
+                if (mode != vec0_initialization_mode::complete_main) return false;
+
+                const auto marker_cookie = std::stoll(value);
+                if (value != std::to_string(marker_cookie) || marker_cookie > observed_cookie) return false;
+                const auto observed_data_version = read_data_version();
+                const auto settled_connection = [&] {
+                    // Autocommit can still be true inside an unfinished
+                    // implicit statement (including a reentrant callback).
+                    return !db_->is_in_transaction() &&
+                        sqlite3_txn_state(db_->handle(), "main") == SQLITE_TXN_NONE;
+                };
+                const bool cacheable = settled_connection() &&
+                    vec_table.size() <= vec0_readiness_proofs_[0].family.size();
+                if (cacheable) {
+                    for (const auto& proof : vec0_readiness_proofs_) {
+                        if (proof.schema_cookie == observed_cookie && proof.marker_cookie == marker_cookie &&
+                            proof.data_version == observed_data_version &&
+                            proof.family_size == vec_table.size() &&
+                            std::equal(vec_table.begin(), vec_table.end(), proof.family.begin()))
+                            return cookie() == observed_cookie && read_data_version() == observed_data_version;
+                    }
+                }
+                // A stale global cookie alone is not evidence of missing
+                // vector rows. Validate exact identities before requesting a
+                // write; genuinely incomplete indices still take the original
+                // transactional repair path below.
+                if (!db_->query(gap_select + " LIMIT 1").empty() || cookie() != observed_cookie ||
+                    read_data_version() != observed_data_version) return false;
+                if (cacheable && settled_connection()) {
+                    auto& proof = vec0_readiness_proofs_[next_vec0_readiness_proof_];
+                    proof.family_size = vec_table.size();
+                    std::copy(vec_table.begin(), vec_table.end(), proof.family.begin());
+                    proof.schema_cookie = observed_cookie;
+                    proof.marker_cookie = marker_cookie;
+                    proof.data_version = observed_data_version;
+                    next_vec0_readiness_proof_ = (next_vec0_readiness_proof_ + 1) % vec0_readiness_proofs_.size();
+                }
+                return true;
             };
-            const auto gap_select = "SELECT m.globalId,m." + column + " FROM " + model +
-                " AS m LEFT JOIN main." + quote(vec_table + "_rowids") + " AS r ON r.id=m.globalId "
-                "WHERE m." + column + " IS NOT NULL AND length(m." + column + ")>0 AND r.id IS NULL";
             if (initialized()) return; // O(1); no model scan on hot add/query
             if (config_.read_only) {
                 // Preserve complete historical read-only indices without

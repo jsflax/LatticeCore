@@ -747,3 +747,39 @@ TEST(WarmVectorReadiness, NoncanonicalAndFutureMarkersRetainWritableRepair) {
         initialization_expect_marker(db.db());
     }
 }
+
+TEST(WarmVectorReadiness, ReadOnlyProofInvalidatesAfterAnotherOwnersVectorDeletion) {
+    TempDB path{"warm_vec_readonly_external_delete"};
+    lattice::lattice_db writer(path.str());
+    create_memory_fixture(writer);
+    writer.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    const auto marker = writer.db().query("SELECT value FROM _lattice_meta WHERE key=?", {initialization_marker});
+    writer.db().execute("CREATE TABLE UnrelatedBeforeReadonlyProof(value INTEGER)");
+    lattice::configuration config(path.str());
+    config.read_only = true;
+    lattice::lattice_db reader(config);
+    ASSERT_NO_THROW(reader.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+    const auto cookie = initialization_scalar(reader.db(), "PRAGMA main.schema_version");
+    const auto version = initialization_scalar(reader.db(), "PRAGMA main.data_version");
+    {
+        initialization_authorizer hot(reader.db());
+        hot.deny = [](int action, const char* first, const char*) {
+            return action == SQLITE_TRANSACTION || action == SQLITE_SAVEPOINT ||
+                (action == SQLITE_READ && first && std::string(first) == "MaintenanceDoc");
+        };
+        EXPECT_NO_THROW(reader.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+        EXPECT_EQ(hot.denied, 0) << "an unchanged readonly proof should avoid repeated gap scans";
+    }
+    writer.delete_vec0("MaintenanceDoc", "embedding", "two");
+    initialization_expect_ids(writer.db(), {"one"});
+    ASSERT_EQ(initialization_scalar(reader.db(), "SELECT COUNT(*) FROM MaintenanceDoc"), 2);
+    ASSERT_EQ(initialization_scalar(reader.db(), "PRAGMA main.schema_version"), cookie);
+    ASSERT_NE(initialization_scalar(reader.db(), "PRAGMA main.data_version"), version);
+    ASSERT_EQ(reader.db().query("SELECT value FROM _lattice_meta WHERE key=?", {initialization_marker}), marker);
+    EXPECT_THROW(reader.ensure_vec0_table("MaintenanceDoc", "embedding", 4), lattice::db_error);
+    EXPECT_FALSE(reader.db().is_in_transaction());
+    writer.upsert_vec0("MaintenanceDoc", "embedding", "two", pack_floats({0, 1, 0, 0}));
+    initialization_expect_ids(writer.db(), {"one", "two"});
+    EXPECT_NO_THROW(reader.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+    initialization_expect_ids(reader.db(), {"one", "two"});
+}

@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.2.8] - 2026-10-22
+
+### Fixed
+- Reject malformed sync deliveries before applying entries or sending ACKs, so
+  a dropped or invalid entry cannot be skipped by the download cursor.
+- Validate typed entries before duplicate and schema-skew ACK handling. An
+  invalid entry that reuses a valid ID cannot advance the cursor past itself.
+- Preserve supported schema-skew no-ops, legacy JSON-string field containers,
+  and valid neighboring entries in typed per-entry processing.
+
+### Compatibility
+- No persistent schema, wire-format layout, or public API signature changes.
+  Malformed wire frames now remain unapplied for corrected delivery and retry.
+  Rebuild Core and generated C++/Swift bridge consumers together.
+
 ## [2.2.7] - 2026-10-22
 
 ### Fixed

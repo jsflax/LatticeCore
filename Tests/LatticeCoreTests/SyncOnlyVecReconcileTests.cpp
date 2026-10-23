@@ -365,3 +365,114 @@ TEST(ColdCombinedVectorInitialization, FillFailureSurfacesErrorThenBothQueryShap
     }
 }
 #endif // __linux__
+
+
+#ifndef __linux__
+#include <cstdio>
+namespace {
+using warm_cookie_rows = std::vector<lattice::database::row_t>;
+// One read-only SELECT retains the cookie, marker and all three exact trigger
+// definitions together. This is metadata observation, never query priming.
+warm_cookie_rows warm_cookie_state(lattice::database& reader) {
+    return reader.query(
+        "WITH expected(name) AS (VALUES('_ReconDoc_embedding_vec_delete'),"
+        "('_ReconDoc_embedding_vec_insert'),('_ReconDoc_embedding_vec_update')) "
+        "SELECT p.schema_version AS schema_cookie,"
+        "(SELECT value FROM main._lattice_meta "
+        " WHERE key='vec0_initialized_v1:_ReconDoc_embedding_vec') AS marker,"
+        "e.name AS name,s.sql AS sql FROM pragma_schema_version AS p "
+        "CROSS JOIN expected AS e LEFT JOIN main.sqlite_schema AS s "
+        "ON s.type='trigger' AND s.name=e.name ORDER BY e.name");
+}
+void warm_cookie_print(const char* phase,const warm_cookie_rows& rows) {
+    for(const auto& row:rows) {
+        const auto text=[&](const char* key) {
+            const auto* value=std::get_if<std::string>(&row.at(key));
+            return value?value->c_str():"<NULL>";
+        };
+        std::fprintf(stderr,"[warm-cookie-probe] phase=%s cookie=%lld marker=%s trigger=%s sql=%s\n",
+            phase,static_cast<long long>(std::get<int64_t>(row.at("schema_cookie"))),
+            text("marker"),text("name"),text("sql"));
+    }
+    std::fflush(stderr);
+}
+int64_t warm_cookie_version(const warm_cookie_rows& state) {
+    return std::get<int64_t>(state.at(0).at("schema_cookie"));
+}
+std::string warm_cookie_marker(const warm_cookie_rows& state) {
+    return std::get<std::string>(state.at(0).at("marker"));
+}
+std::vector<std::pair<std::string,std::string>> warm_cookie_programs(const warm_cookie_rows& state) {
+    std::vector<std::pair<std::string,std::string>> result;
+    for(const auto& row:state)result.emplace_back(
+        std::get<std::string>(row.at("name")),std::get<std::string>(row.at("sql")));
+    return result;
+}
+}
+
+TEST(WarmCombinedVectorRead, UnrelatedCookieChangeMustNotRequireWriteAdmissionForExactWarmIndex) {
+    TempDB path{"warm_vector_cookie_contention"};
+    lattice::swift_configuration cfg(path.str());
+    cfg.busy_timeout_ms=2000; // Same finite budget as the original Engram hub fixture.
+    {
+        // Same public empty-schema lifecycle as quiescent_recon_fixture. The
+        // seed's owned reconcile future drains before any vector row exists.
+        lattice::swift_lattice seed(cfg,{recon_schema("ReconDoc")});
+    }
+    auto l=std::make_unique<lattice::swift_lattice>(cfg);
+    l->stop_audit_maintenance();
+    auto* notifier=lattice::instance_registry::instance().get_or_create_notifier(path.str());
+    ASSERT_NE(notifier,nullptr);
+    notifier->stop_listening();
+    lattice::database holder(path.str(),lattice::database::open_mode::read_write,2000);
+    lattice::database reader(path.str(),lattice::database::open_mode::read_only,2000);
+    raw_hydrate(*l,"ReconDoc","one delivered vector",{1,0,0,0});
+
+    // Exactly one initial nearest query establishes genuine public readiness.
+    const auto warm=l->combined_nearest_query("ReconDoc",{},cold_combined_vectors(),{},{},
+                                             std::nullopt,cold_combined_sort(),1);
+    const std::string warm_error=lattice::last_bridge_error(); // before any diagnostics/assertions
+    std::fprintf(stderr,"[warm-cookie-probe] phase=warm-return rows=%zu error=%s\n",warm.size(),warm_error.c_str());
+    std::fflush(stderr);
+    const auto initial=warm_cookie_state(reader);warm_cookie_print("warm",initial);
+    ASSERT_EQ(warm_error,"");ASSERT_EQ(warm.size(),1u);ASSERT_EQ(initial.size(),3u);
+    ASSERT_EQ(warm_cookie_marker(initial),std::to_string(warm_cookie_version(initial)));
+    const auto programs=warm_cookie_programs(initial);ASSERT_EQ(programs.size(),3u);
+
+    // Deliberately synthetic unrelated committed DDL. This proves only a
+    // conditional public issue; it is not the asserted cause of Engram's run.
+    holder.execute("CREATE TABLE WarmCookieUnrelated(id INTEGER PRIMARY KEY)");
+    const auto changed=warm_cookie_state(reader);warm_cookie_print("after-unrelated-ddl",changed);
+    ASSERT_NE(warm_cookie_version(changed),warm_cookie_version(initial));
+    ASSERT_EQ(warm_cookie_marker(changed),warm_cookie_marker(initial));
+    ASSERT_EQ(warm_cookie_programs(changed),programs);
+    {
+        lattice::transaction held(holder); // actual external BEGIN IMMEDIATE
+        EXPECT_TRUE(holder.is_in_transaction());
+        const auto acquired=warm_cookie_state(reader);warm_cookie_print("external-begin-acquired",acquired);
+        EXPECT_EQ(acquired,changed);
+        const auto rows=l->combined_nearest_query("ReconDoc",{},cold_combined_vectors(),{},{},
+                                                 std::nullopt,cold_combined_sort(),1);
+        const std::string error=lattice::last_bridge_error(); // immediate owned error, no extra nearest
+        std::fprintf(stderr,"[warm-cookie-probe] phase=held-query-return rows=%zu error=%s\n",rows.size(),error.c_str());
+        std::fflush(stderr);
+        const auto after=warm_cookie_state(reader);warm_cookie_print("held-query-return",after);
+        EXPECT_EQ(error,"")<<"An exact warm index should remain readable while another writer owns BEGIN";
+        EXPECT_EQ(rows.size(),1u);EXPECT_EQ(after,changed);
+        EXPECT_FALSE(l->db().is_in_transaction());
+        ASSERT_NO_THROW(held.rollback());
+    }
+    const auto released=warm_cookie_state(reader);warm_cookie_print("external-begin-released",released);
+    EXPECT_EQ(released,changed);
+    const auto retried=l->combined_nearest_query("ReconDoc",{},cold_combined_vectors(),{},{},
+                                                std::nullopt,cold_combined_sort(),1);
+    const std::string retry_error=lattice::last_bridge_error();
+    std::fprintf(stderr,"[warm-cookie-probe] phase=retry-return rows=%zu error=%s\n",retried.size(),retry_error.c_str());
+    std::fflush(stderr);
+    const auto recovered=warm_cookie_state(reader);warm_cookie_print("retry-return",recovered);
+    EXPECT_EQ(retry_error,"");EXPECT_EQ(retried.size(),1u);
+    EXPECT_EQ(warm_cookie_programs(recovered),programs);
+    // Marker/cookie after retry are retained as evidence, not a new requirement
+    // that a future read-only fix must rewrite the readiness marker.
+}
+#endif // __linux__

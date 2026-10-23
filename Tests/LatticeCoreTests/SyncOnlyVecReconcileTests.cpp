@@ -419,7 +419,7 @@ TEST(WarmCombinedVectorRead, UnrelatedCookieChangeMustNotRequireWriteAdmissionFo
         // seed's owned reconcile future drains before any vector row exists.
         lattice::swift_lattice seed(cfg,{recon_schema("ReconDoc")});
     }
-    auto l=std::make_unique<lattice::swift_lattice>(cfg);
+    auto l=std::make_unique<lattice::swift_lattice>(std::move(cfg));
     l->stop_audit_maintenance();
     auto* notifier=lattice::instance_registry::instance().get_or_create_notifier(path.str());
     ASSERT_NE(notifier,nullptr);

@@ -620,6 +620,7 @@ void lattice_db::setup_sync_if_configured() {
     std::string sync_path = resolve_path(config_);
     configuration sync_db_config(sync_path,
                                  std::make_shared<std_thread_scheduler>());
+    sync_db_config.busy_timeout_ms = config_.busy_timeout_ms;
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
     auto sync_db = std::make_unique<lattice_db>(sync_db_config);
@@ -750,6 +751,7 @@ void lattice_db::setup_ipc_if_configured() {
                 // Create dedicated lattice_db for this IPC synchronizer
                 configuration ipc_db_config(config_.path,
                                             std::make_shared<std_thread_scheduler>());
+                ipc_db_config.busy_timeout_ms = config_.busy_timeout_ms;
                 ipc_db_config.target_schema_version = config_.target_schema_version;
                 ipc_db_config.migration_block = config_.migration_block;
                 auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);

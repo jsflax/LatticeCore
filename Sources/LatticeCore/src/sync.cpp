@@ -394,6 +394,16 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
 // entries into a larger payload (server_sent_event::to_json) use it
 // directly instead of dump-then-reparse per entry.
 static json entry_to_json_obj(const audit_log_entry& e);
+
+// These are transport identities and the operations this receiver implements,
+// independent of local schema knowledge. Schema-skew no-ops are still valid.
+static bool remote_entry_envelope_valid(const audit_log_entry& entry) {
+    return !entry.global_id.empty() && !entry.table_name.empty() &&
+           !entry.global_row_id.empty() &&
+           (entry.operation == "INSERT" || entry.operation == "UPDATE" ||
+            entry.operation == "DELETE");
+}
+
 static std::optional<audit_log_entry> entry_from_parsed(const json& j);
 
 std::string audit_log_entry::to_json() const {
@@ -456,6 +466,7 @@ std::optional<audit_log_entry> audit_log_entry::from_json(const std::string& jso
 // time), which is pure overhead on the exact path catch-up hammers.
 static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
     try {
+        if (!j.is_object()) return std::nullopt;
         audit_log_entry entry;
 
         if (j.contains("id") && j["id"].is_number()) {
@@ -477,27 +488,43 @@ static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
             entry.global_row_id = j["globalRowId"].get<std::string>();
         }
 
-        // Parse changedFields - can be object or JSON string
-        if (j.contains("changedFields")) {
-            if (j["changedFields"].is_object()) {
-                for (auto& [key, value] : j["changedFields"].items()) {
-                    entry.changed_fields[key] = json_to_any_property(value);
-                }
-            } else if (j["changedFields"].is_string()) {
-                entry.changed_fields = audit_log_entry::parse_changed_fields(j["changedFields"].get<std::string>());
-            }
+        if ((entry.operation == "INSERT" || entry.operation == "UPDATE") &&
+            (!j.contains("changedFields") || !j.contains("changedFieldsNames"))) {
+            return std::nullopt;
         }
 
-        // Parse changedFieldsNames - can be array or JSON string
+        // Both wire spellings are supported, but malformed JSON or a wrong
+        // container/element type must not become an ACKable empty mutation.
+        // Decode already-parsed containers by reference (no dump/reparse).
+        auto fields = [&](const json& value) {
+            if (!value.is_object()) return false;
+            for (const auto& [key, item] : value.items()) {
+                entry.changed_fields[key] = json_to_any_property(item);
+            }
+            return true;
+        };
+        if (j.contains("changedFields")) {
+            const auto& value = j["changedFields"];
+            if (value.is_string()) {
+                if (!fields(json::parse(value.get<std::string>()))) return std::nullopt;
+            } else if (!fields(value)) {
+                return std::nullopt;
+            }
+        }
+        auto names = [&](const json& value) {
+            if (!value.is_array()) return false;
+            for (const auto& item : value) {
+                if (!item.is_string()) return false;
+                entry.changed_fields_names.push_back(item.get<std::string>());
+            }
+            return true;
+        };
         if (j.contains("changedFieldsNames")) {
-            if (j["changedFieldsNames"].is_array()) {
-                for (const auto& item : j["changedFieldsNames"]) {
-                    if (item.is_string()) {
-                        entry.changed_fields_names.push_back(item.get<std::string>());
-                    }
-                }
-            } else if (j["changedFieldsNames"].is_string()) {
-                entry.changed_fields_names = audit_log_entry::parse_changed_fields_names(j["changedFieldsNames"].get<std::string>());
+            const auto& value = j["changedFieldsNames"];
+            if (value.is_string()) {
+                if (!names(json::parse(value.get<std::string>()))) return std::nullopt;
+            } else if (!names(value)) {
+                return std::nullopt;
             }
         }
 
@@ -514,6 +541,7 @@ static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
             entry.synthesized = j["synthesized"].get<bool>();
         }
 
+        if (!remote_entry_envelope_valid(entry)) return std::nullopt;
         return entry;
     } catch (...) {
         return std::nullopt;
@@ -559,9 +587,10 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
                 // Parse once: the sub-object is already parsed — dumping it
                 // back to a string re-parsed every entry a second time.
                 auto entry = entry_from_parsed(entry_json);
-                if (entry) {
-                    event.audit_logs.push_back(*entry);
-                }
+                // Dropping a bad position would let the resume cursor pass
+                // it. Reject this entire delivery before any apply or ACK.
+                if (!entry) return std::nullopt;
+                event.audit_logs.push_back(std::move(*entry));
             }
             return event;
 
@@ -3546,6 +3575,12 @@ static std::vector<std::string> apply_remote_changes_impl(
                 // committed chunks were never reported (the B-2 pathology at
                 // chunk granularity).
                 try {
+                    // Typed Core callers bypass wire decoding. Reject invalid
+                    // envelopes before dedup and schema-skew ACK shortcuts.
+                    if (!remote_entry_envelope_valid(entry)) {
+                        LOG_WARN("apply_remote", "invalid entry envelope at position %zu; not ACKing", i);
+                        continue;
+                    }
                     // Re-check inside transaction (entry may have been inserted
                     // concurrently). A hit in EITHER AuditLog or the receipts
                     // table means already-applied: ack and move on.
@@ -3877,7 +3912,10 @@ static std::vector<std::string> apply_remote_changes_impl(
                     chunk_acked.insert(applied_ids[k]);
                 }
                 for (size_t k = chunk_start; k < chunk_end; ++k) {
-                    if (!chunk_acked.count(entries[k].global_id)) {
+                    // An invalid typed entry may reuse an earlier valid ID;
+                    // set membership alone is not proof of this position.
+                    if (!remote_entry_envelope_valid(entries[k]) ||
+                        !chunk_acked.count(entries[k].global_id)) {
                         cursor_halted = true;
                         break;
                     }

@@ -551,3 +551,199 @@ TEST(ColdVectorInitialization, ExistingPartialIndexRollbackPreservesCallerAndSam
     initialization_expect_ids(db.db(), {"one", "two"});
     initialization_expect_marker(db.db());
 }
+
+TEST(WarmVectorReadiness, UnrelatedSchemaChangeNeedsOneReadAuditAndNoWriteOrRepeatedScan) {
+    lattice::lattice_db db;
+    create_memory_fixture(db);
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    const auto marker = db.db().query("SELECT value FROM _lattice_meta WHERE key=?", {initialization_marker});
+    db.db().execute("CREATE TABLE UnrelatedWarmReadiness(value INTEGER)");
+    int main_reads = 0;
+    const auto write_action = [](int action) {
+        return action == SQLITE_TRANSACTION || action == SQLITE_SAVEPOINT || action == SQLITE_INSERT ||
+            action == SQLITE_UPDATE || action == SQLITE_DELETE || action == SQLITE_CREATE_TRIGGER ||
+            action == SQLITE_DROP_TRIGGER || action == SQLITE_CREATE_VTABLE;
+    };
+    {
+        initialization_authorizer audit(db.db());
+        audit.deny = [&](int action, const char* first, const char*) {
+            if (action == SQLITE_READ && first && std::string(first) == "MaintenanceDoc") ++main_reads;
+            return write_action(action);
+        };
+        EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+        EXPECT_EQ(audit.denied, 0);
+        EXPECT_GT(main_reads, 0) << "the first stale-cookie proof must inspect actual main identities";
+    }
+    // Changing SQLite's authorizer invalidates prepared statements. A hidden
+    // repeat of the gap SELECT cannot evade this witness through statement caching.
+    {
+        initialization_authorizer hot(db.db());
+        hot.deny = [&](int action, const char* first, const char*) {
+            return write_action(action) ||
+                (action == SQLITE_READ && first && std::string(first) == "MaintenanceDoc");
+        };
+        for (int repeat = 0; repeat < 3; ++repeat)
+            EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+        EXPECT_EQ(hot.denied, 0);
+    }
+    EXPECT_EQ(db.db().query("SELECT value FROM _lattice_meta WHERE key=?", {initialization_marker}), marker);
+    EXPECT_FALSE(db.db().is_in_transaction());
+    initialization_expect_ids(db.db(), {"one", "two"});
+}
+
+TEST(WarmVectorReadiness, RestoredExactTriggerCannotHideAMissingIdentityBehindAnOldProof) {
+    lattice::lattice_db db;
+    create_memory_fixture(db);
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    db.db().execute("CREATE TABLE UnrelatedBeforeTriggerRepair(value INTEGER)");
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    const auto trigger = db.db().query("SELECT sql FROM sqlite_schema WHERE name='_MaintenanceDoc_embedding_vec_update'");
+    ASSERT_EQ(trigger.size(), 1u);
+    const auto program = std::get<std::string>(trigger[0].at("sql"));
+    db.db().execute("DROP TRIGGER _MaintenanceDoc_embedding_vec_update");
+    db.db().execute("DELETE FROM _MaintenanceDoc_embedding_vec WHERE global_id='two'");
+    db.db().execute(program);
+    {
+        initialization_authorizer deny_repair(db.db());
+        deny_repair.deny = [](int action, const char* first, const char*) {
+            return action == SQLITE_TRANSACTION && first && std::string(first) == "BEGIN";
+        };
+        EXPECT_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4), lattice::db_error);
+        EXPECT_GT(deny_repair.denied, 0) << "the missing identity must require real write admission";
+    }
+    EXPECT_FALSE(db.db().is_in_transaction());
+    initialization_expect_ids(db.db(), {"one"});
+    EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+    initialization_expect_ids(db.db(), {"one", "two"});
+    initialization_expect_marker(db.db());
+}
+
+TEST(WarmVectorReadiness, CallerRollbackCannotPublishATemporaryCompletenessProof) {
+    lattice::lattice_db db;
+    create_memory_fixture(db);
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    db.db().execute("DELETE FROM _MaintenanceDoc_embedding_vec WHERE global_id='two'");
+    db.db().execute("CREATE TABLE UnrelatedBeforeProofRollback(value INTEGER)");
+    const auto cookie = initialization_scalar(db.db(), "PRAGMA main.schema_version");
+    db.db().begin_transaction();
+    db.db().execute("INSERT INTO _MaintenanceDoc_embedding_vec(global_id,embedding) "
+                    "SELECT globalId,embedding FROM MaintenanceDoc WHERE globalId='two'");
+    EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+    EXPECT_TRUE(db.db().is_in_transaction());
+    initialization_expect_ids(db.db(), {"one", "two"});
+    db.db().rollback();
+    EXPECT_EQ(initialization_scalar(db.db(), "PRAGMA main.schema_version"), cookie);
+    initialization_expect_ids(db.db(), {"one"});
+    EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+    initialization_expect_ids(db.db(), {"one", "two"});
+    initialization_expect_marker(db.db());
+}
+
+TEST(WarmVectorReadiness, BoundedProofEvictionAndLongNamesFallBackToReadAudits) {
+    lattice::lattice_db db;
+    create_memory_fixture(db);
+    std::vector<std::string> families;
+    for (int i = 0; i < 9; ++i) {
+        const auto name = "extra" + std::to_string(i);
+        db.db().execute("ALTER TABLE MaintenanceDoc ADD COLUMN " + name + " BLOB");
+        db.db().execute("UPDATE MaintenanceDoc SET " + name + "=embedding");
+        families.push_back(name);
+    }
+    const std::string long_name(160, 'x');
+    db.db().execute("ALTER TABLE MaintenanceDoc ADD COLUMN " + long_name + " BLOB");
+    db.db().execute("UPDATE MaintenanceDoc SET " + long_name + "=embedding");
+    for (const auto& column : families) db.ensure_vec0_table("MaintenanceDoc", column, 4);
+    db.ensure_vec0_table("MaintenanceDoc", long_name, 4);
+    db.db().execute("CREATE TABLE UnrelatedBeforeProofEviction(value INTEGER)");
+    for (const auto& column : families) db.ensure_vec0_table("MaintenanceDoc", column, 4);
+    for (const auto& column : std::vector<std::string>{families.front(), long_name, long_name}) {
+        int main_reads = 0;
+        initialization_authorizer audit(db.db());
+        audit.deny = [&](int action, const char* first, const char*) {
+            if (action == SQLITE_READ && first && std::string(first) == "MaintenanceDoc") ++main_reads;
+            return action == SQLITE_TRANSACTION || action == SQLITE_SAVEPOINT || action == SQLITE_INSERT ||
+                action == SQLITE_UPDATE || action == SQLITE_DELETE;
+        };
+        EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", column, 4));
+        EXPECT_GT(main_reads, 0) << "evicted or oversized names must be checked without growing the cache";
+        EXPECT_EQ(audit.denied, 0);
+    }
+}
+
+TEST(WarmVectorReadiness, LiveImplicitReadCannotConsumeAnAutocommitProof) {
+    lattice::lattice_db db;
+    create_memory_fixture(db);
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    db.db().execute("CREATE TABLE UnrelatedBeforeImplicitRead(value INTEGER)");
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    sqlite3_stmt* raw = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db.db().handle(), "SELECT globalId FROM MaintenanceDoc", -1, &raw, nullptr), SQLITE_OK);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> held(raw, &sqlite3_finalize);
+    ASSERT_EQ(sqlite3_step(held.get()), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_get_autocommit(db.db().handle()), 1);
+    ASSERT_EQ(sqlite3_txn_state(db.db().handle(), "main"), SQLITE_TXN_READ);
+    {
+        initialization_authorizer implicit(db.db());
+        implicit.deny = [](int action, const char* first, const char*) {
+            return action == SQLITE_READ && first && std::string(first) == "MaintenanceDoc";
+        };
+        EXPECT_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4), lattice::db_error);
+        EXPECT_GT(implicit.denied, 0) << "an unfinished implicit statement must not consume the settled proof";
+    }
+    held.reset();
+    ASSERT_EQ(sqlite3_txn_state(db.db().handle(), "main"), SQLITE_TXN_NONE);
+    {
+        initialization_authorizer settled(db.db());
+        settled.deny = [](int action, const char* first, const char*) {
+            return action == SQLITE_READ && first && std::string(first) == "MaintenanceDoc";
+        };
+        EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+        EXPECT_EQ(settled.denied, 0);
+    }
+}
+
+TEST(WarmVectorReadiness, ReopenedWriterDoesNotInheritTheRetiredConnectionsProof) {
+    TempDB path{"warm_vec_reopened_writer"};
+    lattice::lattice_db db(path.str());
+    db.stop_audit_maintenance();
+    auto* notifier = lattice::instance_registry::instance().get_or_create_notifier(path.str());
+    ASSERT_NE(notifier, nullptr);
+    notifier->stop_listening();
+    create_memory_fixture(db);
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    db.db().execute("CREATE TABLE UnrelatedBeforeWriterReplacement(value INTEGER)");
+    db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+    const auto cookie = initialization_scalar(db.db(), "PRAGMA main.schema_version");
+    db.close_read_db();
+    auto retired = db.borrow_read_connection();
+    db.db().execute("DELETE FROM _MaintenanceDoc_embedding_vec WHERE global_id='two'");
+    db.close_write_db();
+    db.reopen_write_db();
+    ASSERT_NE(&db.db(), retired.get());
+    ASSERT_EQ(initialization_scalar(db.db(), "PRAGMA main.schema_version"), cookie);
+    initialization_expect_ids(db.db(), {"one"});
+    EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+    initialization_expect_ids(db.db(), {"one", "two"});
+    initialization_expect_marker(db.db());
+}
+
+TEST(WarmVectorReadiness, NoncanonicalAndFutureMarkersRetainWritableRepair) {
+    for (const bool future : {false, true}) {
+        lattice::lattice_db db;
+        create_memory_fixture(db);
+        db.ensure_vec0_table("MaintenanceDoc", "embedding", 4);
+        const auto cookie = initialization_scalar(db.db(), "PRAGMA main.schema_version");
+        const auto value = future ? std::to_string(cookie + 1) : "0" + std::to_string(cookie);
+        db.db().execute("UPDATE _lattice_meta SET value=? WHERE key=?", {value, initialization_marker});
+        {
+            initialization_authorizer deny_repair(db.db());
+            deny_repair.deny = [](int action, const char* first, const char*) {
+                return action == SQLITE_TRANSACTION && first && std::string(first) == "BEGIN";
+            };
+            EXPECT_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4), lattice::db_error);
+            EXPECT_GT(deny_repair.denied, 0);
+        }
+        EXPECT_NO_THROW(db.ensure_vec0_table("MaintenanceDoc", "embedding", 4));
+        initialization_expect_marker(db.db());
+    }
+}

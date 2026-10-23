@@ -869,7 +869,7 @@ std::string replace_once(std::string input, const std::string& from, const std::
     input.replace(at, from.size(), to);
     return input;
 }
-std::string quoted(const std::string& text) {
+std::string quote_wire_string(const std::string& text) {
     std::string result = "\"";
     for (unsigned char c : text) {
         require(c >= 0x20, "wire fixture strings contain no control characters");
@@ -1013,15 +1013,15 @@ TEST(AuditHygiene, MalformedWirePositionRejectsWholeFrameWithoutAckOrCursorLeapA
         const auto fields_member = "\"changedFields\":" + entries[1].changed_fields_to_json();
         std::string bad;
         switch (variant) {
-            case 0: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quoted("[")); break;
+            case 0: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quote_wire_string("[")); break;
             case 1: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":{}"); break;
             case 2: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":[\"name\",17]"); break;
-            case 3: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quoted("{}")); break;
-            case 4: bad = replace_once(valid_middle, fields_member, "\"changedFields\":" + quoted("{")); break;
+            case 3: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quote_wire_string("{}")); break;
+            case 4: bad = replace_once(valid_middle, fields_member, "\"changedFields\":" + quote_wire_string("{")); break;
             case 5: bad = replace_once(valid_middle, fields_member, "\"changedFields\":[]"); break;
             case 6: bad = replace_once(valid_middle, "\"operation\":\"UPDATE\"", "\"operation\":\"MERGE\""); break;
             case 7: bad = "null"; break;
-            case 8: bad = replace_once(valid_middle, "\"globalId\":" + quoted(entries[1].global_id), "\"globalId\":17"); break;
+            case 8: bad = replace_once(valid_middle, "\"globalId\":" + quote_wire_string(entries[1].global_id), "\"globalId\":17"); break;
             case 9: bad = replace_once(valid_middle, names_member + ",", ""); break;
             default: bad = replace_once(valid_middle, fields_member + ",", ""); break;
         }
@@ -1102,9 +1102,9 @@ TEST(AuditHygiene, ValidWireSchemaSkewAndJsonStringContainersStillAckAndAdvanceC
     for (const auto& entry : entries) {
         auto json = entry.to_json();
         json = replace_once(json, "\"changedFields\":" + entry.changed_fields_to_json(),
-                            "\"changedFields\":" + quoted(entry.changed_fields_to_json()));
+                            "\"changedFields\":" + quote_wire_string(entry.changed_fields_to_json()));
         json = replace_once(json, "\"changedFieldsNames\":" + entry.changed_fields_names_to_json(),
-                            "\"changedFieldsNames\":" + quoted(entry.changed_fields_names_to_json()));
+                            "\"changedFieldsNames\":" + quote_wire_string(entry.changed_fields_names_to_json()));
         encoded.push_back(std::move(json));
     }
     auto transport = std::make_unique<lattice::mock_sync_transport>();

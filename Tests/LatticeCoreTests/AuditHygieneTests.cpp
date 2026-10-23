@@ -855,3 +855,326 @@ TEST(AuditHygiene, NestedObserverApplyCannotClearTheOuterApplyFlag) {
     EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
     EXPECT_EQ(sqlite3_get_autocommit(db.db().handle()), 1);
 }
+
+// Malformed wire positions must remain barriers, not become ACKable empty
+// mutations or disappear before contiguous resume-cursor accounting.
+namespace malformed_audit_ack {
+void require(bool value, const char* message) {
+    if (!value) throw std::runtime_error(message);
+}
+std::string replace_once(std::string input, const std::string& from, const std::string& to) {
+    const auto at = input.find(from);
+    require(at != std::string::npos && input.find(from, at + from.size()) == std::string::npos,
+            "wire fixture replacement must address exactly one serialized member");
+    input.replace(at, from.size(), to);
+    return input;
+}
+std::string quoted(const std::string& text) {
+    std::string result = "\"";
+    for (unsigned char c : text) {
+        require(c >= 0x20, "wire fixture strings contain no control characters");
+        if (c == '\\' || c == '"') result += '\\';
+        result += static_cast<char>(c);
+    }
+    return result + '"';
+}
+std::string frame(const std::vector<std::string>& entries) {
+    std::string result = "{\"kind\":\"auditLog\",\"auditLog\":[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i) result += ',';
+        result += entries[i];
+    }
+    return result + "]}";
+}
+std::string frame(const std::vector<lattice::audit_log_entry>& entries) {
+    std::vector<std::string> encoded;
+    for (const auto& entry : entries) encoded.push_back(entry.to_json());
+    return frame(encoded);
+}
+void initialize(lattice::lattice_db& db) {
+    lattice::register_replication_slot(db.db(), "malformed-chan");
+    lattice::ensure_cursor_column(db.db());
+    db.db().execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts (globalId TEXT PRIMARY KEY)");
+    db.db().execute("UPDATE _lattice_replication_slots SET last_received_event_id='sentinel-before-frame' "
+                    "WHERE sync_id='malformed-chan'");
+}
+std::string cursor(lattice::lattice_db& db) {
+    const auto rows = db.db().query("SELECT last_received_event_id AS value FROM "
+                                    "_lattice_replication_slots WHERE sync_id='malformed-chan'");
+    require(rows.size() == 1, "actual receiving slot must exist");
+    return std::get<std::string>(rows[0].at("value"));
+}
+void expect_same(const ApplyPreambleSnapshot& before, const ApplyPreambleSnapshot& after) {
+    EXPECT_EQ(after.persons, before.persons);
+    EXPECT_EQ(after.audit, before.audit);
+    EXPECT_EQ(after.sync_state, before.sync_state);
+    EXPECT_EQ(after.slots, before.slots);
+    EXPECT_EQ(after.sync_control, before.sync_control);
+}
+
+#ifndef __EMSCRIPTEN__
+// Drive the actual synchronizer's existing scheduled work explicitly. This
+// adds no worker/timer or SQL. Closing admission discards tasks before the
+// synchronizer can die, including on a fatal assertion.
+class wire_queue final : public lattice::scheduler {
+    const std::thread::id owner_ = std::this_thread::get_id();
+    mutable std::mutex mutex_;
+    std::queue<std::function<void()>> work_;
+    bool open_ = true;
+public:
+    void invoke(std::function<void()>&& work) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (open_) work_.push(std::move(work));
+    }
+    bool is_on_thread() const noexcept override { return owner_ == std::this_thread::get_id(); }
+    bool is_same_as(const lattice::scheduler* other) const noexcept override { return this == other; }
+    bool can_invoke() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return open_;
+    }
+    void drain() {
+        require(is_on_thread(), "wire fixture has one actual pump thread");
+        for (size_t count = 0; ; ++count) {
+            std::function<void()> work;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (work_.empty()) return;
+                require(count < 256, "unexpected wire fixture work loop");
+                work = std::move(work_.front());
+                work_.pop();
+            }
+            work();
+        }
+    }
+    void shutdown() override {
+        std::queue<std::function<void()>> discarded;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            open_ = false;
+            work_.swap(discarded);
+        }
+    }
+};
+struct queue_ending {
+    std::shared_ptr<wire_queue> queue;
+    ~queue_ending() { queue->shutdown(); }
+};
+// Settle the seeded local upload through the real protocol before taking any
+// baseline snapshot or clearing frames. send_entries can start an ACK watchdog
+// even with the pacer disabled; clearing the mock's frames does not ACK it.
+void settle_seed_upload(lattice::synchronizer_base& sync, lattice::mock_sync_transport& wire,
+                        wire_queue& queue) {
+    std::vector<std::string> ids;
+    for (const auto& message : wire.get_sent_messages()) {
+        const auto event = lattice::server_sent_event::from_json(message.as_string());
+        require(event.has_value(), "actual seeded upload must emit valid protocol frames");
+        if (event->event_type == lattice::server_sent_event::type::audit_log)
+            for (const auto& entry : event->audit_logs) ids.push_back(entry.global_id);
+    }
+    require(!ids.empty(), "wire fixture must settle a real seeded outbound upload");
+    wire.simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_ack(std::move(ids)).to_json()));
+    queue.drain(); // actual mark_as_synced and its queued upload continuation
+    require(sync.get_progress().pending_upload == 0,
+            "actual ACK handling must drain the seeded upload's in-flight entries");
+}
+std::vector<std::string> sent_acks(lattice::mock_sync_transport& wire) {
+    std::vector<std::string> ids;
+    for (const auto& message : wire.get_sent_messages()) {
+        const auto event = lattice::server_sent_event::from_json(message.as_string());
+        require(event.has_value(), "actual synchronizer must emit valid protocol frames");
+        if (event->event_type == lattice::server_sent_event::type::ack)
+            ids.insert(ids.end(), event->acked_ids.begin(), event->acked_ids.end());
+    }
+    return ids;
+}
+#endif
+} // namespace malformed_audit_ack
+
+#ifndef __EMSCRIPTEN__
+TEST(AuditHygiene, MalformedWirePositionRejectsWholeFrameWithoutAckOrCursorLeapAndRetries) {
+    using namespace malformed_audit_ack;
+    // Every variant has valid outer JSON and valid neighbors on both sides.
+    // The intended UPDATE addresses an existing known row with changed values.
+    for (int variant = 0; variant < 11; ++variant) {
+        SCOPED_TRACE(variant);
+        TempDB file{"malformed-wire-position"};
+        auto queue = std::make_shared<wire_queue>();
+        lattice::configuration config(file.str(), queue);
+        auto owner = std::make_unique<lattice::lattice_db>(config);
+        auto& db = *owner;
+        const auto target = db.add(TestPerson{"BeforeMalformed", 70, std::nullopt});
+        initialize(db);
+        auto entries = h3_insert_entries(3);
+        entries[1].operation = "UPDATE";
+        entries[1].global_row_id = target.global_id();
+        const auto valid_middle = entries[1].to_json();
+        const auto names_member = "\"changedFieldsNames\":" + entries[1].changed_fields_names_to_json();
+        const auto fields_member = "\"changedFields\":" + entries[1].changed_fields_to_json();
+        std::string bad;
+        switch (variant) {
+            case 0: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quoted("[")); break;
+            case 1: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":{}"); break;
+            case 2: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":[\"name\",17]"); break;
+            case 3: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quoted("{}")); break;
+            case 4: bad = replace_once(valid_middle, fields_member, "\"changedFields\":" + quoted("{")); break;
+            case 5: bad = replace_once(valid_middle, fields_member, "\"changedFields\":[]"); break;
+            case 6: bad = replace_once(valid_middle, "\"operation\":\"UPDATE\"", "\"operation\":\"MERGE\""); break;
+            case 7: bad = "null"; break;
+            case 8: bad = replace_once(valid_middle, "\"globalId\":" + quoted(entries[1].global_id), "\"globalId\":17"); break;
+            case 9: bad = replace_once(valid_middle, names_member + ",", ""); break;
+            default: bad = replace_once(valid_middle, fields_member + ",", ""); break;
+        }
+        const auto malformed_frame = frame(std::vector<std::string>{entries[0].to_json(), bad, entries[2].to_json()});
+        EXPECT_FALSE(lattice::audit_log_entry::from_json(bad).has_value());
+        EXPECT_FALSE(lattice::server_sent_event::from_json(malformed_frame).has_value());
+
+        auto transport = std::make_unique<lattice::mock_sync_transport>();
+        auto* wire = transport.get();
+        lattice::sync_config sync_config;
+        sync_config.sync_id = "malformed-chan";
+        sync_config.checkpoint_passive_interval_ms = 0; // pacer off; uploads still arm ACK watchdogs
+        lattice::synchronizer sync(std::move(owner), sync_config, std::move(transport));
+        queue_ending ending{queue}; // before sync destruction on every exit
+        sync.connect();
+        queue->drain();
+        settle_seed_upload(sync, *wire, *queue);
+        wire->clear_sent_messages();
+        const auto before = apply_preamble_snapshot(db.db());
+        const auto receipts_before = db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId");
+        wire->simulate_message(lattice::transport_message::from_string(malformed_frame));
+        queue->drain();
+        EXPECT_TRUE(sent_acks(*wire).empty());
+        expect_same(before, apply_preamble_snapshot(db.db()));
+        EXPECT_EQ(db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId"), receipts_before);
+        EXPECT_EQ(cursor(db), "sentinel-before-frame");
+        EXPECT_FALSE(db.db().is_in_transaction());
+        EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
+
+        wire->clear_sent_messages();
+        wire->simulate_message(lattice::transport_message::from_string(frame(entries)));
+        queue->drain();
+        const std::vector<std::string> expected{entries[0].global_id, entries[1].global_id, entries[2].global_id};
+        EXPECT_EQ(sent_acks(*wire), expected);
+        EXPECT_EQ(cursor(db), entries.back().global_id);
+        const auto applied = apply_preamble_snapshot(db.db());
+        EXPECT_EQ(applied.persons.size(), 3u);
+        const auto changed = db.db().query("SELECT name,age FROM TestPerson WHERE globalId=?", {target.global_id()});
+        ASSERT_EQ(changed.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(changed[0].at("name")), "P1");
+        EXPECT_EQ(std::get<int64_t>(changed[0].at("age")), 21);
+        const auto receipts_applied = db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId");
+        wire->clear_sent_messages();
+        wire->simulate_message(lattice::transport_message::from_string(frame(entries)));
+        queue->drain();
+        EXPECT_EQ(sent_acks(*wire), expected);
+        const auto repeated = apply_preamble_snapshot(db.db());
+        EXPECT_EQ(repeated.persons, applied.persons);
+        EXPECT_EQ(repeated.audit, applied.audit);
+        EXPECT_EQ(repeated.sync_state, applied.sync_state);
+        EXPECT_EQ(db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId"), receipts_applied);
+        sync.disconnect();
+    }
+}
+
+TEST(AuditHygiene, ValidWireSchemaSkewAndJsonStringContainersStillAckAndAdvanceCursor) {
+    using namespace malformed_audit_ack;
+    TempDB file{"valid-wire-skew"};
+    auto queue = std::make_shared<wire_queue>();
+    lattice::configuration config(file.str(), queue);
+    auto owner = std::make_unique<lattice::lattice_db>(config);
+    auto& db = *owner;
+    const auto target = db.add(TestPerson{"Stable", 50, std::nullopt});
+    initialize(db);
+    auto entries = h3_insert_entries(4);
+    entries[0].operation = "UPDATE";
+    entries[0].global_row_id = target.global_id();
+    entries[0].changed_fields = {{"name", lattice::any_property("Stable")}};
+    entries[0].changed_fields_names = {"name"}; // real value-identical receipt-backed no-op
+    entries[1].changed_fields["future_column"] = lattice::any_property("newer-peer");
+    entries[1].changed_fields_names.push_back("future_column"); // known fields still apply
+    entries[2].operation = "UPDATE";
+    entries[2].global_row_id = target.global_id();
+    entries[2].changed_fields = {{"future_column", lattice::any_property("newer-peer")}};
+    entries[2].changed_fields_names = {"future_column"}; // unknown-only UPDATE no-op
+    entries[3].table_name = "FutureModelFromNewerPeer"; // supported unknown-table no-op
+    std::vector<std::string> encoded;
+    for (const auto& entry : entries) {
+        auto json = entry.to_json();
+        json = replace_once(json, "\"changedFields\":" + entry.changed_fields_to_json(),
+                            "\"changedFields\":" + quoted(entry.changed_fields_to_json()));
+        json = replace_once(json, "\"changedFieldsNames\":" + entry.changed_fields_names_to_json(),
+                            "\"changedFieldsNames\":" + quoted(entry.changed_fields_names_to_json()));
+        encoded.push_back(std::move(json));
+    }
+    auto transport = std::make_unique<lattice::mock_sync_transport>();
+    auto* wire = transport.get();
+    lattice::sync_config sync_config;
+    sync_config.sync_id = "malformed-chan";
+    sync_config.checkpoint_passive_interval_ms = 0;
+    lattice::synchronizer sync(std::move(owner), sync_config, std::move(transport));
+    queue_ending ending{queue};
+    sync.connect();
+    queue->drain();
+    settle_seed_upload(sync, *wire, *queue);
+    wire->clear_sent_messages();
+    wire->simulate_message(lattice::transport_message::from_string(frame(encoded)));
+    queue->drain();
+    EXPECT_EQ(sent_acks(*wire), (std::vector<std::string>{entries[0].global_id, entries[1].global_id,
+                                                       entries[2].global_id, entries[3].global_id}));
+    EXPECT_EQ(cursor(db), entries.back().global_id);
+    const auto rows = db.db().query("SELECT name,age FROM TestPerson WHERE globalId=?", {target.global_id()});
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(rows[0].at("name")), "Stable");
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("age")), 50);
+    EXPECT_EQ(db.db().query("SELECT id FROM TestPerson WHERE globalId=?", {entries[1].global_row_id}).size(), 1u);
+    EXPECT_FALSE(db.db().table_exists(entries[3].table_name));
+    EXPECT_EQ(db.db().query("SELECT globalId FROM _lattice_applied_receipts WHERE globalId=?",
+                            {entries[0].global_id}).size(), 1u);
+    sync.disconnect();
+}
+#endif
+
+TEST(AuditHygiene, DirectUnsupportedOperationDoesNotAckAndStopsCursorBeforeValidLaterEntry) {
+    using namespace malformed_audit_ack;
+    TempDB file{"typed-invalid-operation"};
+    lattice::lattice_db db{lattice::configuration(file.str())};
+    const auto target = db.add(TestPerson{"StillLocal", 60, std::nullopt});
+    initialize(db);
+    auto entries = h3_insert_entries(3);
+    entries[1].operation = "MERGE";
+    entries[1].global_row_id = target.global_id();
+    EXPECT_EQ(lattice::apply_remote_changes_for(db, entries, "malformed-chan"),
+              (std::vector<std::string>{entries[0].global_id, entries[2].global_id}));
+    EXPECT_EQ(cursor(db), entries[0].global_id);
+    EXPECT_TRUE(db.db().query("SELECT * FROM AuditLog WHERE globalId=?", {entries[1].global_id}).empty());
+    EXPECT_TRUE(db.db().query("SELECT * FROM _lattice_applied_receipts WHERE globalId=?", {entries[1].global_id}).empty());
+    const auto original = db.db().query("SELECT name,age FROM TestPerson WHERE globalId=?", {target.global_id()});
+    ASSERT_EQ(original.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(original[0].at("name")), "StillLocal");
+    EXPECT_EQ(std::get<int64_t>(original[0].at("age")), 60);
+    entries[1].operation = "UPDATE";
+    EXPECT_EQ(lattice::apply_remote_changes_for(db, entries, "malformed-chan"),
+              (std::vector<std::string>{entries[0].global_id, entries[1].global_id, entries[2].global_id}));
+    EXPECT_EQ(cursor(db), entries.back().global_id);
+    EXPECT_EQ(db.db().query("SELECT * FROM AuditLog WHERE globalId=?", {entries[1].global_id}).size(), 1u);
+    const auto changed = db.db().query("SELECT name,age FROM TestPerson WHERE globalId=?", {target.global_id()});
+    ASSERT_EQ(changed.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(changed[0].at("name")), "P1");
+    EXPECT_EQ(std::get<int64_t>(changed[0].at("age")), 21);
+}
+
+TEST(AuditHygiene, InvalidTypedPositionCannotBorrowEarlierAckOfTheSameIdForCursorProgress) {
+    using namespace malformed_audit_ack;
+    TempDB file{"typed-invalid-duplicate-id"};
+    lattice::lattice_db db{lattice::configuration(file.str())};
+    initialize(db);
+    auto entries = h3_insert_entries(3);
+    entries[1].operation = "MERGE";
+    entries[1].global_id = entries[0].global_id; // a different invalid wire position
+    EXPECT_EQ(lattice::apply_remote_changes_for(db, entries, "malformed-chan"),
+              (std::vector<std::string>{entries[0].global_id, entries[2].global_id}));
+    EXPECT_EQ(cursor(db), entries[0].global_id);
+    EXPECT_TRUE(db.db().query("SELECT id FROM TestPerson WHERE globalId=?", {entries[1].global_row_id}).empty());
+    EXPECT_TRUE(db.db().query("SELECT id FROM AuditLog WHERE operation='MERGE'").empty());
+}

@@ -3251,6 +3251,35 @@ public:
         return rows;
     }
 
+    /// The persisted store version on the current read/transaction route.
+    /// Unlike migration bootstrap, a missing or invalid value is an error:
+    /// read-only consumers must never infer compatibility from a fallback.
+    int32_t stored_schema_version() {
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed())
+            throw db_error("Stored schema version connection is closed");
+        const auto rows = connection->query(
+            "SELECT value FROM _lattice_meta WHERE key = 'schema_version' LIMIT 2");
+        if (is_closed() || connection->is_closed())
+            throw db_error("Stored schema version connection is closed");
+        if (rows.size() != 1)
+            throw db_error("Missing or ambiguous stored schema version");
+        const auto found = rows.front().find("value");
+        if (found == rows.front().end() || !std::holds_alternative<std::string>(found->second))
+            throw db_error("Invalid stored schema version type");
+        const auto& text = std::get<std::string>(found->second);
+        if (text.empty()) throw db_error("Invalid stored schema version");
+        int32_t value = 0;
+        for (const unsigned char digit : text) {
+            if (digit < '0' || digit > '9'
+                || value > (std::numeric_limits<int32_t>::max() - (digit - '0')) / 10)
+                throw db_error("Invalid or out-of-range stored schema version");
+            value = value * 10 + (digit - '0');
+        }
+        if (value <= 0) throw db_error("Stored schema version must be positive");
+        return value;
+    }
+
     size_t count(const std::string& table_name,
                  std::optional<std::string> where_clause = std::nullopt,
                  std::optional<std::string> group_by = std::nullopt,

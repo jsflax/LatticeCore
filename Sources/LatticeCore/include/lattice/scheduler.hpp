@@ -84,7 +84,7 @@ public:
         , is_on_thread_fn_(is_on_thread_fn)
         , is_same_as_fn_(is_same_as_fn)
         , can_invoke_fn_(can_invoke_fn)
-        , destroy_fn_(destroy_fn)
+        , context_owner_(own_context(context, destroy_fn))
     {}
 #endif
 
@@ -101,15 +101,13 @@ public:
         , is_on_thread_fn_(is_on_thread_fn)
         , is_same_as_fn_(is_same_as_fn)
         , can_invoke_fn_(can_invoke_fn)
-        , destroy_fn_(destroy_fn)
+        , context_owner_(own_context(context, destroy_fn))
     {}
 #endif
 
-    ~generic_scheduler() override {
-        if (destroy_fn_ && context_) {
-            destroy_fn_(context_);
-        }
-    }
+    // Copies (including make_shared()) share the callback context's lifetime. The Swift
+    // constructor is a temporary; destroying it must not invalidate the shared scheduler.
+    ~generic_scheduler() override = default;
 
     void invoke(std::function<void()>&& fn) override {
         invoke_fn_(std::move(fn), context_);
@@ -135,7 +133,12 @@ private:
     bool (*is_on_thread_fn_)(void*);
     bool (*is_same_as_fn_)(const scheduler*, void*);
     bool (*can_invoke_fn_)(void*);
-    void (*destroy_fn_)(void*);
+    std::shared_ptr<void> context_owner_;
+
+    static std::shared_ptr<void> own_context(void* context, void (*destroy_fn)(void*)) {
+        if (!context || !destroy_fn) return {};
+        return std::shared_ptr<void>(context, destroy_fn);
+    }
 };
 
 using SharedScheduler = std::shared_ptr<scheduler>;

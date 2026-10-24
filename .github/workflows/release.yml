@@ -140,3 +140,14 @@ jobs:
           gh release create "$VERSION" "$CORE_JOB_ROOT/tmp/release-receipt.json" \
             --verify-tag --target "$EXPECTED_SHA" --title "$VERSION" \
             --notes-file "$CORE_JOB_ROOT/tmp/release-notes.md" "${FLAGS[@]}"
+
+  notify-slack:
+    needs: [preflight, release]
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/slack-release.yml
+    with:
+      tag: ${{ needs.preflight.outputs.version }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

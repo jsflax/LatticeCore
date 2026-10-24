@@ -76,7 +76,7 @@ class NotifyReleaseTests(unittest.TestCase):
             self.assertEqual(self.run_notifier(server), "delivered")
         build.assert_called_once_with(
             "Lattice", "2.2.5", RELEASE["html_url"], RELEASE["body"],
-            "https://raw.githubusercontent.com/jsflax/lattice/main/.github/assets/release-icon.png",
+            "https://raw.githubusercontent.com/jsflax/lattice/main/.github/assets/release-icon-cloth-matte.png",
         )
         self.assertEqual([item[1] for item in server.calls], ["GET", "GET", "GET", "POST", "POST", "POST"])
         self.assertEqual(server.receipts(), ["pending", "success"])
@@ -108,7 +108,7 @@ class NotifyReleaseTests(unittest.TestCase):
                 with mock.patch.object(notifier, "build_payload", return_value={}) as build:
                     self.run_notifier(server, env=dict(ENV, GITHUB_REPOSITORY=repo), dry_run=True)
                 self.assertEqual(build.call_args.args[0], product)
-                self.assertEqual(build.call_args.args[4], None if product == "Engram" else f"https://raw.githubusercontent.com/{canonical}/main/.github/assets/release-icon.png")
+                self.assertEqual(build.call_args.args[4], None if product == "Engram" else f"https://raw.githubusercontent.com/{canonical}/main/.github/assets/release-icon-cloth-matte.png")
 
     def test_refuses_draft_or_unpublished_release(self):
         for change in [{"draft": True}, {"published_at": None}, {"draft": None}]:

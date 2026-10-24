@@ -874,6 +874,16 @@ public:
         }
     }
 
+    // Strict metadata query: zero is only a sealed failure sentinel.
+    int32_t stored_schema_version() SWIFT_NAME(storedSchemaVersion()) {
+        last_bridge_error().clear();
+        try { return lattice_db::stored_schema_version(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return 0;
+        }
+    }
+
     // count overloads: never throw into Swift — 0 on failure.
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
@@ -3718,6 +3728,10 @@ public:
         OptionalString distinct_by = std::nullopt,
         const ColumnValueVector& params = {}) const {
         return impl().grouped_counts(table_name, group_by, where_clause, distinct_by, params);
+    }
+
+    int32_t stored_schema_version() const SWIFT_NAME(storedSchemaVersion()) {
+        return impl().stored_schema_version();
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema

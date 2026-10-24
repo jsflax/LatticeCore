@@ -192,6 +192,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/StartupSyncRepairTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
+    Tests/LatticeCoreTests/GenericSchedulerLifetimeTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp

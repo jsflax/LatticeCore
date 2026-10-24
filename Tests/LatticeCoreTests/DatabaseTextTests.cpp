@@ -16,6 +16,56 @@ struct database_query_test_access {
 
 using namespace lattice;
 
+TEST(StoredSchemaVersion, StrictValueUsesCurrentTransactionRoute) {
+    lattice_db owner;
+    EXPECT_EQ(owner.stored_schema_version(), 1);
+    owner.db().execute("UPDATE _lattice_meta SET value='6' WHERE key='schema_version'");
+    EXPECT_EQ(owner.stored_schema_version(), 6);
+    owner.begin_transaction();
+    owner.db().execute("UPDATE _lattice_meta SET value='12' WHERE key='schema_version'");
+    EXPECT_EQ(owner.stored_schema_version(), 12);
+    owner.rollback();
+    EXPECT_EQ(owner.stored_schema_version(), 6);
+    owner.db().execute("UPDATE _lattice_meta SET value='2147483647' WHERE key='schema_version'");
+    EXPECT_EQ(owner.stored_schema_version(), std::numeric_limits<int32_t>::max());
+}
+
+TEST(StoredSchemaVersion, MissingMalformedAndQueryFailuresThrow) {
+    lattice_db owner;
+    const std::vector<std::string> invalid{
+        "", "0", "-1", "+1", " 1", "1 ", "1.5", "6trailing", "2147483648",
+        "9999999999999999999999999", std::string("5\0tail", 6)};
+    for (const auto& value : invalid) {
+        SCOPED_TRACE(value);
+        owner.db().execute("UPDATE _lattice_meta SET value=? WHERE key='schema_version'", {value});
+        EXPECT_THROW(owner.stored_schema_version(), db_error);
+    }
+    owner.db().execute("UPDATE _lattice_meta SET value=x'35' WHERE key='schema_version'");
+    EXPECT_THROW(owner.stored_schema_version(), db_error);
+    owner.db().execute("DELETE FROM _lattice_meta WHERE key='schema_version'");
+    EXPECT_THROW(owner.stored_schema_version(), db_error);
+    owner.db().execute("DROP TABLE _lattice_meta");
+    EXPECT_THROW(owner.stored_schema_version(), db_error);
+    owner.db().execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)");
+    owner.db().execute("INSERT INTO _lattice_meta VALUES('schema_version','5'),('schema_version','6')");
+    EXPECT_THROW(owner.stored_schema_version(), db_error);
+}
+
+TEST(StoredSchemaVersion, ClosedOwnerOrBorrowAndCloseDuringQueryThrow) {
+    for (bool close_owner : {false, true}) {
+        lattice_db owner;
+        const auto connection = owner.borrow_read_connection();
+        if (close_owner) owner.close();
+        else connection->close();
+        EXPECT_THROW(owner.stored_schema_version(), db_error);
+    }
+    lattice_db owner;
+    const auto connection = owner.borrow_read_connection();
+    struct ClearHook { ~ClearHook() { database_query_test_access::set(nullptr); } } clear;
+    database_query_test_access::set([&](sqlite3_stmt*) { connection->close(); });
+    EXPECT_THROW(owner.stored_schema_version(), db_error);
+}
+
 TEST(GroupedCounts, ScalarProjectionDoesNotReadPayloadAndUsesOneStatement) {
     database db(":memory:");
     db.execute("CREATE TABLE Item(id INTEGER PRIMARY KEY,globalId TEXT,topic TEXT,project TEXT,content TEXT,embedding BLOB)");

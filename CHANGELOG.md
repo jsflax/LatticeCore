@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.3.0] - 2026-10-23
+
+### Added
+- Expose the actual persisted schema version through a checked Core and Swift
+  bridge query. Missing, malformed, nonpositive, ambiguous and out-of-range
+  metadata fails explicitly; read-only clients never infer compatibility from
+  their configured migration target or write a replacement version.
+
+### Fixed
+- Share callback-context ownership across generic scheduler copies and
+  `make_shared()`. The final owner invokes the destroy callback exactly once,
+  allowing Swift actor contexts to be released safely after short-lived reads.
+
+### Compatibility
+- Additive Core/Swift bridge API; no persistent schema, sync wire format or
+  public C API change. Rebuild Core and generated C++/Swift consumers together.
+
 ## [2.2.8] - 2026-10-22
 
 ### Fixed

@@ -117,6 +117,13 @@ struct audit_log_entry {
     /// ignore it (legacy upsert behavior — acceptable, they predate groups).
     bool synthesized = false;
 
+    /// Transport-only completeness metadata: these named no_history fields
+    /// contain an observed SQL NULL, not a raw UPDATE-history placeholder.
+    /// Optional on the wire; not persisted in AuditLog. Old peers ignore the
+    /// key and conservatively drop these clears. Receivers still check their
+    /// installed no_history flags and actual column nullability.
+    std::vector<std::string> no_history_nulls;
+
     // Generate SQL instruction from this audit entry
     // Returns {sql, params} for executing the change
     // schema maps column_name -> column_type for decoding hex-encoded BLOBs
@@ -642,11 +649,13 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
 /// peer must therefore fill such columns with the row's CURRENT value first:
 /// for every UPDATE entry whose table schema marks columns no_history and
 /// whose changedFieldsNames lists them with a null/missing value, read the
-/// live row and fill them in; if the row is gone, drop the column from both
+/// live row and fill them in (marking observed NULLs in noHistoryNulls); if
+/// the row is gone, drop the column from both
 /// changedFields and changedFieldsNames (its DELETE entry follows). Invariant
 /// a consumer can rely on: a no_history column syncs its latest value at
 /// upload/push time, not every intermediate value. Called by
 /// query_audit_log_for_sync and events_after; exposed for other shippers.
+/// Full INSERT payloads also mark their explicit no_history NULLs.
 void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries);
 
 /// The same fill for ONE row, as the wire JSON object ({"col": {"kind":..,

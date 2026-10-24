@@ -11,8 +11,8 @@
 // history for ONE turn. With no_history the UPDATE trigger writes NULL for the
 // column's value (it still gates the trigger and appears in changedFieldsNames,
 // so live observers fire); INSERT and DELETE keep full values (once per row).
-// Sync fills the CURRENT value in at upload/push time; a receiver never binds
-// a null for such a column.
+// Sync fills the CURRENT value in at upload/push time; unmarked NULLs remain
+// placeholders. Observed nullable clears use the noHistoryNulls wire marker.
 // ============================================================================
 
 namespace {
@@ -172,7 +172,7 @@ TEST(NoHistory, UploadAndPushLateBindTheLiveValue) {
     EXPECT_TRUE(saw_delete);
 }
 
-TEST(NoHistory, ReceiverNeverBindsANullForANoHistoryColumn) {
+TEST(NoHistory, ReceiverNeverBindsAnUnmarkedNullForANoHistoryColumn) {
     TempDB tmp{"nohistory_receiver"};
     auto schemas = doc_schema(true);
     auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas);

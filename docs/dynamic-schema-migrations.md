@@ -40,8 +40,63 @@ then compare all dynamic data, audit rows, SQLite schema, version/schema metadat
 and fingerprint markers. The row-update failure fixture installs a real SQLite
 unique index rather than assuming property-index metadata support. The scoped
 old-source negative control below also reproduced the missing callback. A rebuilt
-consuming Wasm run is still pending; the native result alone does not qualify
-LatticeJS or an installed HUD runtime.
+consuming Wasm run is recorded in the follow-on section; the native result alone
+does not qualify LatticeJS or an installed HUD runtime.
+
+## Follow-on unmanaged-link repair (focused native and Wasm gates passed)
+
+The consuming rebuilt-Wasm test exposed an independent existing defect in
+`dynamic_object::get_object`: the unmanaged branch moved from a shared staged
+link target, so merely reading the link emptied the original target. The narrow
+follow-on change copies that value instead. A focused native regression reads
+the link repeatedly, checks that original target edits remain visible on later
+reads, persists the graph, and verifies its link after reopening the file. This
+additional case passed individually and with all ten migration cases at
+**2026-10-24 07:09:40 UTC** (11/11, 947 ms). It is not included in the older
+ten-case receipt below. Other `std::move(*...)` sites in the Swift bridge consume
+fresh local optional query results, not the shared staged link value.
+
+The first follow-on test run passed all ten migration cases and its unmanaged
+link-read assertions, then crashed after graph insertion. That fixture used a
+stack `swift_lattice`, which cannot supply the registered shared ownership that
+managed dynamic objects resolve through `shared_for_lattice`. The fixture now
+uses the same registered factory path as Swift/JS callers and asserts managed
+state before getters. The production repair remained unchanged. This correction
+does not qualify direct stack-store managed-object use.
+
+Exact receipts are under `/Users/jason/localdev/hud-scratch/latticecore-hud-migration`:
+`native-unmanaged-link-v1.log`, `native-unmanaged-link-v1-crash.ips` and the
+hash-matched `native-unmanaged-link-v1-fixture.cpp` preserve the failed fixture;
+`native-unmanaged-link-targeted-v2.json` and `native-unmanaged-link-v2.json`
+record the passing runs. `native-unmanaged-link-v2.receipt.txt` records separate
+UTC wall times and source/archive/executable hashes. The debugger attempt was
+terminated during launch and all of its processes were joined/removed before
+the rerun. The incremental build used the same toolchain and two-job target
+shown below. No published dependency or installed runtime has adopted this fix.
+
+At **2026-10-24 07:13:01 UTC**, the consuming LatticeJS build passed all 26
+actual-Wasm/SQLite lifecycle and explicit-model cases. Link presence, repeated
+unmanaged reads, managed cycles, exact Int64 fields, identity-only hydration,
+constraint error delivery/retry and wrapper cleanup passed. All five ownership
+counters returned to zero; no async errors or fatal native logs were recorded.
+`/Users/jason/localdev/latticejs-hud/tmp/native-runtime-unmanaged-link-v1.json`
+is the runtime receipt, with source and artifact hashes in the adjacent
+`native-runtime-unmanaged-link-v1-source.json` and `.receipt.txt` files. The
+incremental Emscripten build used the explicit isolated-Core override and two
+jobs. These tests use a fixture WebSocket and do not qualify a real browser,
+OPFS, network synchronization, a Swift SDK runtime or release publication.
+
+The affected getter is also reachable from published Swift 2.3.0
+(`7ef27aaebe78cfba7bb2b47fe1677bc0bc152604`). Its generated property accessors
+(`LatticeMacros.swift:404,414`) call `Model.getField/setField`
+(`Model.swift:581–588`), which call `CxxObjectBackend.getObject/setObject`
+(`CxxBackend.swift:196–203`) and the same Core reference methods. The unmanaged
+setter shares the target's native `impl_`; the published getter then moves from
+that shared target. Optional links forward through `Accessor.swift:495–504` as
+well. The relevant condition is an unmanaged **owning** model; a managed owner's
+getter uses the separate database branch. This is source-path evidence and an
+actual Wasm reproduction, not a Swift runtime reproduction or a claim that a
+particular installed HUD flow has encountered the defect.
 
 ## Local qualification record
 

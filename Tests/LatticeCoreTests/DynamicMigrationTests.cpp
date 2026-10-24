@@ -363,4 +363,68 @@ TEST(DynamicMigration, CallbackReleasesItsContextRetainWhenThrowing) {
     if (final_release || retained->release()) delete retained;
 }
 #endif
+
+TEST(DynamicObjectLinks, RepeatedUnmanagedReadsPreserveTargetAndPersistGraph) {
+    MigrationFile file;
+    swift_schema_entry entry;
+    entry.table_name = "DynamicLinkItem";
+    auto parent_property = property("parent", column_type::integer, true);
+    parent_property.kind = property_kind::link;
+    parent_property.target_table = entry.table_name;
+    entry.properties = {{"value", property("value")},
+                        {"score", property("score", column_type::integer)},
+                        {"parent", parent_property}};
+    SchemaVector schema{entry};
+    {
+        // Managed dynamic objects resolve ownership through the registered
+        // shared store, as Swift/JS factory callers do; a stack store cannot
+        // supply that lifetime and is not a valid managed-object fixture.
+        auto store = open(file, schema, 1, [](swift_migration_context_ref*) {});
+        ASSERT_TRUE(store);
+        dynamic_object_ref parent(swift_dynamic_object(entry.table_name, entry.properties));
+        parent.set_string("value", "parent");
+        parent.set_int("score", 9007199254740993LL);
+        dynamic_object_ref child(swift_dynamic_object(entry.table_name, entry.properties));
+        child.set_string("value", "child");
+        child.set_int("score", 1);
+        child.set_object("parent", parent);
+
+        for (int read = 0; read < 3; ++read) {
+            auto linked = child.get()->get_object("parent");
+            ASSERT_TRUE(linked.has_value("score"));
+            EXPECT_EQ(linked.get_int("score"), 9007199254740993LL + read);
+            ASSERT_TRUE(parent.has_value("score")) << "link reads must not move from the shared target";
+            EXPECT_EQ(parent.get_int("score"), 9007199254740993LL + read);
+            EXPECT_EQ(parent.get_string("value"), "parent");
+            parent.set_int("score", 9007199254740994LL + read);
+        }
+
+        // Adding the graph after reads must preserve both rows and the link.
+        store->add(child);
+        ASSERT_TRUE(child.get()->lattice);
+        auto linked = child.get()->get_object("parent");
+        ASSERT_TRUE(linked.lattice);
+        EXPECT_EQ(linked.get_string("value"), "parent");
+        EXPECT_EQ(linked.get_int("score"), 9007199254740996LL);
+        EXPECT_EQ(store->db().query("SELECT id FROM DynamicLinkItem").size(), 2u);
+    }
+    {
+        auto reopened = open(file, schema, 1, [](swift_migration_context_ref*) {});
+        ASSERT_TRUE(reopened);
+        auto rows = reopened->objects("DynamicLinkItem");
+        ASSERT_EQ(rows.size(), 2u);
+        bool found_child = false;
+        for (const auto& row : rows) {
+            if (row.get_string("value") != "child") continue;
+            found_child = true;
+            dynamic_object restored_child(row);
+            ASSERT_TRUE(restored_child.lattice);
+            auto linked = restored_child.get_object("parent");
+            ASSERT_TRUE(linked.lattice);
+            EXPECT_EQ(linked.get_string("value"), "parent");
+            EXPECT_EQ(linked.get_int("score"), 9007199254740996LL);
+        }
+        EXPECT_TRUE(found_child);
+    }
+}
 } // namespace

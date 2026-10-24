@@ -46,6 +46,9 @@ TEST(StoredSchemaVersion, MissingMalformedAndQueryFailuresThrow) {
     EXPECT_THROW(owner.stored_schema_version(), db_error);
     owner.db().execute("DROP TABLE _lattice_meta");
     EXPECT_THROW(owner.stored_schema_version(), db_error);
+    owner.db().execute("CREATE TABLE _lattice_meta(key TEXT, value TEXT)");
+    owner.db().execute("INSERT INTO _lattice_meta VALUES('schema_version','5'),('schema_version','6')");
+    EXPECT_THROW(owner.stored_schema_version(), db_error);
 }
 
 TEST(StoredSchemaVersion, ClosedOwnerOrBorrowAndCloseDuringQueryThrow) {

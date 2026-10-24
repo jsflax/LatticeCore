@@ -3159,6 +3159,7 @@ namespace detail {
         fp += config.sync_is_observer ? 'O' : 'P';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
+        fp += std::to_string(static_cast<int>(config.sync_authentication_mode)); fp += '|';
         append_cache_string(fp, config.authorization_token);
         append_cache_filter(fp, config.sync_filter);
         return fp;

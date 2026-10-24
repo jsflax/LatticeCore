@@ -472,6 +472,11 @@ class lattice_db;
 /// @param context Migration context with pending changes and enumeration methods
 using migration_block_t = std::function<void(migration_context& context)>;
 
+/// Bearer authentication remains the default. Transport-managed authentication
+/// delegates admission to an explicitly configured transport (for example, an
+/// HttpOnly browser session); it does not invent or forward a bearer token.
+enum class sync_authentication { bearer_token, transport_managed };
+
 struct configuration {
     /// Database file path. Use ":memory:" for in-memory database.
     std::string path = ":memory:";
@@ -483,8 +488,11 @@ struct configuration {
     /// Example: "ws://localhost:8080/sync"
     std::string websocket_url;
 
-    /// Authorization token for sync. Required if websocket_url is set.
+    /// Authorization token for sync. Required in the default bearer-token mode.
     std::string authorization_token;
+
+    /// Explicit transport admission. Existing configurations retain token-required behavior.
+    sync_authentication sync_authentication_mode = sync_authentication::bearer_token;
 
     /// Target schema version. Default is 1 (initial schema).
     /// If the database is at a lower version, migrations will run.
@@ -597,9 +605,10 @@ struct configuration {
     };
     std::vector<ipc_target> ipc_targets;
 
-    /// Returns true if WSS sync is configured (websocket_url is not empty)
+    /// WSS sync requires an endpoint and either a token or explicit transport admission.
     bool is_sync_enabled() const {
-        return !websocket_url.empty() && !authorization_token.empty();
+        return !websocket_url.empty() && (!authorization_token.empty() ||
+            sync_authentication_mode == sync_authentication::transport_managed);
     }
 
     /// Returns true if any IPC targets are configured

@@ -957,7 +957,9 @@ synchronizer_base::~synchronizer_base() {
 void synchronizer_base::connect() {
     std::lock_guard<std::recursive_mutex> lifecycle(connection_mutex_);
     if (is_destroyed_) return;
-    if (is_connected_ || is_connecting_) return;
+    // Read in the opposite order to on_open's connecting -> connected handoff.
+    // Otherwise an old connected=false and new connecting=false can straddle it.
+    if (is_connecting_ || is_connected_) return;
     is_connecting_ = true;
     ++connection_generation_;
     try {
@@ -1099,10 +1101,12 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
 
 void synchronizer_base::on_websocket_open() {
     if (is_destroyed_) return;
+    // Publish the successor state before retiring the old one. connect() reads
+    // connecting first, so these seq_cst flags never admit a duplicate attempt.
+    is_connected_ = true;
     is_connecting_ = false;
     LOG_INFO("synchronizer", "[%s] on_websocket_open (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
-    is_connected_ = true;
     // Do NOT reset reconnect_attempts_ here: a flapping endpoint fires
     // open→error every cycle, and resetting on open pinned the backoff at
     // base_delay forever (~1s reconnect storm). The counter resets in

@@ -2392,3 +2392,96 @@ TEST(Sync, TerminalErrorPublishesDisconnectedWithoutRequiringCloseCallback) {
     EXPECT_EQ(states, std::vector<bool>({true, false}));
     sync.disconnect();
 }
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+TEST(Sync, ConnectRemainsIdempotentAcrossOpenStateHandoff) {
+    bounded_mock_case([] {
+        class inspected_synchronizer : public lattice::synchronizer {
+        public:
+            using lattice::synchronizer::synchronizer;
+            bool connecting() const { return is_connecting_.load(); }
+            uint64_t generation() const { return connection_generation_.load(); }
+        };
+        TempDB tmp{"local_first_open_handoff"};
+        auto queue = std::make_shared<lifecycle_queue>();
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), queue));
+        lattice::sync_config cfg;
+        cfg.websocket_url = "ws://fixture.invalid/open-handoff";
+        cfg.sync_id = "fixture-open-handoff";
+        auto transport = std::make_unique<lifecycle_transport>();
+        auto* observed = transport.get();
+        inspected_synchronizer sync(std::move(db), cfg, std::move(transport));
+        std::vector<bool> states;
+        sync.set_on_state_change([&](bool connected) { states.push_back(connected); });
+        sync.connect();
+        const auto generation = sync.generation();
+
+        struct restore_level {
+            lattice::log_level previous = lattice::get_log_level();
+            ~restore_level() { lattice::set_log_level(previous); }
+        } restore;
+        std::unique_lock<std::mutex> log_gate(lattice::g_log_mutex());
+        lattice::set_log_level(lattice::log_level::info);
+        // The real callback reaches LOG_INFO after clearing connecting. Holding
+        // the existing logger mutex exposes the former both-false interval.
+        std::thread opener([&] { observed->open(); });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (sync.connecting() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool reached_handoff = !sync.connecting();
+        std::atomic<bool> returned{false};
+        std::thread connector([&] { sync.connect(); returned = true; });
+        const auto return_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!returned && std::chrono::steady_clock::now() < return_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool returned_before_open_completed = returned.load();
+        // Release and join both workers before assertions, even on failure.
+        log_gate.unlock();
+        opener.join();
+        connector.join();
+        EXPECT_TRUE(reached_handoff);
+        EXPECT_TRUE(returned_before_open_completed);
+        EXPECT_EQ(observed->connects, 1);
+        EXPECT_EQ(sync.generation(), generation);
+        EXPECT_TRUE(sync.is_connected());
+        queue->drain();
+        EXPECT_EQ(states, std::vector<bool>({true}));
+        sync.disconnect();
+    });
+}
+#endif
+
+TEST(Sync, StateRegistrationCatchupRejectsRetiredConnection) {
+    TempDB tmp{"local_first_state_catchup"};
+    auto queue = std::make_shared<lifecycle_queue>();
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), queue));
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://fixture.invalid/state-catchup";
+    cfg.sync_id = "fixture-state-catchup";
+    auto transport = std::make_unique<lifecycle_transport>();
+    auto* observed = transport.get();
+    lattice::synchronizer sync(std::move(db), cfg, std::move(transport));
+    sync.connect(); observed->open(); queue->drain();
+    std::vector<bool> states;
+    auto record = [&](bool connected) { states.push_back(connected); };
+
+    sync.set_on_state_change(record); // Queues catch-up for the current connection.
+    sync.disconnect(); sync.connect();
+    queue->drain();
+    EXPECT_TRUE(states.empty()); // The new attempt has not opened yet.
+    observed->open(); queue->drain();
+    EXPECT_EQ(states, std::vector<bool>({true}));
+
+    states.clear();
+    sync.set_on_state_change(record);
+    sync.disconnect(); sync.connect(); observed->open();
+    queue->drain();
+    EXPECT_EQ(states, std::vector<bool>({true})); // Only the new open may report true.
+
+    states.clear();
+    sync.set_on_state_change(record);
+    sync.set_on_state_change({}); // Removing a handler also invalidates queued catch-up.
+    queue->drain();
+    EXPECT_TRUE(states.empty());
+    sync.disconnect();
+}

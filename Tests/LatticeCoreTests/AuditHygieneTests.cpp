@@ -1150,7 +1150,13 @@ TEST(AuditHygiene, NativeNullableUpdateNamesAckWholeFrameAndRedeliverWithoutMuta
         queue->drain();
         EXPECT_EQ(sent_acks(*wire), expected);
         EXPECT_EQ(cursor(db), entries.back().global_id);
-        expect_same(applied, apply_preamble_snapshot(db.db()));
+        // Successful redelivery can refresh the slot's last_active_at heartbeat.
+        // Its cursor is checked above; durable rows must remain unchanged.
+        const auto repeated = apply_preamble_snapshot(db.db());
+        EXPECT_EQ(repeated.persons, applied.persons);
+        EXPECT_EQ(repeated.audit, applied.audit);
+        EXPECT_EQ(repeated.sync_state, applied.sync_state);
+        EXPECT_EQ(repeated.sync_control, applied.sync_control);
         EXPECT_EQ(db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId"), receipts);
         EXPECT_FALSE(db.db().is_in_transaction());
         EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));

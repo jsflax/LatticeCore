@@ -1157,6 +1157,11 @@ TEST(AuditHygiene, NativeNullableUpdateNamesAckWholeFrameAndRedeliverWithoutMuta
         EXPECT_EQ(repeated.audit, applied.audit);
         EXPECT_EQ(repeated.sync_state, applied.sync_state);
         EXPECT_EQ(repeated.sync_control, applied.sync_control);
+        auto before_slots = applied.slots;
+        auto after_slots = repeated.slots;
+        for (auto& slot : before_slots) slot.erase("last_active_at");
+        for (auto& slot : after_slots) slot.erase("last_active_at");
+        EXPECT_EQ(after_slots, before_slots);
         EXPECT_EQ(db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId"), receipts);
         EXPECT_FALSE(db.db().is_in_transaction());
         EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));

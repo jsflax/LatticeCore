@@ -1093,6 +1093,99 @@ lattice::property_descriptor nullable_text_prop(const std::string& name) {
 }
 }  // namespace
 
+// Include hydration and cache admission in the statement budget. The old
+// tests began counting only AFTER enable_row_cache's per-row refetch.
+TEST(Bridge, RowCacheBatchHydrationUsesFetchedValues) {
+    TempDB tmp{"rowcache_batch"};
+    lattice::SchemaVector schemas = {make_schema("RcBatch", {
+        {"name", text_prop("name")}, {"age", int_prop("age")},
+        {"email", nullable_text_prop("email")},
+    })};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int64_t i = 0; i < 128; ++i) {
+        auto sdo = make_sdo("RcBatch", schemas[0].properties);
+        sdo.values["name"] = std::string("row-") + std::to_string(i);
+        sdo.values["age"] = i;
+        sdo.values["email"] = nullptr;
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    (void)db.objects("RcBatch"); // Open the reader/schema cache before budgeting.
+    const auto before = lattice::database::thread_statement_count();
+    auto rows = db.objects("RcBatch", std::nullopt, std::string("age ASC"));
+    ASSERT_EQ(rows.size(), 128u);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        ASSERT_TRUE(rows[i].source.values.contains("globalId"));
+        ASSERT_TRUE(rows[i].source.values.contains("email"));
+        EXPECT_FALSE(rows[i].source.values.contains("id"));
+        lattice::dynamic_object cached(rows[i]);
+        cached.enable_row_cache();
+        EXPECT_EQ(cached.get_int("id"), rows[i].id());
+        EXPECT_EQ(cached.get_string("globalId"), rows[i].global_id());
+        EXPECT_EQ(cached.get_string("name"), "row-" + std::to_string(i));
+        EXPECT_EQ(cached.get_int("age"), static_cast<int64_t>(i));
+        EXPECT_FALSE(cached.has_value("email"));
+    }
+    EXPECT_EQ(lattice::database::thread_statement_count() - before, 1u)
+        << "one row query must serve all scalar hydration and materialization";
+    delete ref;
+}
+
+TEST(Bridge, RowCacheRetainsGenerationValuesBeforeMaterialization) {
+    TempDB tmp{"rowcache_generation"};
+    lattice::SchemaVector schemas = {make_schema("RcGeneration", {
+        {"name", text_prop("name")}, {"age", int_prop("age")},
+    })};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    auto sdo = make_sdo("RcGeneration", schemas[0].properties);
+    sdo.values["name"] = std::string("before"); sdo.values["age"] = int64_t(1);
+    { lattice::dynamic_object obj(sdo); db.add(obj); }
+    const auto generation = ref->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    auto rows = ref->objects_at(generation, "RcGeneration");
+    ASSERT_FALSE(ref->last_generation_read_stale());
+    ASSERT_EQ(rows.size(), 1u);
+    db.db().execute("UPDATE RcGeneration SET name = 'after', age = 2");
+    const auto before = lattice::database::thread_statement_count();
+    lattice::dynamic_object cached(rows[0]);
+    cached.enable_row_cache();
+    EXPECT_EQ(cached.get_string("name"), "before");
+    EXPECT_EQ(cached.get_int("age"), 1);
+    EXPECT_EQ(lattice::database::thread_statement_count() - before, 0u);
+    lattice::dynamic_object live(rows[0]);
+    EXPECT_EQ(live.get_string("name"), "after") << "ordinary handles remain live";
+    cached.refresh_row_cache();
+    EXPECT_EQ(cached.get_int("age"), 2);
+    ref->release_read_generation(generation);
+    delete ref;
+}
+
+TEST(Bridge, RowCacheBatchQueryFailuresRemainDistinguishableFromEmpty) {
+    TempDB tmp{"rowcache_failure"};
+    lattice::SchemaVector schemas = {make_schema("RcFailure", {{"name", text_prop("name")}})};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    auto failed = db.objects("RcFailure", std::string("no_such_column = 1"));
+    EXPECT_TRUE(failed.empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    auto empty = db.objects("RcFailure");
+    EXPECT_TRUE(empty.empty());
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+    const auto generation = ref->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    EXPECT_TRUE(ref->objects_at(generation, "RcFailure", std::string("no_such_column = 1")).empty());
+    EXPECT_TRUE(ref->last_generation_read_stale());
+    EXPECT_TRUE(ref->objects_at(generation, "RcFailure").empty());
+    EXPECT_FALSE(ref->last_generation_read_stale());
+    ref->release_read_generation(generation);
+    delete ref;
+}
+
 TEST(Bridge, RowCacheMaterializedReads) {
     TempDB tmp{"rowcache"};
     lattice::SchemaVector schemas = {

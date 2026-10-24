@@ -3162,6 +3162,7 @@ namespace detail {
     inline std::string connection_fingerprint(const configuration& config) {
         std::string fp = config.read_only ? "R" : "W";
         fp += config.sync_is_observer ? 'O' : 'P';
+        fp += config.sync_autostart ? 'A' : 'D';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         append_cache_string(fp, config.authorization_token);
@@ -3850,6 +3851,11 @@ public:
     void commit() const { sealed([&] { impl().commit(); }); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
+
+    // WSS lifecycle; sealed so startup failures cannot escape across Swift/C++.
+    void connect_sync() const { sealed([&] { impl().connect_sync(); }); }
+    void disconnect_sync() const { sealed([&] { impl().disconnect_sync(); }); }
+    void reconnect_sync() const { sealed([&] { impl().reconnect_sync(); }); }
 
     // Sync status
     bool is_sync_agent() const { return impl().is_sync_agent(); }

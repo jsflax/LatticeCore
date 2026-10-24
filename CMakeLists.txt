@@ -64,6 +64,7 @@ target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
     Sources/LatticeCore/src/schema.cpp
+    Sources/LatticeCore/src/scheduler.cpp
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp

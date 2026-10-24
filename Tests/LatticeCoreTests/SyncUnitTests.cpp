@@ -2233,3 +2233,162 @@ TEST(SyncChildTimeout, RealIPCBothActualChildrenInheritBusyHandler) {
     bounded_mock_case(sync_child_timeout_regressions::ipc_children_inherit_timeout);
 }
 #endif
+
+namespace {
+// A queued scheduler makes the disconnect-vs-backoff ordering deterministic.
+class lifecycle_queue : public lattice::scheduler {
+    std::mutex mutex_;
+    std::vector<std::function<void()>> jobs_;
+    bool accepting_ = true;
+public:
+    void invoke(std::function<void()>&& fn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (accepting_) jobs_.push_back(std::move(fn));
+    }
+    bool is_on_thread() const noexcept override { return false; }
+    bool is_same_as(const lattice::scheduler* other) const noexcept override { return other == this; }
+    bool can_invoke() const noexcept override { return true; }
+    void shutdown() override { std::lock_guard<std::mutex> lock(mutex_); accepting_ = false; jobs_.clear(); }
+    void drain() {
+        for (int i = 0; i < 100; ++i) {
+            std::vector<std::function<void()>> batch;
+            { std::lock_guard<std::mutex> lock(mutex_); batch.swap(jobs_); }
+            if (batch.empty()) return;
+            for (auto& job : batch) job();
+        }
+        FAIL() << "lifecycle queue failed to drain";
+    }
+};
+class lifecycle_transport : public lattice::mock_sync_transport {
+public:
+    int connects = 0;
+    bool complete_open_during_disconnect = false;
+    on_open_handler pending_open;
+    lattice::transport_state current = lattice::transport_state::closed;
+    void set_on_open(on_open_handler callback) override { pending_open = std::move(callback); }
+    void connect(const std::string&, const std::map<std::string, std::string>&) override {
+        ++connects; current = lattice::transport_state::connecting;
+    }
+    void disconnect() override {
+        if (complete_open_during_disconnect) {
+            complete_open_during_disconnect = false;
+            if (pending_open) pending_open();
+        }
+        current = lattice::transport_state::closed;
+    }
+    lattice::transport_state state() const override { return current; }
+    void open() { current = lattice::transport_state::open; if (pending_open) pending_open(); }
+    void fail() { current = lattice::transport_state::closed; simulate_error("fixture failure"); }
+};
+}
+
+TEST(Sync, ExplicitDisconnectCancelsQueuedRetryAcrossLaterConnect) {
+    TempDB tmp{"local_first_retry"};
+    auto queue = std::make_shared<lifecycle_queue>();
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), queue));
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://fixture.invalid/retry";
+    cfg.sync_id = "fixture-retry";
+    cfg.base_delay_seconds = 0.01;
+    auto transport = std::make_unique<lifecycle_transport>();
+    auto* observed = transport.get();
+    lattice::synchronizer sync(std::move(db), cfg, std::move(transport));
+    sync.connect(); observed->fail();
+    sync.disconnect();
+    queue->drain();
+    EXPECT_EQ(observed->connects, 1);
+    sync.connect(); observed->fail(); // A second delayed retry belongs to this generation.
+    sync.disconnect(); sync.connect();
+    queue->drain();
+    EXPECT_EQ(observed->connects, 3); // No stale retry may replace the newest attempt.
+    sync.connect();
+    EXPECT_EQ(observed->connects, 3); // Starting an already-connecting transport is idempotent.
+    sync.disconnect();
+}
+
+TEST(Sync, GenericTransportRetiresContextOnlyAtDestruction) {
+    struct Context { int connects = 0, disconnects = 0, destroyed = 0; } context;
+    {
+        lattice::generic_sync_transport transport(&context,
+            [](void* p, const void*, const void*) { ++static_cast<Context*>(p)->connects; },
+            [](void* p) { ++static_cast<Context*>(p)->disconnects; },
+            [](void*) { return lattice::transport_state::closed; }, nullptr);
+        transport.set_destroy_callback([](void* p) { ++static_cast<Context*>(p)->destroyed; });
+        transport.connect("ws://fixture"); transport.disconnect(); transport.connect("ws://fixture");
+        EXPECT_EQ(context.connects, 2);
+        EXPECT_EQ(context.disconnects, 1);
+        EXPECT_EQ(context.destroyed, 0);
+    }
+    EXPECT_EQ(context.destroyed, 1);
+}
+
+TEST(Sync, DeferredSiblingDoesNotConsumeAutomaticOwnerHandoff) {
+    struct Restore { std::shared_ptr<lattice::network_factory> value;
+        ~Restore() { lattice::set_network_factory(value); } } restore{lattice::get_network_factory()};
+    lattice::set_network_factory(std::make_shared<lattice::mock_network_factory>());
+    TempDB tmp{"deferred_handoff"};
+    lattice::configuration automatic(tmp.str(), "ws://fixture.invalid/handoff", "fixture");
+    lattice::lattice_db owner(automatic);
+    auto deferred = automatic; deferred.sync_autostart = false;
+    lattice::lattice_db dormant(deferred); // Registered before the eligible sibling.
+    lattice::lattice_db waiting(automatic);
+    EXPECT_TRUE(owner.is_sync_agent());
+    EXPECT_FALSE(dormant.is_sync_agent());
+    EXPECT_FALSE(waiting.is_sync_agent());
+    owner.close();
+    EXPECT_FALSE(dormant.is_sync_agent());
+    EXPECT_TRUE(waiting.is_sync_agent());
+    EXPECT_TRUE(waiting.is_sync_connected());
+    waiting.disconnect_sync(); waiting.close(); dormant.close();
+}
+
+TEST(Sync, DisconnectFencesAlreadyAdmittedOpenBeforePublishingFinalState) {
+    TempDB tmp{"local_first_open_drain"};
+    auto queue = std::make_shared<lifecycle_queue>();
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), queue));
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://fixture.invalid/open-drain";
+    cfg.sync_id = "fixture-open-drain";
+    auto transport = std::make_unique<lifecycle_transport>();
+    auto* observed = transport.get();
+    lattice::synchronizer sync(std::move(db), cfg, std::move(transport));
+    int connected_callbacks = 0;
+    sync.set_on_state_change([&](bool connected) { if (connected) ++connected_callbacks; });
+    sync.connect();
+    // Deterministic interleaving: transport's drain completes an open callback
+    // that was already admitted before disconnect reached the transport lock.
+    observed->complete_open_during_disconnect = true;
+    sync.disconnect();
+    EXPECT_FALSE(sync.is_connected());
+    queue->drain();
+    EXPECT_EQ(connected_callbacks, 0);
+    sync.connect();
+    EXPECT_EQ(observed->connects, 2); // A stale true must not block resumption.
+    sync.disconnect();
+}
+
+TEST(Sync, TerminalErrorPublishesDisconnectedWithoutRequiringCloseCallback) {
+    TempDB tmp{"local_first_terminal_error"};
+    auto queue = std::make_shared<lifecycle_queue>();
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), queue));
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://fixture.invalid/terminal-error";
+    cfg.sync_id = "fixture-terminal-error";
+    cfg.max_reconnect_attempts = -1; // Focus on terminal state, not a delayed retry.
+    auto transport = std::make_unique<lifecycle_transport>();
+    auto* observed = transport.get();
+    lattice::synchronizer sync(std::move(db), cfg, std::move(transport));
+    std::vector<bool> states;
+    sync.set_on_state_change([&](bool connected) { states.push_back(connected); });
+    sync.connect(); observed->open(); queue->drain();
+    ASSERT_EQ(states, std::vector<bool>({true}));
+    observed->fail();
+    EXPECT_FALSE(sync.is_connected());
+    queue->drain();
+    EXPECT_EQ(states, std::vector<bool>({true, false}));
+    // Some transports also deliver close after error; do not emit down twice.
+    observed->lattice::mock_sync_transport::disconnect();
+    queue->drain();
+    EXPECT_EQ(states, std::vector<bool>({true, false}));
+    sync.disconnect();
+}

@@ -955,6 +955,12 @@ synchronizer_base::~synchronizer_base() {
 }
 
 void synchronizer_base::connect() {
+    std::lock_guard<std::recursive_mutex> lifecycle(connection_mutex_);
+    if (is_destroyed_) return;
+    if (is_connected_ || is_connecting_) return;
+    is_connecting_ = true;
+    ++connection_generation_;
+    try {
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
@@ -992,13 +998,20 @@ void synchronizer_base::connect() {
     }
 
     ws_client_->connect(url, headers);
+    } catch (...) {
+        is_connecting_ = false;
+        throw;
+    }
 }
 
 void synchronizer_base::disconnect() {
+    std::lock_guard<std::recursive_mutex> lifecycle(connection_mutex_);
+    ++connection_generation_;
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
              log_id(), (void*)this, is_connected_ ? 1 : 0,
              db().config().path.c_str());
     should_reconnect_ = false;  // Prevent auto-reconnect
+    is_connecting_ = false;
     is_connected_ = false;
     reconnect_attempts_ = 0;
 
@@ -1008,7 +1021,19 @@ void synchronizer_base::disconnect() {
         in_flight_ids_.clear();
     }
 
-    ws_client_->disconnect();
+    // Transport construction can throw before assignment; base cleanup still runs.
+    if (ws_client_) ws_client_->disconnect();
+    // Transport disconnect fences/drains its callbacks. An already-admitted
+    // open may have completed while we waited on that fence, after the early
+    // clear above. Publish the final state after it, without taking a callback
+    // lock in on_websocket_open (which would invert transport/lifecycle locks).
+    is_connecting_ = false;
+    is_connected_ = false;
+    const auto generation = connection_generation_.load();
+    if (on_state_change_) scheduler_->invoke([this, generation] {
+        if (!is_destroyed_ && connection_generation_ == generation && !is_connected_)
+            on_state_change_(false);
+    });
 
     // An observer's slot carries no upload state — evict it on a clean
     // disconnect so it never lingers as a participant in anyone's floor.
@@ -1073,6 +1098,8 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
 }
 
 void synchronizer_base::on_websocket_open() {
+    if (is_destroyed_) return;
+    is_connecting_ = false;
     LOG_INFO("synchronizer", "[%s] on_websocket_open (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
     is_connected_ = true;
@@ -1084,15 +1111,19 @@ void synchronizer_base::on_websocket_open() {
     last_open_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 
+    const auto generation = connection_generation_.load();
     if (on_state_change_) {
-        scheduler_->invoke([this] { on_state_change_(true); });
+        scheduler_->invoke([this, generation] {
+            if (!is_destroyed_ && connection_generation_ == generation && is_connected_)
+                on_state_change_(true);
+        });
     }
 
     // Dispatch to scheduler — on_open may fire synchronously on the calling
     // thread (e.g., IPC accept on the main thread). Reconciliation and the
     // initial upload must not block the caller.
-    scheduler_->invoke([this] {
-        if (is_destroyed_) return;
+    scheduler_->invoke([this, generation] {
+        if (is_destroyed_ || connection_generation_ != generation || !is_connected_) return;
 
         register_replication_slot(db().db(), config_.sync_id, config_.is_observer);
 
@@ -1275,6 +1306,8 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 }
 
 void synchronizer_base::on_websocket_error(const std::string& error) {
+    if (is_destroyed_) return;
+    const bool was_connecting = is_connecting_.exchange(false);
     LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
               log_id(), error.c_str(), (void*)this, db().config().path.c_str());
 
@@ -1307,8 +1340,19 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
     }
     fire_progress();
 
+    const auto generation = connection_generation_.load();
+    // A terminal transport error need not be followed by a close callback.
+    // Publish down here, once for the active attempt, before the error detail.
+    if ((was_open || was_connecting) && on_state_change_) {
+        scheduler_->invoke([this, generation] {
+            if (!is_destroyed_ && connection_generation_ == generation && !is_connected_)
+                on_state_change_(false);
+        });
+    }
     if (on_error_) {
-        scheduler_->invoke([this, error] { on_error_(error); });
+        scheduler_->invoke([this, error, generation] {
+            if (!is_destroyed_ && connection_generation_ == generation) on_error_(error);
+        });
     }
 
     // Attempt reconnection
@@ -1316,6 +1360,8 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
 }
 
 void synchronizer_base::on_websocket_close(int code, const std::string& reason) {
+    if (is_destroyed_) return;
+    const bool was_connecting = is_connecting_.exchange(false);
     LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
              log_id(), code, reason.c_str(), (void*)this, db().config().path.c_str());
     const bool was_open = is_connected_.exchange(false);
@@ -1334,8 +1380,12 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
     }
     fire_progress();
 
-    if (on_state_change_) {
-        scheduler_->invoke([this] { on_state_change_(false); });
+    const auto generation = connection_generation_.load();
+    if ((was_open || was_connecting) && on_state_change_) {
+        scheduler_->invoke([this, generation] {
+            if (!is_destroyed_ && connection_generation_ == generation && !is_connected_)
+                on_state_change_(false);
+        });
     }
 
     // Attempt reconnection
@@ -2634,17 +2684,19 @@ void synchronizer_base::schedule_reconnect() {
         // Schedule reconnection with an interruptible sleep.
         // Short-sleep loop checks is_destroyed_ so that scheduler_->shutdown()
         // in the destructor doesn't block for the full backoff delay.
-        scheduler_->invoke([this, delay] {
+        const auto generation = connection_generation_.load();
+        scheduler_->invoke([this, delay, generation] {
             auto end = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(static_cast<int>(delay * 1000));
             while (std::chrono::steady_clock::now() < end) {
-                if (is_destroyed_) return;
+                if (is_destroyed_ || !should_reconnect_ ||
+                    connection_generation_ != generation) return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            if (is_destroyed_) return;
-            if (!is_connected_) {
-                connect();
-            }
+            std::lock_guard<std::recursive_mutex> lifecycle(connection_mutex_);
+            if (is_destroyed_ || !should_reconnect_ ||
+                connection_generation_ != generation) return;
+            if (!is_connected_) connect();
         });
     }
 }

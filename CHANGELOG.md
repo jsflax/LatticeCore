@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.4.0] - 2026-10-24
+
+### Added
+- Allow configured WSS sync to start explicitly after local rows are read, with
+  `configuration.sync_autostart = false`. Connect, disconnect and reconnect keep
+  the primary database handle and local observers; automatic startup remains the
+  default. Full close is still required to release sync ownership before app
+  suspension.
+
+### Fixed
+- Preserve fetched row values during Swift bridge hydration so materialized
+  reads do not issue another query per row or silently hydrate a newer row image.
+- Fence delayed reconnects and in-flight open callbacks across explicit transport
+  restarts, publish disconnected state on terminal errors, and retire external
+  transport contexts only at destruction.
+- Keep dormant deferred siblings out of sync ownership handoff, release ownership
+  after failed setup, and tolerate partial transport construction during cleanup.
+- Include the existing scheduler implementation in the CMake library target.
+
+### Compatibility
+- Additive Core and Swift bridge API; no persistent schema, sync wire format or
+  public C API change. Rebuild native and Swift bridge consumers together. Local
+  schema/integrity initialization and configured IPC startup are unchanged;
+  deferred WSS performs sync-only repair when explicitly started.
+
 ## [2.3.1] - 2026-10-23
 
 ### Fixed

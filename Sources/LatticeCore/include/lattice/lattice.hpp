@@ -486,6 +486,10 @@ struct configuration {
     /// Authorization token for sync. Required if websocket_url is set.
     std::string authorization_token;
 
+    /// Defer WSS ownership, sync repair and transport creation until connect_sync().
+    /// Local schema/integrity initialization and configured IPC remain unchanged.
+    bool sync_autostart = true;
+
     /// Target schema version. Default is 1 (initial schema).
     /// If the database is at a lower version, migrations will run.
     /// If the database is at a higher version, an error is thrown.
@@ -903,6 +907,7 @@ public:
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
         config_.path = resolve_path(config);
+        sync_start_requested_ = config.sync_autostart;
         setup_store_write_gate();
         auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
         LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
@@ -912,7 +917,9 @@ public:
         if (!config.read_only) {
             LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
-            heal_collapsed_sync_state();
+            // The deferred WSS path exposes local rows before sync-only repair.
+            // IPC still starts at open and therefore still needs this repair.
+            if (config.sync_autostart || config.is_ipc_enabled()) heal_collapsed_sync_state();
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
             if (!defer_sync) {
@@ -1999,11 +2006,16 @@ public:
     /// Clear ONE channel's sync filter ("" = WSS).
     void clear_sync_filter(const std::string& channel);
 
-    /// Connect to sync server (called automatically if configured)
+    /// Start/resume configured WSS on this same primary database handle.
+    /// Already-open/connecting transport is left alone.
     void connect_sync();
 
-    /// Disconnect from sync server
+    /// Pause WSS and cancel pending retries without closing local storage.
+    /// This retains sync ownership; use close() before application suspension.
     void disconnect_sync();
+
+    /// Replace the WSS connection attempt, preserving local storage and observers.
+    void reconnect_sync();
 
     /// Set callback for sync state changes
     void set_on_sync_state_change(std::function<void(bool connected)> handler);
@@ -6194,6 +6206,7 @@ private:
     std::atomic<bool> closed_{false};
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
+    std::atomic<bool> sync_start_requested_{true};
 
     // IPC sync
     struct ipc_sync_state {
@@ -7903,9 +7916,13 @@ protected:
         }
 
         // Populate the source object's values from the row
-        if constexpr (has_source_member<T>::value) {
+        // The row image belongs to the managed wrapper, not T itself
+        // (swift_dynamic_object has values, while managed<T> has source).
+        // Preserve the fetched scalars so opting into row-cache reads does
+        // not re-query every row, possibly at a newer generation.
+        if constexpr (has_source_member<managed<T>>::value) {
             for (const auto& [key, value] : row) {
-                if (key != "id" && key != "globalId" && key != "_source") {
+                if (key != "id" && key != "_source") {
                     obj.source.values[key] = value;
                 }
             }
@@ -8800,11 +8817,11 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
     bool handed_off = false;
     instance_registry::instance().for_each_alive(config_.path,
         [&](lattice_db* sibling) {
-            if (!handed_off && sibling != this &&
-                sibling->config_.is_sync_enabled() &&
+            if (!handed_off && sibling != this && !sibling->is_closed() &&
+                sibling->sync_start_requested_ && sibling->config_.is_sync_enabled() &&
                 sibling->config_.websocket_url == config_.websocket_url) {
                 sibling->setup_sync_if_configured();
-                handed_off = true;
+                handed_off = sibling->synchronizer_ != nullptr;
             }
         });
 }
@@ -9021,18 +9038,23 @@ inline void lattice_db::trigger_sync_upload() {
 }
 
 inline void lattice_db::connect_sync() {
+    if (is_closed() || config_.read_only || !config_.is_sync_enabled()) return;
+    sync_start_requested_ = true;
     if (synchronizer_) {
         synchronizer_->connect();
-    } else if (config_.is_sync_enabled()) {
-        // Lazily create synchronizer if config is set but sync wasn't started
+    } else {
         setup_sync_if_configured();
     }
 }
 
 inline void lattice_db::disconnect_sync() {
-    if (synchronizer_) {
-        synchronizer_->disconnect();
-    }
+    sync_start_requested_ = false;
+    if (synchronizer_) synchronizer_->disconnect();
+}
+
+inline void lattice_db::reconnect_sync() {
+    disconnect_sync();
+    connect_sync();
 }
 
 inline void lattice_db::set_on_sync_state_change(std::function<void(bool connected)> handler) {

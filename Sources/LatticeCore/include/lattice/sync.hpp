@@ -363,7 +363,12 @@ public:
     void set_on_state_change(on_state_change_handler handler) {
         on_state_change_ = std::move(handler);
         if (on_state_change_ && is_connected_) {
-            scheduler_->invoke([this] { on_state_change_(true); });
+            const auto generation = connection_generation_.load();
+            scheduler_->invoke([this, generation] {
+                if (!is_destroyed_ && connection_generation_ == generation &&
+                    is_connected_ && on_state_change_)
+                    on_state_change_(true);
+            });
         }
     }
 
@@ -400,8 +405,13 @@ protected:
     }
 
     std::atomic<bool> is_connected_{false};
+    std::atomic<bool> is_connecting_{false};
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
     std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
+    // Explicit disconnect/reconnect invalidates delayed retries before another
+    // transport call can start. Recursive for transports that callback inline.
+    std::recursive_mutex connection_mutex_;
+    std::atomic<uint64_t> connection_generation_{0};
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before

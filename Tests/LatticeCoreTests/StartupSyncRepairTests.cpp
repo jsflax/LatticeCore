@@ -426,4 +426,30 @@ TEST(StartupSyncRepair, PositiveRepairHoldsWriterThroughBothMutations) {
     EXPECT_EQ(sqlite3_exec(peer.handle(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr), SQLITE_OK);
     EXPECT_EQ(sqlite3_exec(peer.handle(), "ROLLBACK", nullptr, nullptr, nullptr), SQLITE_OK);
 }
+TEST(StartupSyncRepair, DeferredWSSLeavesRepairUntilExplicitStart) {
+    Fixture f;
+    f.slot("live-a"); f.audit(1); f.state(1, "live-a");
+    auto deferred = config(f.file);
+    deferred.websocket_url = "ws://fixture.invalid/deferred";
+    deferred.authorization_token = "fixture";
+    deferred.sync_autostart = false;
+    struct Restore { std::shared_ptr<network_factory> value;
+        ~Restore() { set_network_factory(value); } } restore{get_network_factory()};
+    auto factory = std::make_shared<mock_network_factory>();
+    set_network_factory(factory);
+    lattice_db local(deferred);
+    EXPECT_EQ(factory->last_websocket(), nullptr);
+    EXPECT_TRUE(local.db().table_exists("AuditLog")); // Mandatory local schema still exists.
+    EXPECT_EQ(scalar(local.db(), "SELECT isSynchronized FROM AuditLog WHERE id=1"), 0);
+    EXPECT_EQ(scalar(local.db(), "SELECT COUNT(*) FROM _lattice_sync_state"), 1);
+    auto* primary = local.db().handle();
+    local.connect_sync();
+    EXPECT_EQ(local.db().handle(), primary);
+    EXPECT_EQ(scalar(local.db(), "SELECT isSynchronized FROM AuditLog WHERE id=1"), 1);
+    EXPECT_EQ(scalar(local.db(), "SELECT COUNT(*) FROM _lattice_sync_state WHERE audit_entry_id=1"), 0);
+    local.disconnect_sync();
+    local.close();
+    std::filesystem::remove(f.file.path.string() + ".sync.lock");
+}
+
 } // namespace

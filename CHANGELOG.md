@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [2.3.0] - 2026-10-23
 
 ### Added
 - Expose the actual persisted schema version through a checked Core and Swift

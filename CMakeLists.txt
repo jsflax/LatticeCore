@@ -210,6 +210,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/BridgeCacheConfigurationTests.cpp
+    Tests/LatticeCoreTests/DynamicMigrationTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
@@ -232,6 +233,10 @@ target_include_directories(LatticeCoreTests PRIVATE
 # fixed-path logging environment. TMPDIR selects all fixture output locations.
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
+
+# Focused dynamic-schema migration regressions, with no unrelated model registry.
+add_executable(LatticeDynamicMigrationTests Tests/LatticeCoreTests/DynamicMigrationTests.cpp)
+target_link_libraries(LatticeDynamicMigrationTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp

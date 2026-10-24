@@ -764,6 +764,12 @@ public:
         pending_updates_[table_name][row_id] = std::move(row_data);
     }
 
+    /// Queue an explicit field without replacing other pending fields for this row.
+    void queue_row_value(const std::string& table_name, int64_t row_id,
+                         const std::string& column_name, const column_value_t& value) {
+        pending_updates_[table_name][row_id][column_name] = value;
+    }
+
     /// Apply pending updates after auto-migration has added new columns
     void apply_pending_updates() {
         LOG_INFO("migration", "apply_pending_updates: %zu tables queued", pending_updates_.size());
@@ -808,6 +814,9 @@ public:
                     } catch (const std::exception& e) {
                         LOG_ERROR("migration", "Update failed for %s row %lld: %s",
                                   table_name.c_str(), (long long)row_id, e.what());
+                        // A failed transform must abort the surrounding migration
+                        // transaction, including its schema/version publication.
+                        throw;
                     }
                 } else {
                     skip_count++;

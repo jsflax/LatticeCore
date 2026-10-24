@@ -2997,7 +2997,9 @@ public:
         const std::string& table_name,
         void(^callback)(int64_t row_id, const std::unordered_map<std::string, column_value_t>& old_row)
     ) const SWIFT_NAME(enumerateObjects(table:callback:)) {
-        state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+        // This callback exposes only old values. Reading them must not queue
+        // unchanged rows that could overwrite later migration transformations.
+        for (const auto& old_row : state_->ctx->query_sql("SELECT * FROM " + table_name)) {
             // Get row_id
             int64_t row_id = 0;
             auto id_it = old_row.find("id");
@@ -3007,7 +3009,7 @@ public:
 
             // Call Swift callback with old row data
             callback(row_id, old_row);
-        });
+        }
     }
 #else
     /// Enumerate all objects in a table for migration.
@@ -3017,7 +3019,8 @@ public:
         const std::string& table_name,
         std::function<void(int64_t row_id, const std::unordered_map<std::string, column_value_t>& old_row)> callback
     ) const SWIFT_NAME(enumerateObjects(table:callback:)) {
-        state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+        // Match the block-based wrapper: only set_row_value queues writes.
+        for (const auto& old_row : state_->ctx->query_sql("SELECT * FROM " + table_name)) {
             // Get row_id
             int64_t row_id = 0;
             auto id_it = old_row.find("id");
@@ -3027,7 +3030,7 @@ public:
 
             // Call Swift callback with old row data
             callback(row_id, old_row);
-        });
+        }
     }
 #endif
     /// Set a value for a row during migration
@@ -3072,21 +3075,13 @@ public:
     // Called internally before migration context goes out of scope
     void apply_row_updates() const {
         for (const auto& [table_name, rows] : state_->pending_row_updates) {
-            state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
-                int64_t row_id = 0;
-                auto id_it = old_row.find("id");
-                if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
-                    row_id = std::get<int64_t>(id_it->second);
+            for (const auto& [row_id, columns] : rows) {
+                for (const auto& [column, value] : columns) {
+                    state_->ctx->queue_row_value(table_name, row_id, column, value);
                 }
-
-                auto row_it = rows.find(row_id);
-                if (row_it != rows.end()) {
-                    for (const auto& [col, val] : row_it->second) {
-                        new_row[col] = val;
-                    }
-                }
-            });
+            }
         }
+        state_->pending_row_updates.clear();
     }
 
 private:
@@ -3577,17 +3572,19 @@ public:
             // Wrap the C++ migration_context in a Swift-friendly ref
             auto* swift_ctx = new swift_migration_context_ref(&ctx);
             swift_ctx->retain();  // Keep alive during callback
+            const auto release_context = [](swift_migration_context_ref* ref) {
+                if (ref->release()) delete ref;
+            };
+            // Release on both success and exception; Swift may retain its own
+            // reference, so only delete when this callback's retain was last.
+            std::unique_ptr<swift_migration_context_ref, decltype(release_context)>
+                context_guard(swift_ctx, release_context);
 
             // Call the Swift migration block
             migration_block(swift_ctx);
 
             // Apply any row updates that were queued during enumeration
             swift_ctx->apply_row_updates();
-
-            // Release (Swift may have retained, so check before delete)
-            if (swift_ctx->release()) {
-                delete swift_ctx;
-            }
 #else
             // Value-type path: the ref is a plain stack value; no retain/release.
             swift_migration_context_ref swift_ctx(&ctx);

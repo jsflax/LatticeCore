@@ -178,7 +178,7 @@ def notify(tag, *, dry_run=False, environ=None):
     github = GitHub(repository, token)
     release = published_release(github, repository, tag)
     icon_url = None if product == "Engram" else (
-        f"https://raw.githubusercontent.com/{repository}/main/.github/assets/release-icon-cloth-matte.png"
+        f"https://raw.githubusercontent.com/{repository}/main/.github/assets/release-icon-cloth-folded.png"
     )
     payload = build_payload(product, tag, release["html_url"], release.get("body") or "", icon_url)
     if dry_run:

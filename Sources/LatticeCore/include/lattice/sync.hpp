@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <set>
 #include <mutex>
+#include <utility>
 
 namespace lattice {
 
@@ -688,6 +689,28 @@ std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
                               const std::string& sync_id);
+
+/// Rescue copied, unacknowledged local audit entries without acknowledging a
+/// receiving channel. Each unique input ID has one outcome. Duplicate IDs and
+/// unsupported schemas are rejected before entry effects. New entries retain
+/// upload eligibility, including value-identical writes; filter-removal DELETEs
+/// remain synchronized. The source store and its acknowledgements are untouched.
+struct pending_import_result {
+    std::vector<std::string> imported_ids;
+    std::vector<std::string> already_present_ids;
+    std::vector<std::string> rejected_ids;
+};
+pending_import_result apply_pending_changes(lattice_db& db,
+                              const std::vector<audit_log_entry>& entries);
+
+/// Bounded exact-identity audit capture for transports. Decode and late-bind
+/// actual rows in a read snapshot, retaining Core provenance and Int64 values.
+/// Missing/malformed rows or exceeded limits throw; no partial result is returned.
+/// At most 4096 identities and 16 MiB raw/expanded bytes. max_bytes may lower
+/// that budget so a caller can bound a sequence of captures cumulatively.
+std::vector<audit_log_entry> query_audit_log_selected(database& db,
+    const std::vector<std::pair<int64_t, std::string>>& identities,
+    size_t max_bytes = 16 * 1024 * 1024);
 
 // Replication slot management for sync-safe compaction.
 // Each synchronizer registers a slot; compaction only deletes entries

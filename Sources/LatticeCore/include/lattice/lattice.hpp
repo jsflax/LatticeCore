@@ -1504,6 +1504,26 @@ public:
         change_buffer_.back().rows.emplace_back(table, op, row_id, global_id);
     }
 
+    /// Pending-import savepoints roll back SQL without SQLite's transaction
+    /// rollback hook. Keep their uncommitted observer rows equally atomic.
+    /// Caller owns the store write gate and the enclosing transaction.
+    size_t pending_change_buffer_checkpoint() {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        if (change_buffer_.size() > 1) throw std::logic_error("Unexpected uncommitted change batches");
+        return change_buffer_.empty() ? 0 : change_buffer_.back().rows.size();
+    }
+
+    void restore_pending_change_buffer(size_t size) {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        if (change_buffer_.size() > 1 ||
+            (change_buffer_.empty() ? 0 : change_buffer_.back().rows.size()) < size)
+            throw std::logic_error("Pending change checkpoint no longer belongs to this transaction");
+        if (change_buffer_.empty()) return;
+        auto& rows = change_buffer_.back().rows;
+        while (rows.size() > size) rows.pop_back();
+        if (rows.empty()) change_buffer_.clear();
+    }
+
     /// Seal only a completed transaction. splice does not allocate or throw;
     /// rollback may subsequently clear current rows without touching these.
     void seal_change_buffer() noexcept {
@@ -6255,6 +6275,9 @@ public:
     /// changedFieldsNames from AuditLog and pass them to object observers.
     /// Local Swift setter changes don't need this (the setter handles observation).
     std::atomic<bool> applying_remote_changes_{false};
+    /// Pending rescue can roll back an individual journal INSERT. Its cursor
+    /// moves only through the existing committed flush (on all path peers).
+    std::atomic<bool> defer_early_audit_cursor_{false};
 
     /// Set by the upsert/bulk-insert paths so flush_changes() populates changed_fields
     /// for the resulting local UPDATE — lets live object instances backing the conflicted

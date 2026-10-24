@@ -242,6 +242,10 @@ target_link_libraries(LatticeDynamicMigrationTests PRIVATE LatticeCore LatticeSw
 add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)
 target_link_libraries(LatticeNoHistoryNullTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 
+# Bounded pending-write rescue and selected audit export; synthetic stores only.
+add_executable(LatticePendingImportTests Tests/LatticeCoreTests/PendingImportTests.cpp)
+target_link_libraries(LatticePendingImportTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp)

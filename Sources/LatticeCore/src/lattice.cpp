@@ -116,7 +116,8 @@ void lattice_db::setup_change_hook(database& connection) {
                     self->db_->mark_txn_dirty();
                     // Preserve the in-transaction xproc cursor advance: another
                     // same-path instance must not redispatch our local entries.
-                    if (!self->config_.is_in_memory()) {
+                    if (!self->config_.is_in_memory() &&
+                        !self->defer_early_audit_cursor_.load(std::memory_order_acquire)) {
                         instance_registry::instance().for_each_alive(self->config_.path,
                             [rowid](lattice_db* inst) {
                                 inst->last_seen_audit_id_.store(

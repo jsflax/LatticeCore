@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.3.1] - 2026-10-23
+
+### Fixed
+- Accept the null placeholders produced by UPDATE audit triggers in sync
+  `changedFieldsNames` arrays, including the legacy JSON-string form. Swift
+  audit-log encoding preserves those slots; rejecting them discarded complete
+  deliveries containing valid mutations and their receipts.
+- Keep whole-frame rejection for malformed containers, non-string/non-null
+  name elements, missing mutation fields and invalid transport identities.
+
+### Compatibility
+- No persistent schema, wire-format layout or public API changes. Restores
+  compatibility with existing audit rows and Swift audit-log senders.
+
 ## [2.3.0] - 2026-10-23
 
 ### Added

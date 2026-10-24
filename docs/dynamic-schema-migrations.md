@@ -38,9 +38,10 @@ The focused native run passed all ten cases on the Core 2.3.1 repair worktree.
 Rollback fixtures explicitly establish the separately committed base phase first,
 then compare all dynamic data, audit rows, SQLite schema, version/schema metadata
 and fingerprint markers. The row-update failure fixture installs a real SQLite
-unique index rather than assuming property-index metadata support. An old-source
-negative control and a rebuilt consuming Wasm run are still pending; the native
-result alone does not qualify LatticeJS or an installed HUD runtime.
+unique index rather than assuming property-index metadata support. The scoped
+old-source negative control below also reproduced the missing callback. A rebuilt
+consuming Wasm run is still pending; the native result alone does not qualify
+LatticeJS or an installed HUD runtime.
 
 ## Local qualification record
 
@@ -106,5 +107,46 @@ Receipts under `/Users/jason/localdev/hud-scratch/latticecore-hud-migration`:
 Scope: this proves the focused native dynamic-schema callback, transform,
 rollback, version, coexistence and ownership behavior described above. It is
 not release qualification, a whole-Core-suite result, a Swift SDK test run or
-Wasm/browser parity. The old-source negative control is still pending a shared
-build window; no compile or test process from this run remains active.
+Wasm/browser parity. No compile or test process from this run remains active.
+
+## Baseline bridge negative control
+
+At 2026-10-24 **05:03 UTC**, the two selected callback regressions failed as
+expected against the exact `Sources/LatticeSwiftCppBridge/src/lattice.cpp` from
+base `db7edece4f31e6b00ea537d870c2cb452ef9c409`. Both reported zero callback
+invocations where one was required. The versioned test also observed that the
+requested immediate/queued transformations and deletion had not happened.
+The repaired source is commit `36faef606992e81b309baed8ddcbc33f88d93eed`.
+
+This was a **baseline bridge translation-unit control**, not a full baseline
+build: the old source was compiled once with the same Apple clang, SDK, includes,
+C++20/Debug/deployment flags as the passing build, against the passing build's
+headers. Its `lattice.cpp.o` replaced only that member in a scratch copy of
+`libLatticeSwiftCppBridge.a` (`ar -r`, then `ranlib`). The unchanged passing test
+object was relinked with that scratch archive and the other passing libraries.
+Neither the checked-out source nor the passing binary/archive was replaced.
+
+Artifacts are in
+`/Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control`.
+The old source was extracted with
+`git show db7edece4f31e6b00ea537d870c2cb452ef9c409:Sources/LatticeSwiftCppBridge/src/lattice.cpp`.
+The selected test command was:
+
+```sh
+TMPDIR=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/tmp \
+/Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control/LatticeDynamicMigrationTests \
+  --gtest_filter=DynamicMigration.DetectsDynamicChangesAndAppliesTransformsOnce:DynamicMigration.SchemaChangesWithoutVersionBumpStillInvokeGenericCallback \
+  --gtest_output=json:/Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control/tests.json \
+  > /Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control/tests.log 2>&1
+```
+
+Expected process exit: 1; 2 tests failed, 0 errors, 0.176 seconds. The unchanged
+GTest receipt again labels Eastern wall time as UTC (`2026-10-24T01:03:21Z`);
+its actual filesystem timestamp is `2026-10-24T05:03:21.232819+00:00`.
+
+| Negative-control file | SHA-256 |
+| --- | --- |
+| `lattice.cpp` | `51cf67956967bd0b1bb03c2a6198c89962818773650616cbd53e278205a80535` |
+| `LatticeDynamicMigrationTests` | `c11201402ec63e563bb5cc20b50eeaf69f3ba8a9016affd1c926f0e6c53ae50e` |
+| `tests.json` | `b69ca385e555181d84c03b20f9563576f09f0ab264752594710001b0817e3460` |
+| `tests.log` | `149a1bd341fd3088521f7c339fe15dd0ae7d5f70ec17907fe044bd6d92a2135a` |

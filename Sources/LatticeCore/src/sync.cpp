@@ -514,6 +514,9 @@ static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
         auto names = [&](const json& value) {
             if (!value.is_array()) return false;
             for (const auto& item : value) {
+                // UPDATE audit triggers leave null slots for unchanged columns. Swift's
+                // AuditLog encoder preserves them; they are not malformed field names.
+                if (item.is_null()) continue;
                 if (!item.is_string()) return false;
                 entry.changed_fields_names.push_back(item.get<std::string>());
             }

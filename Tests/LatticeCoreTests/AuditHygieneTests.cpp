@@ -996,7 +996,7 @@ TEST(AuditHygiene, MalformedWirePositionRejectsWholeFrameWithoutAckOrCursorLeapA
     using namespace malformed_audit_ack;
     // Every variant has valid outer JSON and valid neighbors on both sides.
     // The intended UPDATE addresses an existing known row with changed values.
-    for (int variant = 0; variant < 11; ++variant) {
+    for (int variant = 0; variant < 16; ++variant) {
         SCOPED_TRACE(variant);
         TempDB file{"malformed-wire-position"};
         auto queue = std::make_shared<wire_queue>();
@@ -1023,7 +1023,12 @@ TEST(AuditHygiene, MalformedWirePositionRejectsWholeFrameWithoutAckOrCursorLeapA
             case 7: bad = "null"; break;
             case 8: bad = replace_once(valid_middle, "\"globalId\":" + quote_wire_string(entries[1].global_id), "\"globalId\":17"); break;
             case 9: bad = replace_once(valid_middle, names_member + ",", ""); break;
-            default: bad = replace_once(valid_middle, fields_member + ",", ""); break;
+            case 10: bad = replace_once(valid_middle, fields_member + ",", ""); break;
+            case 11: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":[\"name\",{}]"); break;
+            case 12: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":[\"name\",[]]"); break;
+            case 13: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":[\"name\",true]"); break;
+            case 14: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":null"); break;
+            default: bad = replace_once(valid_middle, names_member, "\"changedFieldsNames\":" + quote_wire_string("[\"name\",17]")); break;
         }
         const auto malformed_frame = frame(std::vector<std::string>{entries[0].to_json(), bad, entries[2].to_json()});
         EXPECT_FALSE(lattice::audit_log_entry::from_json(bad).has_value());
@@ -1073,6 +1078,82 @@ TEST(AuditHygiene, MalformedWirePositionRejectsWholeFrameWithoutAckOrCursorLeapA
         EXPECT_EQ(repeated.audit, applied.audit);
         EXPECT_EQ(repeated.sync_state, applied.sync_state);
         EXPECT_EQ(db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId"), receipts_applied);
+        sync.disconnect();
+    }
+}
+
+TEST(AuditHygiene, NativeNullableUpdateNamesAckWholeFrameAndRedeliverWithoutMutation) {
+    using namespace malformed_audit_ack;
+    for (const bool string_container : {false, true}) {
+        SCOPED_TRACE(string_container);
+        // Read the actual trigger output, before the native upload path filters null slots.
+        // Swift AuditLog Codable preserves these slots in its [String?] field on the wire.
+        TempDB source_file{"nullable-names-source"};
+        lattice::lattice_db source{lattice::configuration(source_file.str())};
+        const auto source_row = source.add(TestPerson{"BeforeNullable", 70, "keep@example.test"});
+        source.db().execute("UPDATE TestPerson SET name='AfterNullable' WHERE globalId=?", {source_row.global_id()});
+        const auto raw = source.db().query("SELECT changedFields,changedFieldsNames FROM AuditLog "
+                                          "WHERE tableName='TestPerson' AND operation='UPDATE' ORDER BY id DESC LIMIT 1");
+        ASSERT_EQ(raw.size(), 1u);
+        const auto names = std::get<std::string>(raw[0].at("changedFieldsNames"));
+        ASSERT_NE(names.find("null"), std::string::npos);
+
+        TempDB file{"nullable-names-receiver"};
+        auto queue = std::make_shared<wire_queue>();
+        lattice::configuration config(file.str(), queue);
+        auto owner = std::make_unique<lattice::lattice_db>(config);
+        auto& db = *owner;
+        const auto target = db.add(TestPerson{"BeforeNullable", 70, "keep@example.test"});
+        initialize(db);
+        auto entries = h3_insert_entries(3);
+        entries[1].operation = "UPDATE";
+        entries[1].global_row_id = target.global_id();
+        entries[1].changed_fields = lattice::audit_log_entry::parse_changed_fields(
+            std::get<std::string>(raw[0].at("changedFields")));
+        entries[1].changed_fields_names = {"name"};
+        const auto middle = replace_once(entries[1].to_json(),
+            "\"changedFieldsNames\":" + entries[1].changed_fields_names_to_json(),
+            "\"changedFieldsNames\":" + (string_container ? quote_wire_string(names) : names));
+        const auto delivery = frame(std::vector<std::string>{entries[0].to_json(), middle, entries[2].to_json()});
+        const auto parsed = lattice::audit_log_entry::from_json(middle);
+        EXPECT_TRUE(parsed.has_value());
+        if (parsed) EXPECT_EQ(parsed->changed_fields_names, (std::vector<std::string>{"name"}));
+        EXPECT_TRUE(lattice::server_sent_event::from_json(delivery).has_value());
+
+        auto transport = std::make_unique<lattice::mock_sync_transport>();
+        auto* wire = transport.get();
+        lattice::sync_config sync_config;
+        sync_config.sync_id = "malformed-chan";
+        sync_config.checkpoint_passive_interval_ms = 0;
+        lattice::synchronizer sync(std::move(owner), sync_config, std::move(transport));
+        queue_ending ending{queue};
+        sync.connect();
+        queue->drain();
+        settle_seed_upload(sync, *wire, *queue);
+        wire->clear_sent_messages();
+        wire->simulate_message(lattice::transport_message::from_string(delivery));
+        queue->drain();
+        const std::vector<std::string> expected{entries[0].global_id, entries[1].global_id, entries[2].global_id};
+        EXPECT_EQ(sent_acks(*wire), expected);
+        EXPECT_EQ(cursor(db), entries.back().global_id);
+        const auto changed = db.db().query("SELECT name,age,email FROM TestPerson WHERE globalId=?", {target.global_id()});
+        ASSERT_EQ(changed.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(changed[0].at("name")), "AfterNullable");
+        EXPECT_EQ(std::get<int64_t>(changed[0].at("age")), 70);
+        EXPECT_EQ(std::get<std::string>(changed[0].at("email")), "keep@example.test");
+        const auto applied = apply_preamble_snapshot(db.db());
+        EXPECT_EQ(applied.persons.size(), 3u);
+        EXPECT_EQ(db.db().query("SELECT id FROM AuditLog WHERE globalId=?", {entries[1].global_id}).size(), 1u);
+        const auto receipts = db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId");
+        wire->clear_sent_messages();
+        wire->simulate_message(lattice::transport_message::from_string(delivery));
+        queue->drain();
+        EXPECT_EQ(sent_acks(*wire), expected);
+        EXPECT_EQ(cursor(db), entries.back().global_id);
+        expect_same(applied, apply_preamble_snapshot(db.db()));
+        EXPECT_EQ(db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId"), receipts);
+        EXPECT_FALSE(db.db().is_in_transaction());
+        EXPECT_FALSE(db.applying_remote_changes_.load(std::memory_order_acquire));
         sync.disconnect();
     }
 }

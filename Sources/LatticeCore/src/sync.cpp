@@ -398,6 +398,12 @@ static json entry_to_json_obj(const audit_log_entry& e);
 // These are transport identities and the operations this receiver implements,
 // independent of local schema knowledge. Schema-skew no-ops are still valid.
 static bool remote_entry_envelope_valid(const audit_log_entry& entry) {
+    // This namespace belongs to the local receipt primitive, never a peer.
+    // Check before link-table creation and schema-skew/dedup ACK shortcuts.
+    // Match case-insensitively even inside a quoted or qualified identifier.
+    std::string table = entry.table_name;
+    for (auto& c : table) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (table.find("_lattice_local_metadata") != std::string::npos) return false;
     return !entry.global_id.empty() && !entry.table_name.empty() &&
            !entry.global_row_id.empty() &&
            (entry.operation == "INSERT" || entry.operation == "UPDATE" ||

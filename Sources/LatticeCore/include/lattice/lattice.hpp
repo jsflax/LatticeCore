@@ -4423,6 +4423,17 @@ public:
         return query_read(sql.str(), repeated);
     }
 
+    /// Immutable, namespaced state local to this physical database. It is
+    /// neither a model nor synchronization history. Reads never create storage;
+    /// insertion requires this thread's existing explicit write transaction.
+    /// This lets a caller atomically persist a receipt with ordinary audited
+    /// model mutations, without opening a second database or bypassing Lattice.
+    std::optional<std::string> local_metadata(const std::string& name_space,
+                                              const std::string& key);
+    bool insert_local_metadata_if_absent(const std::string& name_space,
+                                         const std::string& key,
+                                         const std::string& value);
+
     // Transaction support. On shared-cache stores the per-store write gate
     // (results spec §4.1) is held for the duration of the transaction, so
     // generation captures on sibling handles never interleave a

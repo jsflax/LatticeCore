@@ -198,6 +198,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
     Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp
+    Tests/LatticeCoreTests/LocalMetadataTests.cpp
     Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
@@ -231,6 +232,10 @@ target_include_directories(LatticeCoreTests PRIVATE
 # fixed-path logging environment. TMPDIR selects all fixture output locations.
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
+
+# Focused transaction/receipt qualification without compiling every bridge test.
+add_executable(LatticeLocalMetadataTests Tests/LatticeCoreTests/LocalMetadataTests.cpp)
+target_link_libraries(LatticeLocalMetadataTests PRIVATE LatticeCore gtest_main)
 
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp

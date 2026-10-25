@@ -3824,6 +3824,14 @@ public:
     }
     void optimize() const { impl().optimize(); }
 
+    OptionalString local_metadata(const std::string& name_space, const std::string& key) const {
+        return sealed([&] { return impl().local_metadata(name_space, key); });
+    }
+    bool insert_local_metadata_if_absent(const std::string& name_space, const std::string& key,
+                                          const std::string& value) const {
+        return sealed([&] { return impl().insert_local_metadata_if_absent(name_space, key, value); });
+    }
+
     // Transactions — begin_transaction throws db_error when the busy
     // timeout lapses or an allocation fails under memory pressure; that
     // escaped into Swift and killed the Engram MCP server twice on

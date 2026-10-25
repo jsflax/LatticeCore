@@ -234,6 +234,10 @@ target_include_directories(LatticeCoreTests PRIVATE
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
 
+# Focused no-history transport tests, using synthetic real-Core stores only.
+add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)
+target_link_libraries(LatticeNoHistoryNullTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp)

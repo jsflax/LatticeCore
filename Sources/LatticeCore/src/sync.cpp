@@ -15,6 +15,11 @@ std::function<void(size_t chunk_start)> apply_chunk_begin;
 
 using json = nlohmann::json;
 
+namespace {
+std::vector<std::string> no_history_columns(database& db, const std::string& table_name);
+void mark_no_history_nulls(audit_log_entry& entry, const std::vector<std::string>& columns);
+}
+
 static std::atomic<int64_t> g_sync_instance_count{0};
 
 // ============================================================================
@@ -397,8 +402,26 @@ static json entry_to_json_obj(const audit_log_entry& e);
 
 // These are transport identities and the operations this receiver implements,
 // independent of local schema knowledge. Schema-skew no-ops are still valid.
+static bool no_history_null_metadata_valid(const audit_log_entry& entry) {
+    if (!entry.no_history_nulls.empty()) {
+        if (entry.operation != "INSERT" && entry.operation != "UPDATE") return false;
+        std::unordered_set<std::string> seen;
+        for (const auto& name : entry.no_history_nulls) {
+            const auto value = entry.changed_fields.find(name);
+            if (name.empty() || !seen.insert(name).second ||
+                std::find(entry.changed_fields_names.begin(), entry.changed_fields_names.end(), name)
+                    == entry.changed_fields_names.end() ||
+                value == entry.changed_fields.end() ||
+                value->second.kind != any_property_kind::null_kind ||
+                !std::holds_alternative<std::nullptr_t>(value->second.value)) return false;
+        }
+    }
+    return true;
+}
+
 static bool remote_entry_envelope_valid(const audit_log_entry& entry) {
-    return !entry.global_id.empty() && !entry.table_name.empty() &&
+    return no_history_null_metadata_valid(entry) &&
+           !entry.global_id.empty() && !entry.table_name.empty() &&
            !entry.global_row_id.empty() &&
            (entry.operation == "INSERT" || entry.operation == "UPDATE" ||
             entry.operation == "DELETE");
@@ -411,6 +434,8 @@ std::string audit_log_entry::to_json() const {
 }
 
 static json entry_to_json_obj(const audit_log_entry& entry) {
+    if (!no_history_null_metadata_valid(entry))
+        throw std::invalid_argument("Invalid noHistoryNulls completeness metadata");
     const auto& id = entry.id;
     const auto& global_id = entry.global_id;
     const auto& table_name = entry.table_name;
@@ -448,6 +473,7 @@ static json entry_to_json_obj(const audit_log_entry& entry) {
         // Optional key — only on the wire when set. Old receivers ignore it.
         j["synthesized"] = true;
     }
+    if (!entry.no_history_nulls.empty()) j["noHistoryNulls"] = entry.no_history_nulls;
 
     return j;
 }
@@ -493,12 +519,29 @@ static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
             return std::nullopt;
         }
 
+        if (j.contains("noHistoryNulls")) {
+            if (!j["noHistoryNulls"].is_array()) return std::nullopt;
+            for (const auto& name : j["noHistoryNulls"]) {
+                if (!name.is_string()) return std::nullopt;
+                entry.no_history_nulls.push_back(name.get<std::string>());
+            }
+        }
+
         // Both wire spellings are supported, but malformed JSON or a wrong
         // container/element type must not become an ACKable empty mutation.
         // Decode already-parsed containers by reference (no dump/reparse).
         auto fields = [&](const json& value) {
             if (!value.is_object()) return false;
             for (const auto& [key, item] : value.items()) {
+                // Do not let the permissive legacy AnyProperty decoder turn
+                // a malformed value into a marked, intentional NULL.
+                if (std::find(entry.no_history_nulls.begin(), entry.no_history_nulls.end(), key)
+                    != entry.no_history_nulls.end()) {
+                    const bool typed_null = item.is_object() && item.contains("kind") &&
+                        item["kind"].is_number_integer() && item["kind"] == 4 &&
+                        item.contains("value") && item["value"].is_null();
+                    if (!item.is_null() && !typed_null) return false;
+                }
                 entry.changed_fields[key] = json_to_any_property(item);
             }
             return true;
@@ -1527,6 +1570,8 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
         }
         entry.changed_fields_names.push_back(col_name);
     }
+
+    mark_no_history_nulls(entry, no_history_columns(db().db(), table_name));
 
     return entry;
 }
@@ -2867,6 +2912,16 @@ bool value_is_absent(const audit_log_entry& e, const std::string& col) {
     return it == e.changed_fields.end() || it->second.kind == any_property_kind::null_kind;
 }
 
+void mark_no_history_nulls(audit_log_entry& entry, const std::vector<std::string>& columns) {
+    entry.no_history_nulls.clear();
+    for (const auto& col : columns) {
+        const auto value = entry.changed_fields.find(col);
+        if (value != entry.changed_fields.end() && value->second.kind == any_property_kind::null_kind &&
+            std::find(entry.changed_fields_names.begin(), entry.changed_fields_names.end(), col)
+                != entry.changed_fields_names.end()) entry.no_history_nulls.push_back(col);
+    }
+}
+
 } // namespace
 
 std::string no_history_live_values_json(database& db, const std::string& table_name,
@@ -2893,13 +2948,19 @@ std::string no_history_live_values_json(database& db, const std::string& table_n
 void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
     std::unordered_map<std::string, std::vector<std::string>> flagged_by_table;
     for (auto& e : entries) {
-        if (e.operation != "UPDATE") continue;
+        e.no_history_nulls.clear();
+        if (e.operation != "UPDATE" && e.operation != "INSERT") continue;
         auto cached = flagged_by_table.find(e.table_name);
         if (cached == flagged_by_table.end()) {
             cached = flagged_by_table.emplace(e.table_name, no_history_columns(db, e.table_name)).first;
         }
         const auto& cols = cached->second;
         if (cols.empty()) continue;
+        if (e.operation == "INSERT") {
+            // INSERT history is a complete payload, never a placeholder.
+            mark_no_history_nulls(e, cols);
+            continue;
+        }
         std::vector<std::string> need;
         for (const auto& col : cols) {
             const bool listed = std::find(e.changed_fields_names.begin(), e.changed_fields_names.end(), col)
@@ -2931,6 +2992,7 @@ void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
                     e.changed_fields_names.end());
             }
         }
+        mark_no_history_nulls(e, cols);
     }
 }
 
@@ -3594,6 +3656,7 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::unordered_set<std::string> tables_ensured;
     std::unordered_set<std::string> vec0_ensured;
     std::unordered_map<std::string, std::unordered_map<std::string, column_type>> schema_cache;
+    std::unordered_map<std::string, std::unordered_set<std::string>> nullable_cache;
 
     bool chunk_retried = false;
     for (size_t chunk_start = 0; chunk_start < entries.size(); ) {
@@ -3772,20 +3835,34 @@ static std::vector<std::string> apply_remote_changes_impl(
                         }
                     }
 
-                    // no_history receiver guard (1.5.0). A sender is supposed
-                    // to late-bind these columns before shipping; if one
-                    // arrives null anyway (older sender, a row deleted mid-
-                    // flight), binding NULL would violate a NOT NULL column
-                    // and the failed entry would be re-sent forever (the same
-                    // wedge the skew filter above closes). Drop the column and
-                    // apply the rest; the value follows in a later entry.
+                    // Unmarked NULL is still a legacy history placeholder.
+                    // Marked NULL is an intentional clear only when the local
+                    // physical column permits it. Keep the NOT NULL anti-wedge
+                    // guard even for newer peers with a different schema.
                     if (is_model_table &&
                         (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
                         std::vector<std::string> drop;
+                        auto nullable = nullable_cache.find(entry.table_name);
+                        if (nullable == nullable_cache.end()) {
+                            std::unordered_set<std::string> columns;
+                            for (const auto& row : db.db().query("PRAGMA table_info(" + entry.table_name + ")")) {
+                                const auto name = row.find("name"), required = row.find("notnull"), pk = row.find("pk");
+                                if (name != row.end() && required != row.end() && pk != row.end() &&
+                                    std::holds_alternative<std::string>(name->second) &&
+                                    std::holds_alternative<int64_t>(required->second) &&
+                                    std::holds_alternative<int64_t>(pk->second) &&
+                                    std::get<int64_t>(required->second) == 0 && std::get<int64_t>(pk->second) == 0)
+                                    columns.insert(std::get<std::string>(name->second));
+                            }
+                            nullable = nullable_cache.emplace(entry.table_name, std::move(columns)).first;
+                        }
                         for (const auto& col : no_history_columns(db.db(), entry.table_name)) {
                             const auto& names = apply_entry->changed_fields_names;
                             if (std::find(names.begin(), names.end(), col) != names.end() &&
-                                value_is_absent(*apply_entry, col)) {
+                                value_is_absent(*apply_entry, col) &&
+                                !(nullable->second.count(col) &&
+                                  std::find(entry.no_history_nulls.begin(), entry.no_history_nulls.end(), col)
+                                    != entry.no_history_nulls.end())) {
                                 drop.push_back(col);
                             }
                         }
@@ -4012,6 +4089,7 @@ static std::vector<std::string> apply_remote_changes_impl(
             tables_ensured.clear();
             vec0_ensured.clear();
             schema_cache.clear();
+            nullable_cache.clear();
             if (!chunk_retried) {
                 chunk_retried = true;
                 LOG_WARN("apply_remote", "chunk [%zu,%zu) failed (%s) — retrying once",
@@ -4033,6 +4111,7 @@ static std::vector<std::string> apply_remote_changes_impl(
             tables_ensured.clear();
             vec0_ensured.clear();
             schema_cache.clear();
+            nullable_cache.clear();
             LOG_WARN("apply_remote",
                      "chunk [%zu,%zu) failed (non-std exception) — stopping this delivery; "
                      "%zu already-committed entries will be acked",

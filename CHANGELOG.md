@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.4.1] - 2026-10-25
+
+### Fixed
+- Replicate an observed null for nullable NoHistory fields, so clearing a previously cached value reaches the receiving store. Preserve the distinction between an explicit clear and a legacy unavailable-value placeholder.
+- Validate observed-null transport metadata before duplicate handling and require the receiver field to be both NoHistory and physically nullable.
+- Clear the nullable-field cache with the existing schema caches after a chunk rollback, allowing a corrected retry to use current column metadata.
+
+### Compatibility
+- Optional sync metadata and additive C++/Swift bridge fields; no persistent schema or public C ABI change. Rebuild Core and Swift bridge consumers together.
+- Use the matching Swift adapter to preserve observed-null metadata through Codable and bridge transport. Older peers retain their previous null behavior; this release does not retroactively repair already-acknowledged clears.
+
 ## [2.4.0] - 2026-10-24
 
 ### Added

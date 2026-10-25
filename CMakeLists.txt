@@ -217,6 +217,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
     Tests/LatticeCoreTests/AuditRetentionTests.cpp
     Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditedWritesPreparationTests.cpp
     Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
@@ -236,6 +237,14 @@ target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_ma
 # Focused transaction/receipt qualification without compiling every bridge test.
 add_executable(LatticeLocalMetadataTests Tests/LatticeCoreTests/LocalMetadataTests.cpp)
 target_link_libraries(LatticeLocalMetadataTests PRIVATE LatticeCore gtest_main)
+
+# Audited-writer admission and the suppression/ownership paths it shares.
+add_executable(LatticeAuditedWritesPreparationTests
+    Tests/LatticeCoreTests/AuditedWritesPreparationTests.cpp
+    Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditHygieneTests.cpp)
+target_link_libraries(LatticeAuditedWritesPreparationTests PRIVATE LatticeCore gtest_main)
 
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp

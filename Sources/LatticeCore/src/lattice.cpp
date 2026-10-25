@@ -98,6 +98,64 @@ bool lattice_db::insert_local_metadata_if_absent(const std::string& name_space,
     return sqlite3_changes(db_->handle()) == 1;
 }
 
+bool lattice_db::prepare_for_audited_writes() {
+    if (config_.read_only) throw db_error("audited writes require a writable connection");
+    return with_audit_prune_transaction_([&]() -> int64_t {
+        // sync_disabled() resolves this name on the connection. A TEMP shadow
+        // would make normalizing main's flag insufficient to enable auditing.
+        if (!db_->query("SELECT 1 FROM temp.sqlite_schema WHERE name = '_SyncControl' COLLATE NOCASE").empty())
+            throw db_error("audited writes reject a temporary sync control shadow");
+        const auto tables = db_->query(
+            "SELECT type, name, sql FROM main.sqlite_schema WHERE name = '_SyncControl' COLLATE NOCASE");
+        if (tables.size() != 1 ||
+            !std::holds_alternative<std::string>(tables[0].at("type")) ||
+            std::get<std::string>(tables[0].at("type")) != "table" ||
+            !std::holds_alternative<std::string>(tables[0].at("name")) ||
+            std::get<std::string>(tables[0].at("name")) != "_SyncControl" ||
+            !std::holds_alternative<std::string>(tables[0].at("sql")))
+            throw db_error("audited writes require the canonical sync control table");
+        // Accept formatting/case differences, but no alternate constraints,
+        // extra columns, generated columns, views or virtual tables.
+        std::string shape;
+        for (unsigned char c : std::get<std::string>(tables[0].at("sql"))) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') continue;
+            shape += c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+        }
+        if (shape != "createtable_synccontrol(idintegerprimarykeycheck(id=1),disabledintegernotnulldefault0)" ||
+            !db_->query("SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger' "
+                        "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty() ||
+            !db_->query("SELECT 1 FROM temp.sqlite_schema WHERE type = 'trigger' "
+                        "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty())
+            throw db_error("audited writes require the canonical sync control shape without triggers");
+
+        // SQL whitespace normalization alone cannot distinguish keywords from
+        // a custom declared type such as INTEGERPRIMARYKEY. Check SQLite's
+        // parsed column metadata too, including generated/hidden columns.
+        const std::vector<database::row_t> expected_columns = {
+            {{"cid", int64_t{0}}, {"name", std::string("id")}, {"type", std::string("INTEGER")},
+             {"notnull", int64_t{0}}, {"dflt_value", nullptr}, {"pk", int64_t{1}}, {"hidden", int64_t{0}}},
+            {{"cid", int64_t{1}}, {"name", std::string("disabled")}, {"type", std::string("INTEGER")},
+             {"notnull", int64_t{1}}, {"dflt_value", std::string("0")}, {"pk", int64_t{0}}, {"hidden", int64_t{0}}}
+        };
+        if (db_->query("PRAGMA main.table_xinfo('_SyncControl')") != expected_columns)
+            throw db_error("audited writes require the canonical sync control column metadata");
+
+        const auto rows = db_->query("SELECT id, disabled FROM main._SyncControl");
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("id")) ||
+            std::get<int64_t>(rows[0].at("id")) != 1 ||
+            !std::holds_alternative<int64_t>(rows[0].at("disabled")))
+            throw db_error("audited writes require one integer sync control row with id 1");
+        const auto disabled = std::get<int64_t>(rows[0].at("disabled"));
+        if (disabled != 0 && disabled != 1)
+            throw db_error("audited writes require a zero or one sync control flag");
+        if (disabled == 0) return 0;
+        db_->execute("UPDATE main._SyncControl SET disabled = 0 WHERE id = 1");
+        if (sqlite3_changes64(db_->handle()) != 1 || sync_flag_in_owned_transaction_() != 0)
+            throw db_error("audited writes did not normalize exactly one sync control row");
+        return 1;
+    }) != 0;
+}
+
 // Single definition of the global log level (declared extern in log.hpp).
 // Seed from the LATTICE_LOG_LEVEL env var (0=off..4=debug) so logging can be
 // enabled for a test/run without code changes, e.g. `LATTICE_LOG_LEVEL=4 swift test`.

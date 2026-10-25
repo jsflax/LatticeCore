@@ -3773,6 +3773,11 @@ public:
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
         return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
     }
+    /// Explicit audited-writer admission. false also represents a sealed
+    /// failure; callers must check last_bridge_error() before using the result.
+    bool prepare_for_audited_writes() const {
+        return sealed([&] { return impl().prepare_for_audited_writes(); });
+    }
     /// Age-based, cursor-safe history prune (see lattice_db::prune_audit_log).
     int64_t prune_audit_log(int64_t retention_seconds) const
         SWIFT_NAME(pruneAuditLog(retentionSeconds:)) {

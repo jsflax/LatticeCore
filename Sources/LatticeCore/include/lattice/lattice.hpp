@@ -3404,6 +3404,13 @@ public:
         return 0;
     }
 
+    /// Explicitly prepare a store whose owner requires ordinary writes to be
+    /// audited. Validate the canonical control table and its single 0/1 flag,
+    /// then normalize a legacy disabled flag in an exclusively owned write
+    /// transaction. Returns true only when 1 changed to 0. Ordinary opens and
+    /// generic maintenance preserve deliberately disabled auditing.
+    bool prepare_for_audited_writes();
+
     /// Hard-delete rows WITHOUT relaying the deletes: each row's DELETE
     /// audit entry carries the `__lattice_filter_removal` marker, which WSS
     /// receivers skip-and-ack (they never apply it) and IPC receivers record
@@ -3426,11 +3433,8 @@ public:
     int64_t delete_rows_no_relay(const std::string& table,
                                  const std::vector<std::string>& global_row_ids) {
         if (global_row_ids.empty()) return 0;
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        int64_t deleted = 0;
-        db_->begin_transaction();
-        try {
-            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        return with_sync_suppressed_transaction_([&]() -> int64_t {
+            int64_t deleted = 0;
             for (const auto& gid : global_row_ids) {
                 db_->execute("DELETE FROM \"" + table + "\" WHERE globalId = ? COLLATE NOCASE",
                              {gid});
@@ -3445,17 +3449,8 @@ public:
                     "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
                     {generate_global_id(), table, gid});
             }
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->commit();
-        } catch (...) {
-            db_->rollback();
-            // The flag write above rolled back with everything else, but
-            // restore defensively in case the txn died after a partial step.
-            try { db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1",
-                               {prev_disabled}); } catch (...) {}
-            throw;
-        }
-        return deleted;
+            return deleted;
+        });
     }
 
     /// Repair audit rows whose timestamp landed in the REAL column as TEXT.
@@ -3711,6 +3706,20 @@ public:
 
 private:
     friend struct audit_maintenance_test_access;
+    friend struct sync_apply_transaction_access;
+    template<typename F>
+    int64_t with_sync_suppressed_transaction_(F&& body) {
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            // Capture only after ownership and BEGIN. Reading before admission
+            // can save another operation's temporary 1, or an old persistent
+            // 1 that prepare_for_audited_writes has since normalized.
+            const auto previous = sync_flag_in_owned_transaction_();
+            db_->execute("UPDATE main._SyncControl SET disabled = 1 WHERE id = 1");
+            const auto result = std::forward<F>(body)();
+            db_->execute("UPDATE main._SyncControl SET disabled = ? WHERE id = 1", {previous});
+            return result;
+        });
+    }
     template<typename F>
     int64_t with_audit_prune_transaction_(F&& body) {
         int64_t result = 0;
@@ -3976,12 +3985,12 @@ private:
         return value;
     }
 
-    int64_t history_sync_flag_in_transaction_() {
+    int64_t sync_flag_in_owned_transaction_() {
         const auto rows = db_->query("SELECT disabled FROM main._SyncControl WHERE id=1");
-        if (rows.size() != 1) throw db_error("history generation requires one sync control row");
+        if (rows.size() != 1) throw db_error("owned transaction requires one sync control row");
         const auto it = rows[0].find("disabled");
         if (it == rows[0].end() || !std::holds_alternative<int64_t>(it->second))
-            throw db_error("history generation requires an integer sync control flag");
+            throw db_error("owned transaction requires an integer sync control flag");
         return std::get<int64_t>(it->second);
     }
 
@@ -4095,7 +4104,7 @@ private:
                     plans.push_back(std::move(plan));
                 }
                 if (force) {
-                    const int64_t disabled = history_sync_flag_in_transaction_();
+                    const int64_t disabled = sync_flag_in_owned_transaction_();
                     db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
                     db_->execute("DELETE FROM main.AuditLog");
                     db_->execute("DELETE FROM main._lattice_sync_state");
@@ -4217,7 +4226,7 @@ private:
                         }
                         where += " ORDER BY " + order_expr + " LIMIT ?";
                         params.push_back(batch_size);
-                        const auto disabled = history_sync_flag_in_transaction_();
+                        const auto disabled = sync_flag_in_owned_transaction_();
                         db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
                         db_->execute(base.str() + where, params);
                         const auto count = static_cast<int64_t>(sqlite3_changes(db_->handle()));

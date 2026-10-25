@@ -519,7 +519,8 @@ static std::vector<std::string> collect_all_sync_ids(const configuration& config
 }
 
 void lattice_db::setup_sync_if_configured() {
-    if (!config_.is_sync_enabled()) {
+    if (is_closed() || config_.read_only || !sync_start_requested_ ||
+        !config_.is_sync_enabled() || synchronizer_) {
         return;
     }
 
@@ -583,9 +584,15 @@ void lattice_db::setup_sync_if_configured() {
     // Only one synchronizer per {path, websocket_url} across all instances
     if (!try_register_sync_key(config_.path, config_.websocket_url)) {
         LOG_DEBUG("lattice_db", "Synchronizer already active for this path, skipping");
+#ifndef __EMSCRIPTEN__
+        if (sync_lock_fd_ >= 0) {
+            ::flock(sync_lock_fd_, LOCK_UN); ::close(sync_lock_fd_); sync_lock_fd_ = -1;
+        }
+#endif
         return;
     }
 
+    try {
     // Create sync config from our configuration
     sync_config sync_cfg;
     sync_cfg.websocket_url = config_.websocket_url;
@@ -615,6 +622,7 @@ void lattice_db::setup_sync_if_configured() {
     // directly. This avoids opening a second connection to the same OPFS file,
     // which would fail due to exclusive locking.
     LOG_INFO("lattice_db", "sync using shared db (Emscripten), path=%s", config_.path.c_str());
+    if (!config_.sync_autostart) heal_collapsed_sync_state();
 #else
     // Native: create a dedicated lattice_db for the synchronizer (separate
     // connection on its own thread via std_thread_scheduler).
@@ -658,9 +666,22 @@ void lattice_db::setup_sync_if_configured() {
     if (on_sync_error_) {
         synchronizer_->set_on_error(on_sync_error_);
     }
+    if (on_sync_progress_) synchronizer_->set_on_progress(on_sync_progress_);
 
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
+    } catch (...) {
+        // Manual start is retryable on the same local handle after setup fails.
+        // Do not strand an ownership key/flock or tear down unrelated IPC.
+        synchronizer_.reset();
+        unregister_sync_key(config_.path, config_.websocket_url);
+#ifndef __EMSCRIPTEN__
+        if (sync_lock_fd_ >= 0) {
+            ::flock(sync_lock_fd_, LOCK_UN); ::close(sync_lock_fd_); sync_lock_fd_ = -1;
+        }
+#endif
+        throw;
+    }
 }
 
 void lattice_db::setup_ipc_if_configured() {

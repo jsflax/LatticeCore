@@ -261,4 +261,42 @@ TEST(NoHistoryNull, AlreadyAckedLegacyClearIsNotRepairedByReplayingWithMarker) {
     ASSERT_EQ(apply_remote_changes(db, {e}).size(), 1u);
     expect_body(db, "first"); // Same audit identity was already ACKed; cutover needs explicit repair.
 }
+
+TEST(NoHistoryNull, ChunkRetryRefreshesPhysicalNullabilityAfterSchemaChange) {
+    File file;
+    lattice::swift_lattice db(config(file), schema());
+    seed(db);
+    auto entry = clear("schema-retry");
+    entry.changed_fields_names.push_back("future");
+    entry.changed_fields["future"] = any_property(nullptr);
+    entry.no_history_nulls.push_back("future");
+    // The first attempt populates its schema/nullability caches, then fails
+    // while restoring the trigger gate. No row change or receipt may survive.
+    db.db().execute("CREATE TRIGGER fail_chunk_restore BEFORE UPDATE OF disabled ON _SyncControl "
+                    "WHEN NEW.disabled=0 BEGIN SELECT RAISE(ABORT,'retry fixture'); END");
+    struct ResetHook {
+        ~ResetHook() { test_hooks::apply_chunk_begin = nullptr; }
+    } reset;
+    int attempts = 0;
+    test_hooks::apply_chunk_begin = [&](size_t chunk_start) {
+        EXPECT_EQ(chunk_start, 0u);
+        if (++attempts != 2) return;
+        const auto before = db.db().query("SELECT title FROM NhNull WHERE globalId='row'");
+        ASSERT_EQ(before.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(before[0].at("title")), "initial");
+        EXPECT_TRUE(db.db().query("SELECT id FROM AuditLog WHERE globalId='schema-retry'").empty());
+        // Simulate a committed physical schema/NoHistory metadata addition
+        // between the rolled-back attempt and its retry, using real SQLite.
+        db.db().execute("DROP TRIGGER fail_chunk_restore");
+        db.db().execute("ALTER TABLE NhNull ADD COLUMN future TEXT DEFAULT 'prior'");
+        db.db().execute("UPDATE _lattice_meta SET value='body,future,required' "
+                        "WHERE key='trigger_flags:NhNull'");
+    };
+    EXPECT_EQ(apply_remote_changes(db, {entry}), std::vector<std::string>{entry.global_id});
+    EXPECT_EQ(attempts, 2);
+    const auto after = db.db().query("SELECT future FROM NhNull WHERE globalId='row'");
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(after[0].at("future")));
+    EXPECT_EQ(db.db().query("SELECT id FROM AuditLog WHERE globalId='schema-retry'").size(), 1u);
+}
 } // namespace

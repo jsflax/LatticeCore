@@ -94,6 +94,8 @@ TEST(TransportAuthentication, EmptyDefaultTokenNeverConstructsTransportButManage
             EXPECT_EQ(factory->attempts->front().url, config.websocket_url);
             EXPECT_TRUE(factory->attempts->front().headers.empty());
             db.connect_sync();
+            EXPECT_EQ(factory->attempts->size(), 1u);
+            db.reconnect_sync();
             EXPECT_EQ(factory->attempts->size(), 2u);
             EXPECT_TRUE(factory->attempts->back().headers.empty());
         }

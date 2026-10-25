@@ -1,8 +1,15 @@
 # Nullable no-history values on sync
 
-Status: nine focused actual-Core tests passed on 2026-10-24. Paired Swift and
-browser/Wasm qualification remain pending; no dependency floor or live cutover
-is claimed.
+Status: forward-ported from `844c7ac6840d5be4e06c8113280b8d8f492fcd76`
+onto the current 2.4 source line. Managed macOS, Linux and C-ABI qualification
+of this port is pending. The nine-test receipt below belongs to the earlier
+source branch, not this port. No release, dependency floor or live cutover is
+claimed.
+
+This port also clears the physical-nullability memo alongside the existing
+schema memo after a chunk rollback. A tenth real-SQL regression changes the
+physical schema between a failed chunk and its retry and verifies that the
+new nullable field is cleared rather than silently acknowledged unchanged.
 
 `@NoHistory` UPDATE triggers retain a field name but store a NULL placeholder instead of its value. Before sending, Core reads that field's current row value. A real SQL NULL was previously indistinguishable from the placeholder at the receiver, so the entry could be ACKed while its nullable field kept an older value.
 
@@ -31,7 +38,7 @@ This patch does **not** repair clears already ACKed under an old implementation.
 
 Historical failing probe bytes remain under `hud-scratch/lattice-nohistory-null/runs/20261024T071422Z`; they are evidence, not fixtures to overwrite. No old binary has been silently relabeled as qualified by removing the new metadata in a test.
 
-### Actual-Core receipt
+### Historical actual-Core receipt
 
 The two-job Debug build reused `hud-scratch/latticecore-hud-migration/build`
 with Apple clang 21, the macOS 27 SDK and deployment target 13.3. Evidence is

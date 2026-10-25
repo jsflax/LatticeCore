@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.4.1] - 2026-10-25
+
+### Fixed
+- Replicate an observed null for nullable NoHistory fields, so clearing a previously cached value reaches the receiving store. Preserve the distinction between an explicit clear and a legacy unavailable-value placeholder.
+- Validate observed-null transport metadata before duplicate handling and require the receiver field to be both NoHistory and physically nullable.
+- Clear the nullable-field cache with the existing schema caches after a chunk rollback, allowing a corrected retry to use current column metadata.
+
+### Compatibility
+- Optional sync metadata and additive C++/Swift bridge fields; no persistent schema or public C ABI change. Rebuild Core and Swift bridge consumers together.
+- Use the matching Swift adapter to preserve observed-null metadata through Codable and bridge transport. Older peers retain their previous null behavior; this release does not retroactively repair already-acknowledged clears.
+
+## [2.4.0] - 2026-10-24
+
+### Added
+- Allow configured WSS sync to start explicitly after local rows are read, with
+  `configuration.sync_autostart = false`. Connect, disconnect and reconnect keep
+  the primary database handle and local observers; automatic startup remains the
+  default. Full close is still required to release sync ownership before app
+  suspension.
+
+### Fixed
+- Preserve fetched row values during Swift bridge hydration so materialized
+  reads do not issue another query per row or silently hydrate a newer row image.
+- Fence delayed reconnects and in-flight open callbacks across explicit transport
+  restarts, publish disconnected state on terminal errors, and retire external
+  transport contexts only at destruction.
+- Keep dormant deferred siblings out of sync ownership handoff, release ownership
+  after failed setup, and tolerate partial transport construction during cleanup.
+- Include the existing scheduler implementation in the CMake library target.
+
+### Compatibility
+- Additive Core and Swift bridge API; no persistent schema, sync wire format or
+  public C API change. Rebuild native and Swift bridge consumers together. Local
+  schema/integrity initialization and configured IPC startup are unchanged;
+  deferred WSS performs sync-only repair when explicitly started.
+
 ## [2.3.1] - 2026-10-23
 
 ### Fixed

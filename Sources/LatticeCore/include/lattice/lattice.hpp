@@ -6524,6 +6524,9 @@ private:
         model_cols["id"] = "INTEGER";
         model_cols["globalId"] = "TEXT";
         for (const auto& prop : schema.properties) {
+            // Lists use separate tables, just as in create_model_table and
+            // migrate_model_table; they never add columns to this table.
+            if (prop.kind == property_kind::list) continue;
             if (prop.is_geo_bounds) {
                 model_cols[prop.name + "_minLat"] = "REAL";
                 model_cols[prop.name + "_maxLat"] = "REAL";

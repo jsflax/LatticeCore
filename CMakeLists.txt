@@ -211,6 +211,8 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/BridgeCacheConfigurationTests.cpp
+    Tests/LatticeCoreTests/TransportAuthenticationTests.cpp
+    Tests/LatticeCoreTests/DynamicMigrationTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
@@ -234,9 +236,21 @@ target_include_directories(LatticeCoreTests PRIVATE
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
 
+# Focused dynamic-schema migration regressions, with no unrelated model registry.
+add_executable(LatticeDynamicMigrationTests Tests/LatticeCoreTests/DynamicMigrationTests.cpp)
+target_link_libraries(LatticeDynamicMigrationTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
 # Focused no-history transport tests, using synthetic real-Core stores only.
 add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)
 target_link_libraries(LatticeNoHistoryNullTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
+# Bounded pending-write rescue and selected audit export; synthetic stores only.
+add_executable(LatticePendingImportTests Tests/LatticeCoreTests/PendingImportTests.cpp)
+target_link_libraries(LatticePendingImportTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
+# Explicit transport authentication defaults and cache identity; synthetic stores only.
+add_executable(LatticeTransportAuthenticationTests Tests/LatticeCoreTests/TransportAuthenticationTests.cpp)
+target_link_libraries(LatticeTransportAuthenticationTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp

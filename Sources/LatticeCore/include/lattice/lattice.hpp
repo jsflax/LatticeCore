@@ -472,6 +472,11 @@ class lattice_db;
 /// @param context Migration context with pending changes and enumeration methods
 using migration_block_t = std::function<void(migration_context& context)>;
 
+/// Bearer authentication remains the default. Transport-managed authentication
+/// delegates admission to an explicitly configured transport (for example, an
+/// HttpOnly browser session); it does not invent or forward a bearer token.
+enum class sync_authentication { bearer_token, transport_managed };
+
 struct configuration {
     /// Database file path. Use ":memory:" for in-memory database.
     std::string path = ":memory:";
@@ -483,12 +488,15 @@ struct configuration {
     /// Example: "ws://localhost:8080/sync"
     std::string websocket_url;
 
-    /// Authorization token for sync. Required if websocket_url is set.
+    /// Authorization token for sync. Required in the default bearer-token mode.
     std::string authorization_token;
 
     /// Defer WSS ownership, sync repair and transport creation until connect_sync().
     /// Local schema/integrity initialization and configured IPC remain unchanged.
     bool sync_autostart = true;
+
+    /// Explicit transport admission. Existing configurations retain token-required behavior.
+    sync_authentication sync_authentication_mode = sync_authentication::bearer_token;
 
     /// Target schema version. Default is 1 (initial schema).
     /// If the database is at a lower version, migrations will run.
@@ -601,9 +609,10 @@ struct configuration {
     };
     std::vector<ipc_target> ipc_targets;
 
-    /// Returns true if WSS sync is configured (websocket_url is not empty)
+    /// WSS sync requires an endpoint and either a token or explicit transport admission.
     bool is_sync_enabled() const {
-        return !websocket_url.empty() && !authorization_token.empty();
+        return !websocket_url.empty() && (!authorization_token.empty() ||
+            sync_authentication_mode == sync_authentication::transport_managed);
     }
 
     /// Returns true if any IPC targets are configured
@@ -768,6 +777,12 @@ public:
         pending_updates_[table_name][row_id] = std::move(row_data);
     }
 
+    /// Queue an explicit field without replacing other pending fields for this row.
+    void queue_row_value(const std::string& table_name, int64_t row_id,
+                         const std::string& column_name, const column_value_t& value) {
+        pending_updates_[table_name][row_id][column_name] = value;
+    }
+
     /// Apply pending updates after auto-migration has added new columns
     void apply_pending_updates() {
         LOG_INFO("migration", "apply_pending_updates: %zu tables queued", pending_updates_.size());
@@ -812,6 +827,9 @@ public:
                     } catch (const std::exception& e) {
                         LOG_ERROR("migration", "Update failed for %s row %lld: %s",
                                   table_name.c_str(), (long long)row_id, e.what());
+                        // A failed transform must abort the surrounding migration
+                        // transaction, including its schema/version publication.
+                        throw;
                     }
                 } else {
                     skip_count++;
@@ -1500,6 +1518,26 @@ public:
         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
         if (change_buffer_.empty()) change_buffer_.emplace_back();
         change_buffer_.back().rows.emplace_back(table, op, row_id, global_id);
+    }
+
+    /// Pending-import savepoints roll back SQL without SQLite's transaction
+    /// rollback hook. Keep their uncommitted observer rows equally atomic.
+    /// Caller owns the store write gate and the enclosing transaction.
+    size_t pending_change_buffer_checkpoint() {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        if (change_buffer_.size() > 1) throw std::logic_error("Unexpected uncommitted change batches");
+        return change_buffer_.empty() ? 0 : change_buffer_.back().rows.size();
+    }
+
+    void restore_pending_change_buffer(size_t size) {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        if (change_buffer_.size() > 1 ||
+            (change_buffer_.empty() ? 0 : change_buffer_.back().rows.size()) < size)
+            throw std::logic_error("Pending change checkpoint no longer belongs to this transaction");
+        if (change_buffer_.empty()) return;
+        auto& rows = change_buffer_.back().rows;
+        while (rows.size() > size) rows.pop_back();
+        if (rows.empty()) change_buffer_.clear();
     }
 
     /// Seal only a completed transaction. splice does not allocate or throw;
@@ -6259,6 +6297,9 @@ public:
     /// changedFieldsNames from AuditLog and pass them to object observers.
     /// Local Swift setter changes don't need this (the setter handles observation).
     std::atomic<bool> applying_remote_changes_{false};
+    /// Pending rescue can roll back an individual journal INSERT. Its cursor
+    /// moves only through the existing committed flush (on all path peers).
+    std::atomic<bool> defer_early_audit_cursor_{false};
 
     /// Set by the upsert/bulk-insert paths so flush_changes() populates changed_fields
     /// for the resulting local UPDATE — lets live object instances backing the conflicted
@@ -6483,6 +6524,9 @@ private:
         model_cols["id"] = "INTEGER";
         model_cols["globalId"] = "TEXT";
         for (const auto& prop : schema.properties) {
+            // Lists use separate tables, just as in create_model_table and
+            // migrate_model_table; they never add columns to this table.
+            if (prop.kind == property_kind::list) continue;
             if (prop.is_geo_bounds) {
                 model_cols[prop.name + "_minLat"] = "REAL";
                 model_cols[prop.name + "_maxLat"] = "REAL";

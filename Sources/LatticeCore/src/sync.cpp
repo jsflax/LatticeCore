@@ -2907,6 +2907,12 @@ std::vector<std::string> no_history_columns(database& db, const std::string& tab
     return out;
 }
 
+std::string quote_sync_identifier(const std::string& name) {
+    std::string quoted = "\"";
+    for (char c : name) { if (c == '\"') quoted += '\"'; quoted += c; }
+    return quoted + "\"";
+}
+
 bool value_is_absent(const audit_log_entry& e, const std::string& col) {
     auto it = e.changed_fields.find(col);
     return it == e.changed_fields.end() || it->second.kind == any_property_kind::null_kind;
@@ -2945,7 +2951,7 @@ std::string no_history_live_values_json(database& db, const std::string& table_n
     return out.dump();
 }
 
-void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
+static void late_bind_no_history_impl(database& db, std::vector<audit_log_entry>& entries, bool strict_reads) {
     std::unordered_map<std::string, std::vector<std::string>> flagged_by_table;
     for (auto& e : entries) {
         e.no_history_nulls.clear();
@@ -2970,12 +2976,13 @@ void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
         if (need.empty()) continue;
 
         std::string select = "SELECT ";
-        for (size_t i = 0; i < need.size(); ++i) { if (i) select += ", "; select += need[i]; }
-        select += " FROM " + e.table_name + " WHERE globalId = ? LIMIT 1";
+        for (size_t i = 0; i < need.size(); ++i) { if (i) select += ", "; select += "live." + quote_sync_identifier(need[i]); }
+        select += " FROM " + quote_sync_identifier(e.table_name) + " AS live WHERE globalId = ? LIMIT 1";
         std::vector<database::row_t> rows;
         try {
             rows = db.query(select, {e.global_row_id});
         } catch (const std::exception& ex) {
+            if (strict_reads) throw;
             LOG_WARN("sync", "late_bind_no_history: %s.%s read failed: %s",
                      e.table_name.c_str(), e.global_row_id.c_str(), ex.what());
         }
@@ -2994,6 +3001,10 @@ void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
         }
         mark_no_history_nulls(e, cols);
     }
+}
+
+void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
+    late_bind_no_history_impl(db, entries, false);
 }
 
 std::vector<audit_log_entry> query_audit_log(database& db,
@@ -3063,6 +3074,195 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 
     late_bind_no_history(db, entries);   // fill no_history columns before anyone ships them
     return entries;
+}
+
+namespace {
+// Selected export is strict: corrupt stored JSON must not quietly become an
+// empty mutation through the legacy permissive history parser.
+bool selected_value_valid(const json& value) {
+    auto integer64 = [](const json& v) {
+        return v.is_number_integer() && (!v.is_number_unsigned() || v.get<uint64_t>() <= INT64_MAX);
+    };
+    if (!value.is_object()) return value.is_null() || value.is_string() || value.is_boolean() ||
+        integer64(value) || (value.is_number_float() && std::isfinite(value.get<double>()));
+    if (!value.contains("kind") || !value["kind"].is_number_integer() || !value.contains("value")) return false;
+    const auto& kind = value["kind"];
+    const auto& v = value["value"];
+    if (kind == static_cast<int>(any_property_kind::null_kind)) return v.is_null();
+    if (kind == static_cast<int>(any_property_kind::string_kind)) return v.is_string();
+    if (kind == static_cast<int>(any_property_kind::int_kind))
+        return integer64(v) && v.get<int64_t>() >= INT32_MIN && v.get<int64_t>() <= INT32_MAX;
+    if (kind == static_cast<int>(any_property_kind::int64_kind)) return integer64(v);
+    if (kind == static_cast<int>(any_property_kind::float_kind))
+        return v.is_number() && std::isfinite(v.get<float>());
+    if (kind == static_cast<int>(any_property_kind::date_kind) ||
+        kind == static_cast<int>(any_property_kind::double_kind))
+        return v.is_number() && std::isfinite(v.get<double>());
+    if (kind == static_cast<int>(any_property_kind::data_kind) && v.is_string()) {
+        const auto& hex = v.get_ref<const std::string&>();
+        return hex.size() % 2 == 0 && std::all_of(hex.begin(), hex.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+        });
+    }
+    return false;
+}
+
+audit_log_entry selected_audit_row(const database::row_t& row) {
+    json wire = json::object();
+    for (const auto* name : {"id", "rowId"}) {
+        const auto& v = row.at(name);
+        if (!std::holds_alternative<int64_t>(v)) throw std::invalid_argument("Invalid selected audit integer");
+        wire[name] = std::get<int64_t>(v);
+    }
+    for (const auto* name : {"globalId", "tableName", "operation", "globalRowId", "changedFields", "changedFieldsNames"}) {
+        const auto& v = row.at(name);
+        if (!std::holds_alternative<std::string>(v)) throw std::invalid_argument("Invalid selected audit text");
+        wire[name] = std::get<std::string>(v);
+    }
+    for (const auto* name : {"isFromRemote", "isSynchronized", "synthesized"}) {
+        const auto& v = row.at(name);
+        if (!std::holds_alternative<int64_t>(v) ||
+            (std::get<int64_t>(v) != 0 && std::get<int64_t>(v) != 1))
+            throw std::invalid_argument("Invalid selected audit flag");
+        wire[name] = std::get<int64_t>(v) == 1;
+    }
+    const auto& time = row.at("timestamp");
+    if (std::holds_alternative<std::string>(time)) wire["timestamp"] = std::get<std::string>(time);
+    else if (std::holds_alternative<int64_t>(time)) wire["timestamp"] = std::to_string(std::get<int64_t>(time));
+    else if (std::holds_alternative<double>(time) && std::isfinite(std::get<double>(time)))
+        wire["timestamp"] = json(std::get<double>(time)).dump();
+    else throw std::invalid_argument("Invalid selected audit timestamp");
+    try {
+        const auto fields = json::parse(wire["changedFields"].get<std::string>());
+        if (!fields.is_object()) throw std::invalid_argument("Invalid selected audit fields");
+        for (const auto& [name, value] : fields.items())
+            if (name.empty() || !selected_value_valid(value))
+                throw std::invalid_argument("Invalid selected audit value");
+    } catch (const json::exception&) {
+        throw std::invalid_argument("Malformed selected audit fields JSON");
+    }
+    auto result = entry_from_parsed(wire);
+    if (!result) throw std::invalid_argument("Malformed selected audit entry");
+    return std::move(*result);
+}
+
+std::string selected_identifier(const std::string& value) {
+    if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_';
+    })) throw std::invalid_argument("Invalid selected audit identifier");
+    return "\"" + value + "\"";
+}
+
+size_t selected_length(const database::row_t& row, const char* key, size_t budget) {
+    const auto& value = row.at(key);
+    if (!std::holds_alternative<int64_t>(value) || std::get<int64_t>(value) < 0 ||
+        static_cast<uint64_t>(std::get<int64_t>(value)) > budget)
+        throw std::length_error("Selected audit export exceeds byte limit");
+    return static_cast<size_t>(std::get<int64_t>(value));
+}
+} // namespace
+
+std::vector<audit_log_entry> query_audit_log_selected(database& db,
+    const std::vector<std::pair<int64_t, std::string>>& identities, size_t max_bytes) {
+    constexpr size_t limit = 16 * 1024 * 1024;
+    if (identities.size() > 4096 || max_bytes == 0 || max_bytes > limit)
+        throw std::length_error("Selected audit export exceeds bounds");
+    std::unordered_set<int64_t> ids;
+    std::unordered_set<std::string> globals;
+    size_t identity_bytes = 0;
+    for (const auto& [id, global] : identities) {
+        if (global.size() > max_bytes - identity_bytes)
+            throw std::length_error("Selected audit identities exceed byte limit");
+        identity_bytes += global.size();
+        if (id <= 0 || global.empty() ||
+            !ids.insert(id).second || !globals.insert(global).second)
+            throw std::invalid_argument("Invalid selected audit identity");
+    }
+    if (identities.empty()) return {};
+    // The established statement scope holds the connection and suppresses
+    // delivery until this complete read snapshot has unlocked. A bare mutex
+    // would allow RELEASE to deliver previously sealed observers under it.
+    std::vector<audit_log_entry> result;
+    try {
+      {
+        database::statement_scope capture(db);
+        if (db.is_closed()) throw std::invalid_argument("Selected audit store is closed");
+        db.execute("SAVEPOINT lattice_selected_audit");
+        try {
+        size_t used = 0, materialized_bytes = 0;
+        for (const auto& [id, global] : identities) {
+            const size_t remaining = max_bytes - used;
+            // Fetch lengths first: a corrupt/huge row is never materialized.
+            const auto sizes = db.query(
+                "SELECT coalesce(length(CAST(globalId AS BLOB)),0)+coalesce(length(CAST(tableName AS BLOB)),0)"
+                "+coalesce(length(CAST(operation AS BLOB)),0)+coalesce(length(CAST(globalRowId AS BLOB)),0)"
+                "+coalesce(length(CAST(changedFields AS BLOB)),0)+coalesce(length(CAST(changedFieldsNames AS BLOB)),0)"
+                "+coalesce(length(CAST(timestamp AS BLOB)),0) AS bytes FROM AuditLog WHERE id=? AND globalId=?", {id, global});
+            if (sizes.size() != 1) throw std::invalid_argument("Selected audit identity not found");
+            const auto raw_bytes = selected_length(sizes[0], "bytes", std::min(remaining, max_bytes - materialized_bytes));
+            materialized_bytes += raw_bytes;
+            auto rows = db.query("SELECT id,globalId,tableName,operation,rowId,globalRowId,changedFields,"
+                "changedFieldsNames,timestamp,isFromRemote,isSynchronized,synthesized FROM AuditLog WHERE id=? AND globalId=?", {id, global});
+            if (rows.size() != 1) throw std::invalid_argument("Selected audit identity changed");
+            auto entry = selected_audit_row(rows[0]);
+            rows.clear();
+            if ((entry.operation == "INSERT" || entry.operation == "UPDATE") && entry.table_name[0] != '_') {
+                // Bound metadata before reading its CSV, then live values
+                // before late binding. A placeholder can expand substantially.
+                const auto meta = db.query("SELECT typeof(value) AS valueType, length(CAST(value AS BLOB)) AS bytes, "
+                    "length(value)-length(replace(value,',',''))+1 AS columns FROM _lattice_meta WHERE key=?",
+                    {std::string("trigger_flags:") + entry.table_name});
+                if (!meta.empty()) {
+                    const auto& type = meta[0].at("valueType");
+                    if (!std::holds_alternative<std::string>(type) || std::get<std::string>(type) != "text")
+                        throw std::invalid_argument("Selected NoHistory metadata must be text");
+                    selected_length(meta[0], "columns", 4096);
+                    // The bounded CSV is parsed here and by the shared late
+                    // binder. Charge both materializations before either read.
+                    materialized_bytes += 2 * selected_length(meta[0], "bytes", (max_bytes - materialized_bytes) / 2);
+                }
+                const auto columns = no_history_columns(db, entry.table_name);
+                if (columns.size() > 4096) throw std::length_error("Too many selected NoHistory columns");
+                selected_identifier(entry.table_name);
+                std::string lengths;
+                for (const auto& column : columns) {
+                    if (column.size() > 1024) throw std::length_error("Selected NoHistory column name exceeds limit");
+                    selected_identifier(column);
+                    if (entry.operation != "UPDATE" || !value_is_absent(entry, column) ||
+                        std::find(entry.changed_fields_names.begin(), entry.changed_fields_names.end(), column)
+                          == entry.changed_fields_names.end()) continue;
+                    if (!lengths.empty()) lengths += "+";
+                    lengths += "coalesce(length(CAST(live." + selected_identifier(column) + " AS BLOB)),0)";
+                }
+                if (!lengths.empty()) {
+                    const auto live = db.query("SELECT " + lengths + " AS bytes FROM " + selected_identifier(entry.table_name)
+                        + " AS live WHERE globalId=? LIMIT 1", {entry.global_row_id});
+                    if (!live.empty()) materialized_bytes += selected_length(live[0], "bytes",
+                        std::min(remaining - raw_bytes, max_bytes - materialized_bytes));
+                }
+            }
+            std::vector<audit_log_entry> single{std::move(entry)};
+            late_bind_no_history_impl(db, single, true);
+            const size_t expanded = single[0].to_json().size();
+            if (expanded > remaining) throw std::length_error("Selected audit export exceeds expanded byte limit");
+            used += expanded;
+            result.push_back(std::move(single[0]));
+        }
+        db.execute("RELEASE SAVEPOINT lattice_selected_audit");
+        } catch (...) {
+            db.execute("ROLLBACK TO SAVEPOINT lattice_selected_audit");
+            db.execute("RELEASE SAVEPOINT lattice_selected_audit");
+            throw;
+        }
+      }
+    } catch (...) {
+        const auto failure = std::current_exception();
+        try { db.drain_if_settled(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+    db.drain_if_settled();
+    return result;
 }
 
 // Notify AuditLog observers on ALL instances sharing this database path.
@@ -3573,16 +3773,25 @@ static double wire_timestamp_to_epoch(const std::string& ts) {
     return static_cast<double>(::time(nullptr));
 }
 
-// Unified implementation for applying remote changes.
-// receiving_sync_id = nullopt → global mode (server path): isSynchronized=1, no _lattice_sync_state row.
-// receiving_sync_id = value   → per-sync mode (relay path): isSynchronized=0, insert _lattice_sync_state row.
+enum class audit_apply_mode { global, per_sync, pending_import };
+enum class pending_outcome { rejected, imported, already_present };
+
+// One guarded data/journal path. Pending import deliberately has neither the
+// receiving channel's ACK/cursor nor its value-identical suppression policy.
 static std::vector<std::string> apply_remote_changes_impl(
     lattice_db& db,
     const std::vector<audit_log_entry>& entries,
-    const std::optional<std::string>& receiving_sync_id)
+    audit_apply_mode mode,
+    const std::optional<std::string>& receiving_sync_id,
+    std::vector<pending_outcome>* outcomes = nullptr)
 {
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
+    const bool pending_import = mode == audit_apply_mode::pending_import;
+    std::unordered_map<std::string, size_t> pending_counts;
+    if (pending_import) {
+        for (const auto& entry : entries) ++pending_counts[entry.global_id];
+    }
 
     // Signal flush_changes to look up changedFieldsNames from AuditLog for
     // object observers. Only this delivery may clear its flag: an observer
@@ -3605,6 +3814,17 @@ static std::vector<std::string> apply_remote_changes_impl(
         LOG_WARN("apply_remote", "another delivery is still applying; returning no ACKable entries");
         return applied_ids;
     }
+
+    struct pending_cursor_scope {
+        lattice_db& db;
+        bool active;
+        explicit pending_cursor_scope(lattice_db& owner, bool pending) : db(owner), active(pending) {
+            if (active) db.defer_early_audit_cursor_.store(true, std::memory_order_release);
+        }
+        ~pending_cursor_scope() {
+            if (active) db.defer_early_audit_cursor_.store(false, std::memory_order_release);
+        }
+    } pending_cursor(db, pending_import);
 
     // Process in chunks to avoid holding the write lock for too long.
     const size_t chunk_size = 50;
@@ -3685,6 +3905,8 @@ static std::vector<std::string> apply_remote_changes_impl(
 
             for (size_t i = chunk_start; i < chunk_end; ++i) {
                 const auto& entry = entries[i];
+                bool pending_savepoint = false;
+                size_t pending_change_checkpoint = 0;
 
                 // Per-entry error isolation — the contract the C ABI and the
                 // bridge document: an entry that fails to apply for ANY reason
@@ -3697,6 +3919,9 @@ static std::vector<std::string> apply_remote_changes_impl(
                 // committed chunks were never reported (the B-2 pathology at
                 // chunk granularity).
                 try {
+                    // An ambiguous repeated identity cannot become two effects
+                    // or two contradictory outcomes, even across chunk bounds.
+                    if (pending_import && pending_counts[entry.global_id] != 1) continue;
                     // Typed Core callers bypass wire decoding. Reject invalid
                     // envelopes before dedup and schema-skew ACK shortcuts.
                     if (!remote_entry_envelope_valid(entry)) {
@@ -3715,7 +3940,17 @@ static std::vector<std::string> apply_remote_changes_impl(
                     );
                     if (!existing.empty()) {
                         applied_ids.push_back(entry.global_id);
+                        if (outcomes) (*outcomes)[i] = pending_outcome::already_present;
                         continue;
+                    }
+
+                    // Ordinary receive retains its existing isolation policy.
+                    // Rescue must keep the model write and upload journal
+                    // atomic, including trigger/schema side effects.
+                    if (pending_import) {
+                        pending_change_checkpoint = db.pending_change_buffer_checkpoint();
+                        db.db().execute("SAVEPOINT lattice_pending_entry");
+                        pending_savepoint = true;
                     }
 
                     // If it's a link table (starts with _), ensure it exists —
@@ -3797,12 +4032,27 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // via catch-up/reconcile; the schema handshake surfaces
                     // the drift as a visible warning instead of a wedge.
                     if (is_model_table && schema.empty()) {
+                        if (pending_import)
+                            throw std::invalid_argument("Pending entry has an unsupported table");
                         LOG_ERROR("apply_remote",
                                   "unknown table '%s' (schema drift — newer peer); "
                                   "acking entry %s as inapplicable no-op",
                                   entry.table_name.c_str(), entry.global_id.c_str());
                         applied_ids.push_back(entry.global_id);
                         continue;
+                    }
+
+                    if (pending_import) {
+                        for (const auto& name : entry.changed_fields_names) {
+                            if (name == "__lattice_filter_removal" && entry.operation == "DELETE") continue;
+                            if (!schema.count(name))
+                                throw std::invalid_argument("Pending entry has an unsupported column");
+                        }
+                        for (const auto& [name, value] : entry.changed_fields) {
+                            (void)value;
+                            if (!schema.count(name))
+                                throw std::invalid_argument("Pending entry has an unsupported value column");
+                        }
                     }
 
                     // Unknown COLUMNS: drop them (loudly) and apply the rest.
@@ -3932,6 +4182,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
 
                     if (!sql_succeeded) {
+                        if (pending_import) throw std::runtime_error("Pending model write failed");
                         continue;
                     }
 
@@ -3991,7 +4242,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                         std::find(entry.changed_fields_names.begin(),
                                   entry.changed_fields_names.end(),
                                   "__lattice_filter_removal") != entry.changed_fields_names.end();
-                    int is_synchronized = (receiving_sync_id && !is_filter_removal) ? 0 : 1;
+                    int is_synchronized = (mode != audit_apply_mode::global && !is_filter_removal) ? 0 : 1;
                     std::string insert_sql = R"(
                         INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
                             changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized, synthesized)
@@ -4027,8 +4278,23 @@ static std::vector<std::string> apply_remote_changes_impl(
                         }
                     }
 
+                    if (pending_savepoint) {
+                        db.db().execute("RELEASE SAVEPOINT lattice_pending_entry");
+                        pending_savepoint = false;
+                    }
                     applied_ids.push_back(entry.global_id);
+                    if (outcomes) (*outcomes)[i] = pending_outcome::imported;
                 } catch (const std::exception& e) {
+                    if (pending_savepoint) {
+                        // If cleanup itself fails, let the enclosing chunk
+                        // roll back; continuing could commit an unjournalled
+                        // model mutation. Its outcomes are rolled back too.
+                        db.db().execute("ROLLBACK TO SAVEPOINT lattice_pending_entry");
+                        db.restore_pending_change_buffer(pending_change_checkpoint);
+                        db.db().execute("RELEASE SAVEPOINT lattice_pending_entry");
+                        tables_ensured.clear(); vec0_ensured.clear();
+                        schema_cache.clear(); nullable_cache.clear();
+                    }
                     LOG_ERROR("apply_remote", "entry[%zu] skipped (table=%s, op=%s): %s",
                               i, entry.table_name.c_str(), entry.operation.c_str(), e.what());
                     continue;
@@ -4083,6 +4349,8 @@ static std::vector<std::string> apply_remote_changes_impl(
             // return what committed; the sender re-sends only the rest.
             try { db.db().rollback(); } catch (...) {}
             applied_ids.resize(applied_before_chunk);
+            if (outcomes) std::fill(outcomes->begin() + chunk_start,
+                                    outcomes->begin() + chunk_end, pending_outcome::rejected);
             cursor_candidate = cursor_candidate_before_chunk;
             cursor_halted = cursor_halted_before_chunk;
             // The per-delivery memos may record DDL that the rollback undid.
@@ -4106,6 +4374,8 @@ static std::vector<std::string> apply_remote_changes_impl(
             // Non-std throw: same containment policy, no retry (unknown cause).
             try { db.db().rollback(); } catch (...) {}
             applied_ids.resize(applied_before_chunk);
+            if (outcomes) std::fill(outcomes->begin() + chunk_start,
+                                    outcomes->begin() + chunk_end, pending_outcome::rejected);
             cursor_candidate = cursor_candidate_before_chunk;
             cursor_halted = cursor_halted_before_chunk;
             tables_ensured.clear();
@@ -4130,13 +4400,35 @@ static std::vector<std::string> apply_remote_changes_impl(
 }
 
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries) {
-    return apply_remote_changes_impl(db, entries, std::nullopt);
+    return apply_remote_changes_impl(db, entries, audit_apply_mode::global, std::nullopt);
 }
 
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
                               const std::string& sync_id) {
-    return apply_remote_changes_impl(db, entries, sync_id);
+    return apply_remote_changes_impl(db, entries, audit_apply_mode::per_sync, sync_id);
+}
+
+pending_import_result apply_pending_changes(lattice_db& db,
+                              const std::vector<audit_log_entry>& entries) {
+    // Never roll back or commit a transaction owned by the caller. The
+    // shared receive implementation owns complete write chunks.
+    if (db.db().is_in_transaction())
+        throw std::invalid_argument("Pending import requires no active transaction");
+    std::vector<pending_outcome> outcomes(entries.size(), pending_outcome::rejected);
+    apply_remote_changes_impl(db, entries, audit_apply_mode::pending_import, std::nullopt, &outcomes);
+    pending_import_result result;
+    std::unordered_set<std::string> seen;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& id = entries[i].global_id;
+        if (!seen.insert(id).second) continue;
+        switch (outcomes[i]) {
+            case pending_outcome::imported: result.imported_ids.push_back(id); break;
+            case pending_outcome::already_present: result.already_present_ids.push_back(id); break;
+            case pending_outcome::rejected: result.rejected_ids.push_back(id); break;
+        }
+    }
+    return result;
 }
 
 } // namespace lattice

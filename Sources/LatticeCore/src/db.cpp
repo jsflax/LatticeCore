@@ -6,6 +6,7 @@
 #include <thread>
 #include <chrono>
 #include <exception>
+#include <memory>
 
 namespace lattice {
 
@@ -82,9 +83,11 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         flags |= SQLITE_OPEN_URI;  // see read-only branch note
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
+    // A throwing constructor never reaches ~database(). Keep ownership local
+    // through every initialization statement, including failing PRAGMAs.
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> opening(db_, sqlite3_close_v2);
     if (rc != SQLITE_OK) {
         std::string error = sqlite3_errmsg(db_);
-        sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to open database: %s", error.c_str());
         throw db_error("Failed to open database: " + error);
@@ -158,11 +161,11 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     // Initialize sqlite-vec extension for vector search
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
     if (vec_rc != SQLITE_OK) {
-        sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
     }
+    opening.release();  // Fully initialized: ~database() now owns the connection.
 }
 
 database::~database() {

@@ -2,6 +2,10 @@
 #ifndef __linux__
 #include <lattice.hpp>          // swift_lattice, swift_lattice_ref
 #include <dynamic_object.hpp>   // dynamic_object, dynamic_object_ref
+#include <fstream>
+#include <memory>
+#include <fcntl.h>
+#include <limits.h>
 
 // ============================================================================
 // Bridge Layer Tests — swift_lattice + dynamic_object (what Swift actually uses)
@@ -1382,6 +1386,95 @@ TEST(BridgeTuning, CreateUncachedNeverAliasesParent) {
     auto clone = lattice::detail::LatticeCache::instance().create_uncached(cfg, lattice::SchemaVector{});
     EXPECT_NE(parent.get(), clone.get())
         << "query-clone must be a distinct instance even with an identical config";
+}
+
+TEST(BridgeDynamicOpen, MissingFileReportsErrorThenValidOpenRecovers) {
+    TempDB tmp{"bridge_dynamic_checked"};
+    lattice::swift_configuration cfg(tmp.str());
+    lattice::cxx_error error(std::runtime_error("previous failure"));
+
+    std::unique_ptr<lattice::swift_lattice_ref> missing;
+    ASSERT_NO_THROW(missing.reset(lattice::swift_lattice_ref::create_dynamic(cfg, error)));
+    ASSERT_NE(missing, nullptr);
+    EXPECT_FALSE(missing->valid());
+    EXPECT_FALSE(error.msg.empty());
+    EXPECT_NE(error.msg, "previous failure");
+    EXPECT_FALSE(std::filesystem::exists(tmp.path)) << "dynamic open must not create a missing file";
+
+    const lattice::SchemaVector schemas = {
+        make_schema("CheckedDynamicRow", {{"amount", int_prop("amount")}})
+    };
+    std::unique_ptr<lattice::swift_lattice_ref> writer(
+        lattice::swift_lattice_ref::create(cfg, schemas));
+    auto row = make_sdo("CheckedDynamicRow", schemas[0].properties);
+    row.values["amount"] = int64_t(19);
+    lattice::dynamic_object object(row);
+    writer->get()->add(object);
+    const auto audit_before = writer->get()->count("AuditLog");
+
+    std::unique_ptr<lattice::swift_lattice_ref> reader;
+    ASSERT_NO_THROW(reader.reset(lattice::swift_lattice_ref::create_dynamic(cfg, error)));
+    ASSERT_NE(reader, nullptr);
+    ASSERT_TRUE(error.name.empty() && error.msg.empty());
+    ASSERT_TRUE(reader->valid());
+    EXPECT_EQ(reader->get()->count("CheckedDynamicRow"), 1u);
+    EXPECT_NE(reader->get(), writer->get());
+    EXPECT_EQ(lattice::detail::LatticeCache::instance().get_by_pointer(reader->get()).get(), reader->get());
+
+    std::unique_ptr<lattice::swift_lattice_ref> second(
+        lattice::swift_lattice_ref::create_dynamic(cfg, error));
+    ASSERT_TRUE(error.name.empty() && error.msg.empty());
+    ASSERT_NE(second, nullptr);
+    ASSERT_TRUE(second->valid());
+    EXPECT_NE(second->get(), reader->get()) << "dynamic opens must remain independent";
+    EXPECT_THROW(reader->get()->db().execute("UPDATE CheckedDynamicRow SET amount=20"), lattice::db_error);
+    EXPECT_EQ(writer->get()->count("AuditLog"), audit_before);
+    reader->get()->close();
+    EXPECT_EQ(second->get()->count("CheckedDynamicRow"), 1u);
+    EXPECT_EQ(writer->get()->count("CheckedDynamicRow"), 1u);
+}
+
+TEST(BridgeDynamicOpen, InvalidDatabaseReportsErrorWithoutChangingItsBytes) {
+    TempDB tmp{"bridge_dynamic_invalid"};
+    const std::string content = "This is not a SQLite database.\n";
+    {
+        std::ofstream output(tmp.path, std::ios::binary);
+        ASSERT_TRUE(output);
+        output << content;
+    }
+    // Count only this unique fixture's descriptors: unrelated process activity
+    // cannot turn a leaked SQLite connection into a passing total-FD comparison.
+    const auto expected_path = std::filesystem::canonical(tmp.path);
+    const auto open_handles = [&] {
+        size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator("/dev/fd")) {
+            const auto fd = std::stoi(entry.path().filename().string());
+            char path[PATH_MAX];
+            if (fcntl(fd, F_GETPATH, path) == 0 && std::filesystem::path(path) == expected_path) ++count;
+        }
+        return count;
+    };
+    const auto before = open_handles();
+    {
+        std::ifstream oracle(tmp.path, std::ios::binary);
+        ASSERT_TRUE(oracle);
+        ASSERT_EQ(open_handles(), before + 1) << "descriptor oracle must observe this exact fixture";
+    }
+    ASSERT_EQ(open_handles(), before);
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        lattice::cxx_error error(std::runtime_error("previous failure"));
+        std::unique_ptr<lattice::swift_lattice_ref> invalid;
+        ASSERT_NO_THROW(invalid.reset(lattice::swift_lattice_ref::create_dynamic(
+            lattice::swift_configuration(tmp.str()), error)));
+        ASSERT_NE(invalid, nullptr);
+        EXPECT_FALSE(invalid->valid());
+        EXPECT_FALSE(error.msg.empty());
+        EXPECT_NE(error.msg, "previous failure");
+        EXPECT_EQ(open_handles(), before) << "failed open leaked a descriptor on attempt " << attempt;
+    }
+    std::ifstream input(tmp.path, std::ios::binary);
+    const std::string after((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(after, content);
 }
 
 // ============================================================================

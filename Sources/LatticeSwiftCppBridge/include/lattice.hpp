@@ -3536,16 +3536,16 @@ public:
     /// live database directly — no checkpoint required.
     static LATTICE_SLREF_RET create_dynamic(const swift_configuration& config)
         SWIFT_NAME(createDynamic(config:)) LATTICE_SLREF_UNRETAINED {
-        swift_configuration cfg = config;
-        cfg.read_only = true;
-        auto impl = std::make_shared<swift_lattice>(std::move(cfg));
-        // Register so managed objects hydrated from queries can resolve their
-        // owning lattice (managed::lattice_shared -> shared_for_lattice ->
-        // get_by_pointer). Bare make_shared bypasses get_or_create's cache.
-        detail::LatticeCache::instance().register_pointer(impl);
-        impl->open_dynamic();
-        return _make(impl);
+        return _make(create_dynamic_shared(config));
     }
+
+    /// Checked dynamic construction. Preserves the independent read-only
+    /// connection and schema reconstruction of create_dynamic(), but reports
+    /// native open failures instead of crossing Swift's exception boundary.
+    /// The returned ref is invalid when err is populated.
+    static LATTICE_SLREF_RET create_dynamic(const swift_configuration& config,
+                                            cxx_error& err)
+        SWIFT_NAME(createDynamic(config:error:)) LATTICE_SLREF_UNRETAINED;
 
     /// Factory method with Swift migration block.
     /// The migration block is called when schema changes are detected.
@@ -4141,6 +4141,17 @@ public:
 
 private:
     swift_lattice_ref() = default;
+
+    static std::shared_ptr<swift_lattice> create_dynamic_shared(const swift_configuration& config) {
+        swift_configuration cfg = config;
+        cfg.read_only = true;
+        auto impl = std::make_shared<swift_lattice>(std::move(cfg));
+        // Register so managed objects hydrated from queries can resolve their
+        // owning lattice. Bare make_shared deliberately bypasses the keyed cache.
+        detail::LatticeCache::instance().register_pointer(impl);
+        impl->open_dynamic();
+        return impl;
+    }
 
     std::shared_ptr<swift_lattice> impl_;
 #if LATTICE_HAS_FRT

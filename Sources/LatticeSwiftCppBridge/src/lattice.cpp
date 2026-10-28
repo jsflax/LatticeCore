@@ -1988,3 +1988,45 @@ SWIFT_NAME(createUncached(swiftConfig:schemas:error:)) {
     return _make(impl);
 }
 #endif
+
+#if LATTICE_HAS_FRT
+lattice::swift_lattice_ref* lattice::swift_lattice_ref::create_dynamic(
+    const swift_configuration& config, cxx_error& err)
+SWIFT_NAME(createDynamic(config:error:)) {
+    // Match checked create_uncached(): Swift inspects err before boxing this
+    // non-null wrapper, whose implementation remains empty on failure.
+    auto ref = new swift_lattice_ref();
+    err.name.clear();
+    err.msg.clear();
+    try {
+        ref->impl_ = create_dynamic_shared(config);
+    } catch (const std::exception& e) {
+        last_error_ = e;
+        err = e;
+    } catch (...) {
+        const std::runtime_error failure("Unknown exception opening dynamic Lattice");
+        last_error_ = failure;
+        err = failure;
+    }
+    return ref;
+}
+#else
+lattice::swift_lattice_ref lattice::swift_lattice_ref::create_dynamic(
+    const swift_configuration& config, cxx_error& err)
+SWIFT_NAME(createDynamic(config:error:)) {
+    std::shared_ptr<swift_lattice> impl;
+    err.name.clear();
+    err.msg.clear();
+    try {
+        impl = create_dynamic_shared(config);
+    } catch (const std::exception& e) {
+        last_error_ = e;
+        err = e;
+    } catch (...) {
+        const std::runtime_error failure("Unknown exception opening dynamic Lattice");
+        last_error_ = failure;
+        err = failure;
+    }
+    return _make(impl);
+}
+#endif

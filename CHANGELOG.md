@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.4.2] - 2026-10-28
+
+### Fixed
+- Add checked dynamic-open factories so Swift consumers can report invalid-store and initialization failures without a native exception escaping the bridge. Preserve independent read-only connections and the existing unchecked overloads.
+- Close the partially opened SQLite connection when database initialization throws, including failed PRAGMAs, instead of leaking the connection.
+
+### Compatibility
+- Additive C++/Swift bridge overloads; no persistent schema, sync wire format or public C ABI change. Rebuild Core and Swift bridge consumers together.
+- Swift consumers must use the matching checked adapter to receive these open failures as Swift errors.
+
 ## [2.4.1] - 2026-10-25
 
 ### Fixed

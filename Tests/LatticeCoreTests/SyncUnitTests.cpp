@@ -1030,6 +1030,103 @@ TEST(Sync, DuplicateEntrySkipped) {
     EXPECT_EQ(db.objects<TestPerson>().size(), 1u);
 }
 
+TEST(Sync, ReplayAcknowledgesFirstUnionAndLinkEntries) {
+    lattice::lattice_db source;
+    lattice::lattice_db target;
+    lattice::union_descriptor choice;
+    choice.union_table_name = "_ReplayChoice";
+    choice.cases = {{"text", {{"", lattice::column_type::text}}}};
+    lattice::union_descriptor collision;
+    collision.union_table_name = "_ReplayLinkNames";
+    collision.cases = {{"lhs", {{"", lattice::column_type::text}}},
+                       {"rhs", {{"", lattice::column_type::text}}},
+                       {"rhs_type", {{"", lattice::column_type::text}}}};
+    for (auto* db : {&source, &target}) {
+        db->ensure_union_table(choice.union_table_name, choice, "TestPerson", "choice");
+        db->ensure_union_table(collision.union_table_name, collision, "TestPerson", "collision");
+    }
+    source.ensure_link_table("_ReplayLinks");
+    source.ensure_virtual_link_table("_ReplayVirtualLinks");
+    source.db().execute("DELETE FROM AuditLog");
+    source.db().execute("INSERT INTO _ReplayChoice(globalId,\"case\",text) VALUES "
+                        "('choice-1','text','first'),('choice-2','text','second')");
+    source.db().execute("INSERT INTO _ReplayLinkNames(globalId,\"case\",lhs) VALUES "
+                        "('collision-1','lhs','first'),('collision-2','lhs','second')");
+    source.db().execute("INSERT INTO _ReplayLinks(globalId,lhs,rhs) VALUES "
+                        "('link-1','owner','child')");
+    source.db().execute("INSERT INTO _ReplayVirtualLinks(globalId,lhs,rhs,rhs_type) VALUES "
+                        "('virtual-1','owner','child','TestPerson')");
+    ASSERT_FALSE(target.db().table_exists("_ReplayLinks"));
+    ASSERT_FALSE(target.db().table_exists("_ReplayVirtualLinks"));
+
+    // Replay real trigger-produced audit records through the wire decoder.
+    const auto entries = lattice::query_audit_log(source.db());
+    ASSERT_EQ(entries.size(), 6u);
+    const auto wire = lattice::server_sent_event::make_audit_log(entries).to_json();
+    const auto decoded = lattice::server_sent_event::from_json(wire);
+    ASSERT_TRUE(decoded.has_value());
+    std::vector<std::string> expected;
+    for (const auto& entry : entries) expected.push_back(entry.global_id);
+    EXPECT_EQ(lattice::apply_remote_changes(target, decoded->audit_logs), expected);
+    const auto copied = lattice::query_audit_log(target.db());
+    ASSERT_EQ(copied.size(), entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) EXPECT_EQ(copied[i].global_id, expected[i]);
+    for (const auto* table : {"_ReplayChoice", "_ReplayLinkNames", "_ReplayLinks", "_ReplayVirtualLinks"}) {
+        EXPECT_EQ(target.db().query(std::string("SELECT * FROM ") + table + " ORDER BY globalId"),
+                  source.db().query(std::string("SELECT * FROM ") + table + " ORDER BY globalId"));
+    }
+    EXPECT_EQ(target.db().query("SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+                               {std::string("idx__ReplayLinks_rhs_lhs")}).size(), 1u);
+    EXPECT_TRUE(target.db().query("SELECT name FROM sqlite_master WHERE type='index' AND name IN "
+                                 "('idx__ReplayChoice_rhs_lhs','idx__ReplayLinkNames_rhs_lhs')").empty());
+
+    // An existing virtual table must retain its kind even when an entry omits
+    // rhs_type (DELETE does not need a full link payload).
+    auto deletion = decoded->audit_logs.back();
+    ASSERT_EQ(deletion.table_name, "_ReplayVirtualLinks");
+    deletion.global_id = "virtual-delete-audit";
+    deletion.operation = "DELETE";
+    deletion.changed_fields.clear();
+    deletion.changed_fields_names.clear();
+    EXPECT_EQ(lattice::apply_remote_changes(target, {deletion}),
+              std::vector<std::string>{deletion.global_id});
+    EXPECT_TRUE(target.db().query("SELECT * FROM _ReplayVirtualLinks").empty());
+    EXPECT_TRUE(target.db().query("SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+                                 {std::string("idx__ReplayVirtualLinks_rhs_lhs")}).empty());
+}
+
+TEST(Sync, FailedLinkEnsureIsNotMemoizedAsSuccess) {
+    lattice::lattice_db db;
+    db.db().execute("CREATE TABLE _ReplayEnsureRetry(lhs TEXT NOT NULL,rhs TEXT NOT NULL,"
+                    "globalId TEXT UNIQUE,PRIMARY KEY(lhs,rhs))");
+    // A conflicting schema object makes the required reverse-index DDL fail.
+    db.db().execute("CREATE TABLE idx__ReplayEnsureRetry_rhs_lhs(value TEXT)");
+    ASSERT_THROW(db.db().execute("CREATE INDEX IF NOT EXISTS idx__ReplayEnsureRetry_rhs_lhs "
+                                 "ON _ReplayEnsureRetry(rhs,lhs)"), lattice::db_error);
+    std::vector<lattice::audit_log_entry> entries;
+    std::vector<std::string> expected;
+    for (int i = 0; i < 2; ++i) {
+        lattice::audit_log_entry entry;
+        entry.global_id = "retry-audit-" + std::to_string(i);
+        entry.global_row_id = "retry-row-" + std::to_string(i);
+        entry.table_name = "_ReplayEnsureRetry";
+        entry.operation = "INSERT";
+        entry.timestamp = "2026-10-28T00:00:00Z";
+        entry.changed_fields = {{"lhs", lattice::any_property("owner")},
+                                {"rhs", lattice::any_property("child-" + std::to_string(i))}};
+        entry.changed_fields_names = {"lhs", "rhs"};
+        expected.push_back(entry.global_id);
+        entries.push_back(std::move(entry));
+    }
+    EXPECT_TRUE(lattice::apply_remote_changes(db, entries).empty());
+    EXPECT_TRUE(db.db().query("SELECT * FROM _ReplayEnsureRetry").empty());
+    EXPECT_TRUE(lattice::query_audit_log(db.db()).empty());
+    db.db().execute("DROP TABLE idx__ReplayEnsureRetry_rhs_lhs");
+    EXPECT_EQ(lattice::apply_remote_changes(db, entries), expected);
+    EXPECT_EQ(db.db().query("SELECT * FROM _ReplayEnsureRetry").size(), 2u);
+    EXPECT_EQ(lattice::query_audit_log(db.db()).size(), 2u);
+}
+
 // ----------------------------------------------------------------------------
 // Backoff: flapping endpoint must walk the exponential ladder
 // ----------------------------------------------------------------------------

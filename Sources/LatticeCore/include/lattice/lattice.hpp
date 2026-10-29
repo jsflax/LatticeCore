@@ -4651,6 +4651,12 @@ public:
             db_->execute(sql);
         }
 
+        // Parent/target lookups traverse links in the opposite direction from the
+        // (lhs, rhs) primary key. Cover both filtering and the returned source ID,
+        // including existing tables; otherwise every child query scans all links.
+        db_->execute("CREATE INDEX IF NOT EXISTS idx_" + link_table_name +
+                     "_rhs_lhs ON " + link_table_name + "(rhs, lhs)");
+
         // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
         create_link_table_triggers(link_table_name);
     }
@@ -7420,7 +7426,10 @@ protected:
     /// snapshots; guarded ALTER in ensure_audit_log_table). Epoch 5 ships
     /// alone as Engram Groups increment 0; this train is increment 1.
     /// Renumbered from 5 by the same rebase.
-    static constexpr int kLatticeSchemaFormatEpoch = 6;
+    /// Epoch 7: regular link tables gained a covering (rhs, lhs) index for
+    /// reverse traversal. Both Core and Swift schema fingerprints must force
+    /// one guarded ensure pass on stores written before the index existed.
+    static constexpr int kLatticeSchemaFormatEpoch = 7;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as

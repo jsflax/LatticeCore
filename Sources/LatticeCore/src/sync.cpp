@@ -3718,20 +3718,41 @@ static std::vector<std::string> apply_remote_changes_impl(
                         continue;
                     }
 
-                    // If it's a link table (starts with _), ensure it exists —
-                    // once per (table, kind) per delivery (B3.4: these are
-                    // per-TABLE facts; running them per ENTRY cost ~3,000
-                    // statements per 1000-entry frame, including two
-                    // sqlite_master scans and a PRAGMA table_info each).
-                    if (!entry.table_name.empty() && entry.table_name[0] == '_') {
-                        bool is_virtual = std::find(entry.changed_fields_names.begin(),
-                                                    entry.changed_fields_names.end(),
-                                                    "rhs_type") != entry.changed_fields_names.end();
-                        if (tables_ensured.insert(entry.table_name + (is_virtual ? "|v" : "|l")).second) {
-                            if (is_virtual) {
-                                db.ensure_virtual_link_table(entry.table_name);
-                            } else {
-                                db.ensure_link_table(entry.table_name);
+                    // A leading underscore also names union side tables, not
+                    // just links. Memoize the physical schema before deciding
+                    // whether link DDL is appropriate; union case names may
+                    // themselves be lhs/rhs/rhs_type.
+                    auto schema_it = schema_cache.find(entry.table_name);
+                    if (schema_it == schema_cache.end()) {
+                        schema_it = schema_cache.emplace(
+                            entry.table_name, db.get_table_schema(entry.table_name)).first;
+                    }
+                    if (!entry.table_name.empty() && entry.table_name[0] == '_' &&
+                        !schema_registry::instance().get_schema(entry.table_name)) {
+                        const auto& columns = schema_it->second;
+                        const bool missing = columns.empty();
+                        auto wire_has = [&](const char* name) {
+                            return entry.changed_fields.count(name) &&
+                                std::find(entry.changed_fields_names.begin(),
+                                          entry.changed_fields_names.end(), name)
+                                    != entry.changed_fields_names.end();
+                        };
+                        const bool is_link = missing
+                            ? wire_has("lhs") && wire_has("rhs") &&
+                                !wire_has("case") && !wire_has("\"case\"")
+                            : columns.count("lhs") && columns.count("rhs") &&
+                                !columns.count("case") && !columns.count("id");
+                        if (is_link) {
+                            const bool is_virtual = missing ? wire_has("rhs_type")
+                                                            : columns.count("rhs_type") != 0;
+                            const auto key = entry.table_name + (is_virtual ? "|v" : "|l");
+                            if (!tables_ensured.count(key)) {
+                                if (is_virtual) db.ensure_virtual_link_table(entry.table_name);
+                                else db.ensure_link_table(entry.table_name);
+                                // Failed ensures must be retried, not treated as
+                                // successful on the next entry in this delivery.
+                                if (missing) schema_it->second = db.get_table_schema(entry.table_name);
+                                tables_ensured.insert(key);
                             }
                         }
                     }
@@ -3773,15 +3794,8 @@ static std::vector<std::string> apply_remote_changes_impl(
                     for (const auto& name : entry.changed_fields_names) {
                         LOG_DEBUG("apply_remote", "  fieldName: %s", name.c_str());
                     }
-                    // Schema memo (B3.4): PRAGMA table_info once per table per
-                    // delivery, not per entry. Safe because the ensure_* calls
-                    // above run before the first fetch for a table, and tables
-                    // only ever gain existence within a delivery.
-                    auto schema_it = schema_cache.find(entry.table_name);
-                    if (schema_it == schema_cache.end()) {
-                        schema_it = schema_cache.emplace(
-                            entry.table_name, db.get_table_schema(entry.table_name)).first;
-                    }
+                    // Existing tables use one schema read per delivery. The
+                    // on-demand link path refreshes it after successful creation.
                     const auto& schema = schema_it->second;
                     bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
 

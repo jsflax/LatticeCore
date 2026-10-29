@@ -477,11 +477,23 @@ TEST(Bridge, ReceiveMalformedSyncDataReportsErrorAndNextValidReceiveClearsIt) {
     ASSERT_NE(ref, nullptr);
     auto& db = *ref->get();
 
-    // Two parse failures that used to be reported as successful empty applies:
-    // malformed JSON, and a valid JSON envelope with an invalid audit entry.
+    lattice::audit_log_entry prefix;
+    prefix.global_id = "must-not-apply-prefix";
+    prefix.table_name = "BridgePerson";
+    prefix.operation = "INSERT";
+    prefix.global_row_id = "must-not-create-prefix-row";
+    prefix.changed_fields = {{"name", lattice::any_property("Uncommitted prefix")}};
+    prefix.changed_fields_names = {"name"};
+    prefix.timestamp = "2026-10-29T00:00:00Z";
+
+    // Parse failures used to be reported as successful empty applies. Include
+    // a valid prefix followed by an invalid entry to prove decoding failure
+    // cannot partially persist a frame before its bad position is discovered.
     const std::vector<std::string> malformed = {
         R"({"auditLog":["private-payload-marker")",
-        R"({"auditLog":[{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})"
+        R"({"auditLog":[{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})",
+        std::string("{\"auditLog\":[") + prefix.to_json() +
+            R"(,{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})"
     };
     for (size_t i = 0; i < malformed.size(); ++i) {
         const auto& wire = malformed[i];
@@ -491,8 +503,10 @@ TEST(Bridge, ReceiveMalformedSyncDataReportsErrorAndNextValidReceiveClearsIt) {
         ASSERT_TRUE(error.has_value());
         EXPECT_NE(error->find("Failed to parse sync data:"), std::string::npos);
         if (i == 1) EXPECT_NE(error->find("invalid auditLog entry at index 0"), std::string::npos);
+        if (i == 2) EXPECT_NE(error->find("invalid auditLog entry at index 1"), std::string::npos);
         EXPECT_EQ(error->find("private-payload-marker"), std::string::npos);
         EXPECT_TRUE(db.objects("BridgePerson").empty());
+        EXPECT_TRUE(db.db().query("SELECT globalId FROM AuditLog").empty());
     }
 
     lattice::audit_log_entry entry;

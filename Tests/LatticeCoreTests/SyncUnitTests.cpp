@@ -714,8 +714,10 @@ TEST(Sync, SynchronizerNackRetainsAckTimeoutRecovery) {
         ASSERT_FALSE(ids.empty());
         transport->simulate_message(lattice::transport_message::from_string(
             lattice::server_sent_event::make_nack(ids, "temporary rejection").to_json()));
-        EXPECT_EQ(transport->get_sent_messages().size(), initial_sends);
-        // The pre-existing watchdog, not the NACK callback, eventually retries.
+        // No-immediate-resend is pinned by the preceding NACK test. Do not
+        // assert an early send count here: a stalled runner may legitimately
+        // cross this test's short watchdog deadline before this point.
+        // The pre-existing watchdog eventually retries without a new write.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (transport->get_sent_messages().size() == initial_sends &&
                std::chrono::steady_clock::now() < deadline) {

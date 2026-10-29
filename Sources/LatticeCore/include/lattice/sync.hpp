@@ -157,31 +157,42 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack, replay_request };
+    enum class type { audit_log, ack, replay_request, nack };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
     std::vector<std::string> acked_ids;       // For ack type (UUIDs)
+    std::vector<std::string> nacked_ids;      // Rejected uploads; never acknowledgments
+    std::string nack_reason;
 
     // Serialize to JSON
     std::string to_json() const;
 
     // Deserialize from JSON
     static std::optional<server_sent_event> from_json(const std::string& json);
+    /// Optional payload-free diagnostic: fixed category and, for an invalid
+    /// audit entry, its zero-based position. Never includes wire values or
+    /// parser exception text. Cleared on a successful parse.
+    static std::optional<server_sent_event> from_json(
+        const std::string& json, std::string* error_out);
 
     // Factory methods
     static server_sent_event make_audit_log(std::vector<audit_log_entry> logs) {
-        return {type::audit_log, std::move(logs), {}};
+        return {type::audit_log, std::move(logs), {}, {}, {}};
     }
 
     static server_sent_event make_ack(std::vector<std::string> ids) {
-        return {type::ack, {}, std::move(ids)};
+        return {type::ack, {}, std::move(ids), {}, {}};
+    }
+
+    static server_sent_event make_nack(std::vector<std::string> ids, std::string reason) {
+        return {type::nack, {}, {}, std::move(ids), std::move(reason)};
     }
 
     /// Fresh-peer catch-up request. IPC transports ONLY — never sent over WSS
     /// (deployed servers on older protocol versions would fail to parse it).
     static server_sent_event make_replay_request() {
-        return {type::replay_request, {}, {}};
+        return {type::replay_request, {}, {}, {}, {}};
     }
 };
 

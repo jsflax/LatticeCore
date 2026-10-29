@@ -466,6 +466,101 @@ TEST(Bridge, ReceiveSyncDataInsert) {
     EXPECT_EQ(int(results[0].get_int("age")), 42);
 }
 
+TEST(Bridge, ReceiveMalformedSyncDataReportsErrorAndNextValidReceiveClearsIt) {
+    TempDB tmp{"bridge_sync_decode_error"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgePerson", {{"name", text_prop("name")}})
+    };
+    lattice::swift_configuration config(tmp.str());
+    std::unique_ptr<lattice::swift_lattice_ref> ref(
+        lattice::swift_lattice_ref::create(config, schemas));
+    ASSERT_NE(ref, nullptr);
+    auto& db = *ref->get();
+
+    lattice::audit_log_entry prefix;
+    prefix.global_id = "must-not-apply-prefix";
+    prefix.table_name = "BridgePerson";
+    prefix.operation = "INSERT";
+    prefix.global_row_id = "must-not-create-prefix-row";
+    prefix.changed_fields = {{"name", lattice::any_property("Uncommitted prefix")}};
+    prefix.changed_fields_names = {"name"};
+    prefix.timestamp = "2026-10-29T00:00:00Z";
+
+    // Parse failures used to be reported as successful empty applies. Include
+    // a valid prefix followed by an invalid entry to prove decoding failure
+    // cannot partially persist a frame before its bad position is discovered.
+    const std::vector<std::string> malformed = {
+        R"({"auditLog":["private-payload-marker")",
+        R"({"auditLog":[{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})",
+        std::string("{\"auditLog\":[") + prefix.to_json() +
+            R"(,{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})"
+    };
+    for (size_t i = 0; i < malformed.size(); ++i) {
+        const auto& wire = malformed[i];
+        const auto applied = db.receive_sync_data(lattice::ByteVector(wire.begin(), wire.end()));
+        EXPECT_TRUE(applied.empty());
+        const auto error = db.last_receive_error();
+        ASSERT_TRUE(error.has_value());
+        EXPECT_NE(error->find("Failed to parse sync data:"), std::string::npos);
+        if (i == 1) EXPECT_NE(error->find("invalid auditLog entry at index 0"), std::string::npos);
+        if (i == 2) EXPECT_NE(error->find("invalid auditLog entry at index 1"), std::string::npos);
+        EXPECT_EQ(error->find("private-payload-marker"), std::string::npos);
+        EXPECT_TRUE(db.objects("BridgePerson").empty());
+        EXPECT_TRUE(db.db().query("SELECT globalId FROM AuditLog").empty());
+    }
+
+    lattice::audit_log_entry entry;
+    entry.global_id = "valid-after-error";
+    entry.table_name = "BridgePerson";
+    entry.operation = "INSERT";
+    entry.global_row_id = "valid-row-after-error";
+    entry.changed_fields = {{"name", lattice::any_property("Recovered")}};
+    entry.changed_fields_names = {"name"};
+    entry.timestamp = "2026-10-29T00:00:00Z";
+    const auto wire = lattice::server_sent_event::make_audit_log({entry}).to_json();
+    const auto applied = db.receive_sync_data(lattice::ByteVector(wire.begin(), wire.end()));
+    EXPECT_EQ(applied, std::vector<std::string>{entry.global_id});
+    EXPECT_FALSE(db.last_receive_error().has_value());
+    auto rows = db.objects("BridgePerson");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].get_string("name"), "Recovered");
+}
+
+TEST(Bridge, ReceiveNackReportsReasonWithoutAcknowledgingLocalEntries) {
+    TempDB tmp{"bridge_sync_nack"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgePerson", {{"name", text_prop("name")}})
+    };
+    lattice::swift_configuration config(tmp.str());
+    std::unique_ptr<lattice::swift_lattice_ref> ref(
+        lattice::swift_lattice_ref::create(config, schemas));
+    ASSERT_NE(ref, nullptr);
+    auto& db = *ref->get();
+    auto sdo = make_sdo("BridgePerson", schemas[0].properties);
+    sdo.values["name"] = std::string("Still pending");
+    lattice::dynamic_object object(sdo);
+    db.add(object);
+    const auto before = db.db().query(
+        "SELECT globalId, isSynchronized FROM AuditLog ORDER BY id");
+    ASSERT_FALSE(before.empty());
+    const auto id = std::get<std::string>(before[0].at("globalId"));
+
+    // Exact Swift wire keys. A NACK must not enter the successful ACK path.
+    const auto wire = std::string(R"({"kind":"nack","nack":[")") + id +
+        R"("],"nackReason":"relay rejected this upload"})";
+    EXPECT_TRUE(db.receive_sync_data(lattice::ByteVector(wire.begin(), wire.end())).empty());
+    const auto error = db.last_receive_error();
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(*error, "Sync upload rejected: relay rejected this upload");
+    EXPECT_EQ(db.db().query("SELECT globalId, isSynchronized FROM AuditLog ORDER BY id"), before);
+
+    // A legitimate empty ACK remains a successful bookkeeping message and
+    // clears the preceding per-call receive error.
+    const std::string ack = R"({"kind":"ack","ack":[]})";
+    EXPECT_TRUE(db.receive_sync_data(lattice::ByteVector(ack.begin(), ack.end())).empty());
+    EXPECT_FALSE(db.last_receive_error().has_value());
+}
+
 TEST(Bridge, ReceiveSyncDataWithBlob) {
     // THE KEY TEST: BLOB data through the full sync bridge path
     TempDB tmp{"bridge_sync_blob"};

@@ -401,6 +401,92 @@ TEST(Sync, ServerSentEventJson) {
     EXPECT_EQ(parsed_ack->acked_ids.size(), 3u);
 }
 
+TEST(Sync, ServerSentNackRoundTripsWithoutAcknowledging) {
+    // Exact keys emitted by Swift ServerSentEvent.nack(ids:reason:).
+    const std::string wire = R"({"kind":"nack","nack":["1F7219D7-9FE9-4ABA-883C-835720F80EC2"],"nackReason":"relay apply failed [no-throw-shortfall]"})";
+    std::string diagnostic = "stale error";
+    auto event = lattice::server_sent_event::from_json(wire, &diagnostic);
+    ASSERT_TRUE(event.has_value());
+    EXPECT_TRUE(diagnostic.empty());
+    EXPECT_EQ(event->event_type, lattice::server_sent_event::type::nack);
+    EXPECT_EQ(event->nacked_ids, std::vector<std::string>({"1F7219D7-9FE9-4ABA-883C-835720F80EC2"}));
+    EXPECT_EQ(event->nack_reason, "relay apply failed [no-throw-shortfall]");
+    EXPECT_TRUE(event->acked_ids.empty());
+    EXPECT_TRUE(event->audit_logs.empty());
+
+    const auto encoded = lattice::server_sent_event::make_nack(
+        event->nacked_ids, event->nack_reason).to_json();
+    EXPECT_EQ(encoded.find("\"ack\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"auditLog\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"replayRequest\":"), std::string::npos);
+    auto roundtrip = lattice::server_sent_event::from_json(encoded);
+    ASSERT_TRUE(roundtrip.has_value());
+    EXPECT_EQ(roundtrip->event_type, lattice::server_sent_event::type::nack);
+    EXPECT_EQ(roundtrip->nacked_ids, event->nacked_ids);
+    EXPECT_EQ(roundtrip->nack_reason, event->nack_reason);
+}
+
+TEST(Sync, ServerSentNackOptionalReasonAndLegacyKeyFrames) {
+    for (const auto& wire : {R"({"nack":["id-1"]})",
+                             R"({"kind":"nack","nack":["id-1"],"nackReason":null})"}) {
+        std::string diagnostic = "stale error";
+        auto event = lattice::server_sent_event::from_json(wire, &diagnostic);
+        ASSERT_TRUE(event.has_value());
+        EXPECT_TRUE(diagnostic.empty());
+        EXPECT_EQ(event->event_type, lattice::server_sent_event::type::nack);
+        EXPECT_TRUE(event->nack_reason.empty());
+    }
+    // Old peers omitted kind; diagnostics must not make that an error.
+    EXPECT_TRUE(lattice::server_sent_event::from_json(R"({"ack":["id-1"]})"));
+    EXPECT_TRUE(lattice::server_sent_event::from_json(R"({"auditLog":[]})"));
+    EXPECT_TRUE(lattice::server_sent_event::from_json(R"({"replayRequest":true})"));
+}
+
+TEST(Sync, ServerSentNackRejectsMalformedAndAmbiguousFrames) {
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {R"({"nack":"SECRET"})", "nack is not an array"},
+        {R"({"nack":["id-1",42]})", "invalid nack entry"},
+        {R"({"nack":[""]})", "invalid nack entry"},
+        {R"({"nack":["id-1"],"nackReason":{"SECRET":true}})", "nackReason is not a string"},
+        {R"({"kind":"nack","ack":["id-1"]})", "sync frame kind does not match payload"},
+        {R"({"kind":"ack","nack":["id-1"]})", "sync frame kind does not match payload"},
+        {R"({"nack":["id-1"],"ack":["id-1"]})", "ambiguous sync frame payload"},
+        {R"({"nack":["id-1"],"auditLog":[]})", "ambiguous sync frame payload"},
+        {R"({"nack":["id-1"],"replayRequest":true})", "ambiguous sync frame payload"},
+        {R"({"ack":["id-1"],"rejected":"SECRET"})", "ambiguous sync frame payload"},
+        {R"({"nack":["id-1"],"nackReason":"SECRET})", "malformed sync JSON"},
+        {R"(["SECRET"])", "sync frame is not an object"},
+    };
+    for (const auto& [wire, expected] : cases) {
+        std::string diagnostic;
+        EXPECT_FALSE(lattice::server_sent_event::from_json(wire, &diagnostic));
+        EXPECT_EQ(diagnostic, expected);
+        EXPECT_EQ(diagnostic.find("SECRET"), std::string::npos);
+    }
+}
+
+TEST(Sync, ServerSentAuditFailureReportsPositionWithoutWireValues) {
+    lattice::audit_log_entry valid;
+    valid.global_id = "valid-entry";
+    valid.table_name = "TestPerson";
+    valid.operation = "INSERT";
+    valid.global_row_id = "valid-row";
+    valid.changed_fields = {{"name", lattice::any_property("Alice")}};
+    valid.changed_fields_names = {"name"};
+    valid.timestamp = "2024-01-01T00:00:00Z";
+    const auto wire = std::string("{\"auditLog\":[") + valid.to_json() +
+        R"(,{"globalId":"SECRET","tableName":42}]})";
+    std::string diagnostic;
+    EXPECT_FALSE(lattice::server_sent_event::from_json(wire, &diagnostic));
+    EXPECT_EQ(diagnostic, "invalid auditLog entry at index 1");
+    EXPECT_EQ(diagnostic.find("SECRET"), std::string::npos);
+    EXPECT_EQ(diagnostic.find("Alice"), std::string::npos);
+    // Failure is whole-frame; there is no partially parsed event to apply.
+    EXPECT_FALSE(lattice::server_sent_event::from_json(wire));
+    EXPECT_TRUE(lattice::server_sent_event::from_json(R"({"ack":[]})", &diagnostic));
+    EXPECT_TRUE(diagnostic.empty());
+}
+
 TEST(Sync, GenerateInstructionInsert) {
     lattice::audit_log_entry entry;
     entry.table_name = "TestPerson";
@@ -534,6 +620,114 @@ TEST(Sync, SynchronizerReceiveAck) {
 
     sync.disconnect();
 }
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+TEST(Sync, SynchronizerNackReportsReasonWithoutAcknowledgingOrImmediateResend) {
+    bounded_mock_case([] {
+        auto factory = std::make_shared<lattice::mock_network_factory>();
+        lattice::set_network_factory(factory);
+        TempDB tmp{"syncnack"};
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        lattice::lattice_db reader(lattice::configuration(tmp.str()));
+        db->add(TestPerson{"NackTest", 40, std::nullopt});
+        lattice::sync_config config;
+        config.websocket_url = "ws://localhost:8080/sync";
+        config.sync_id = "nack-test";
+        config.all_active_sync_ids = {config.sync_id};
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0;
+        std::vector<std::string> errors;
+        size_t completions = 0;
+        lattice::synchronizer sync(std::move(db), config);
+        sync.set_on_error([&](const std::string& error) { errors.push_back(error); });
+        sync.set_on_sync_complete([&](const std::vector<std::string>&) { ++completions; });
+        auto* transport = factory->last_websocket();
+        ASSERT_NE(transport, nullptr);
+        sync.connect();
+        const auto before = sync.get_progress();
+        ASSERT_GT(before.pending_upload, 0);
+        const auto sent = transport->get_sent_messages().size();
+        auto pending = lattice::query_audit_log(reader.db(), true);
+        ASSERT_FALSE(pending.empty());
+        std::vector<std::string> ids;
+        for (const auto& entry : pending) ids.push_back(entry.global_id);
+        const auto floor_before = reader.db().query(
+            "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = ?",
+            {config.sync_id});
+        const auto nack = lattice::server_sent_event::make_nack(ids, "relay apply failed").to_json();
+        for (int i = 0; i < 8; ++i) {
+            transport->simulate_message(lattice::transport_message::from_string(nack));
+            sync.sync_now(); // must not free the NACKed window for a new send
+        }
+        ASSERT_EQ(errors.size(), 8u);
+        for (const auto& error : errors) EXPECT_EQ(error, "Sync upload rejected: relay apply failed");
+        EXPECT_EQ(completions, 0u);
+        EXPECT_EQ(transport->get_sent_messages().size(), sent);
+        EXPECT_EQ(sync.get_progress().pending_upload, before.pending_upload);
+        EXPECT_EQ(sync.get_progress().acked, before.acked);
+        EXPECT_EQ(lattice::query_audit_log(reader.db(), true).size(), pending.size());
+        EXPECT_EQ(reader.db().query(
+            "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = ?",
+            {config.sync_id}), floor_before);
+
+        transport->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_nack({"unrelated-id"}, "").to_json()));
+        EXPECT_EQ(errors.back(), "Sync upload rejected: no reason supplied");
+        EXPECT_EQ(transport->get_sent_messages().size(), sent);
+        transport->simulate_message(lattice::transport_message::from_string(
+            R"({"kind":"nack","nack":["SECRET",42]})"));
+        EXPECT_EQ(errors.back(), "Failed to parse server message: invalid nack entry");
+        EXPECT_EQ(sync.get_progress().pending_upload, before.pending_upload);
+        transport->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_ack(ids).to_json()));
+        EXPECT_TRUE(lattice::query_audit_log(reader.db(), true).empty());
+        EXPECT_EQ(sync.get_progress().pending_upload, 0);
+        EXPECT_EQ(completions, 1u);
+        sync.disconnect();
+    });
+}
+
+TEST(Sync, SynchronizerNackRetainsAckTimeoutRecovery) {
+    bounded_mock_case([] {
+        auto factory = std::make_shared<lattice::mock_network_factory>();
+        lattice::set_network_factory(factory);
+        TempDB tmp{"nacktimeout"};
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        lattice::lattice_db reader(lattice::configuration(tmp.str()));
+        db->add(TestPerson{"TimeoutNack", 40, std::nullopt});
+        lattice::sync_config config;
+        config.websocket_url = "ws://localhost:8080/sync";
+        config.sync_id = "nack-timeout";
+        config.all_active_sync_ids = {config.sync_id};
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0;
+        config.ack_timeout_base_ms = 300;
+        lattice::synchronizer sync(std::move(db), config);
+        auto* transport = factory->last_websocket();
+        ASSERT_NE(transport, nullptr);
+        sync.connect();
+        const auto initial_sends = transport->get_sent_messages().size();
+        ASSERT_GT(initial_sends, 0u);
+        const auto pending = lattice::query_audit_log(reader.db(), true);
+        std::vector<std::string> ids;
+        for (const auto& entry : pending) ids.push_back(entry.global_id);
+        ASSERT_FALSE(ids.empty());
+        transport->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_nack(ids, "temporary rejection").to_json()));
+        EXPECT_EQ(transport->get_sent_messages().size(), initial_sends);
+        // The pre-existing watchdog, not the NACK callback, eventually retries.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (transport->get_sent_messages().size() == initial_sends &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        EXPECT_GT(transport->get_sent_messages().size(), initial_sends);
+        EXPECT_EQ(lattice::query_audit_log(reader.db(), true).size(), pending.size());
+        EXPECT_EQ(sync.get_progress().acked, 0);
+        sync.disconnect();
+    });
+}
+#endif
 
 TEST(Sync, SynchronizerReceiveRemote) {
     auto mock_factory = std::make_shared<lattice::mock_network_factory>();

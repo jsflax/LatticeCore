@@ -2899,9 +2899,24 @@ public:
         last_receive_error_.reset();
         try {
             std::string json_str(data.begin(), data.end());
-            auto event = server_sent_event::from_json(json_str);
+            std::string parse_error;
+            auto event = server_sent_event::from_json(json_str, &parse_error);
             if (!event) {
-                return {};  // Parse failed
+                // An empty success is reserved for messages that applied no
+                // entries (for example ACK bookkeeping). A rejected upload
+                // must reach Swift's receive() error path, otherwise the relay
+                // misclassifies it as an unexplained apply shortfall and retries.
+                last_receive_error_ = "Failed to parse sync data: " + parse_error;
+                return {};
+            }
+            if (event->event_type == server_sent_event::type::nack) {
+                // The shared C/Swift receive helper must not turn a newly
+                // recognized rejection into successful empty JSON. NACKs never
+                // mark entries synchronized or mutate the local upload state.
+                last_receive_error_ = "Sync upload rejected: " +
+                    (event->nack_reason.empty() ? std::string("no reason supplied")
+                                                : event->nack_reason);
+                return {};
             }
             std::vector<std::string> result;
 

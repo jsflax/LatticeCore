@@ -762,6 +762,49 @@ TEST(CAPICrossProcessObservation, ObserverFiresForSiblingInstanceWrites) {
 // apply_remote_changes path. Pin the per-entry isolation contract: one bad
 // entry in a batch is skipped, the good entries apply, and ONLY the applied
 // ids come back (unapplied entries must not be acked).
+TEST(CAPIReceiveSyncData, NackReturnsErrorInsteadOfEmptySuccess) {
+    TempPath path("capi_receive_nack");
+    PersonSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), &schema.schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    auto* person = add_person(db, "Local pending value", 7);
+    ASSERT_NE(person, nullptr);
+
+    char* raw_before = lattice_db_events_after(db, nullptr);
+    ASSERT_NE(raw_before, nullptr) << lattice_last_error();
+    const auto before = nlohmann::json::parse(raw_before);
+    lattice_string_free(raw_before);
+    ASSERT_FALSE(before.empty());
+    const nlohmann::json nack = {
+        {"kind", "nack"}, {"nack", {before.at(0).at("globalId")}},
+        {"nackReason", "relay refused this upload"}
+    };
+    const auto wire = nack.dump();
+    char* result = lattice_db_receive_sync_data(
+        db, reinterpret_cast<const uint8_t*>(wire.data()), wire.size());
+    EXPECT_EQ(result, nullptr);
+    ASSERT_NE(lattice_last_error(), nullptr);
+    EXPECT_STREQ(lattice_last_error(), "Sync upload rejected: relay refused this upload");
+    if (result) lattice_string_free(result);
+
+    // The error must not acknowledge or delete the local audit entry.
+    char* raw_after = lattice_db_events_after(db, nullptr);
+    ASSERT_NE(raw_after, nullptr) << lattice_last_error();
+    EXPECT_EQ(nlohmann::json::parse(raw_after), before);
+    lattice_string_free(raw_after);
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 1u);
+
+    const std::string ack = R"({"kind":"ack","ack":[]})";
+    result = lattice_db_receive_sync_data(
+        db, reinterpret_cast<const uint8_t*>(ack.data()), ack.size());
+    ASSERT_NE(result, nullptr) << lattice_last_error();
+    EXPECT_EQ(nlohmann::json::parse(result), nlohmann::json::array());
+    lattice_string_free(result);
+    lattice_object_release(person);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
 TEST(CAPIReceiveSyncData, PerEntryErrorIsolation) {
     TempPath src_path("capi_recv_src"), dst_path("capi_recv_dst");
     PersonSchema ps;

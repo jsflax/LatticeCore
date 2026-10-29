@@ -610,6 +610,10 @@ std::string server_sent_event::to_json() const {
             audit_array.push_back(entry_to_json_obj(entry));
         }
         j["auditLog"] = audit_array;
+    } else if (event_type == type::nack) {
+        j["kind"] = "nack";
+        j["nack"] = nacked_ids;
+        j["nackReason"] = nack_reason;
     } else if (event_type == type::replay_request) {
         j["kind"] = "replayRequest";
         j["replayRequest"] = true;
@@ -622,25 +626,56 @@ std::string server_sent_event::to_json() const {
 }
 
 std::optional<server_sent_event> server_sent_event::from_json(const std::string& json_str) {
+    return from_json(json_str, nullptr);
+}
+
+std::optional<server_sent_event> server_sent_event::from_json(
+    const std::string& json_str, std::string* error_out) {
+    if (error_out) error_out->clear();
+    auto reject = [error_out](const std::string& reason) -> std::optional<server_sent_event> {
+        if (error_out) *error_out = reason;
+        return std::nullopt;
+    };
     try {
         json j = json::parse(json_str);
+        if (!j.is_object()) return reject("sync frame is not an object");
 
-        if (j.contains("auditLog") && j["auditLog"].is_array()) {
+        // Legacy frames can omit kind. When it is supplied, it must agree
+        // with the sole payload key. In particular a NACK must never reach
+        // the ACK branch just because an ambiguous frame also carries ack.
+        const char* payload = nullptr;
+        size_t payload_count = 0;
+        for (const char* key : {"auditLog", "ack", "replayRequest", "nack", "rejected", "floorReset"}) {
+            if (j.contains(key)) {
+                payload = key;
+                ++payload_count;
+            }
+        }
+        if (payload_count > 1) return reject("ambiguous sync frame payload");
+        if (payload_count == 0) return reject("unsupported sync frame");
+        if (j.contains("kind") && (!j["kind"].is_string() || j["kind"] != payload))
+            return reject("sync frame kind does not match payload");
+
+        if (j.contains("auditLog")) {
+            if (!j["auditLog"].is_array()) return reject("auditLog is not an array");
             server_sent_event event;
             event.event_type = type::audit_log;
 
+            size_t entry_index = 0;
             for (const auto& entry_json : j["auditLog"]) {
                 // Parse once: the sub-object is already parsed — dumping it
                 // back to a string re-parsed every entry a second time.
                 auto entry = entry_from_parsed(entry_json);
                 // Dropping a bad position would let the resume cursor pass
                 // it. Reject this entire delivery before any apply or ACK.
-                if (!entry) return std::nullopt;
+                if (!entry) return reject("invalid auditLog entry at index " + std::to_string(entry_index));
                 event.audit_logs.push_back(std::move(*entry));
+                ++entry_index;
             }
             return event;
 
-        } else if (j.contains("ack") && j["ack"].is_array()) {
+        } else if (j.contains("ack")) {
+            if (!j["ack"].is_array()) return reject("ack is not an array");
             server_sent_event event;
             event.event_type = type::ack;
 
@@ -651,16 +686,33 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
             }
             return event;
 
+        } else if (j.contains("nack")) {
+            if (!j["nack"].is_array()) return reject("nack is not an array");
+            server_sent_event event;
+            event.event_type = type::nack;
+            for (const auto& id : j["nack"]) {
+                if (!id.is_string() || id.get_ref<const std::string&>().empty())
+                    return reject("invalid nack entry");
+                event.nacked_ids.push_back(id.get<std::string>());
+            }
+            if (j.contains("nackReason") && !j["nackReason"].is_null()) {
+                if (!j["nackReason"].is_string()) return reject("nackReason is not a string");
+                event.nack_reason = j["nackReason"].get<std::string>();
+            }
+            return event;
+
         } else if (j.contains("replayRequest")) {
             server_sent_event event;
             event.event_type = type::replay_request;
             return event;
         }
     } catch (...) {
-        return std::nullopt;
+        // nlohmann's exception text can quote untrusted wire data. Keep the
+        // error safe to forward through the bridge and operational logs.
+        return reject("malformed sync JSON");
     }
 
-    return std::nullopt;
+    return reject("unsupported sync frame");
 }
 
 // ============================================================================
@@ -1219,20 +1271,25 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
     try {
         std::string json_str = msg.as_string();
 
-        auto event = server_sent_event::from_json(json_str);
+        std::string parse_error;
+        auto event = server_sent_event::from_json(json_str, &parse_error);
         if (!event) {
-            if (on_error_) {
-                scheduler_->invoke([this] { on_error_("Failed to parse server message"); });
-            }
+            const auto generation = connection_generation_.load();
+            scheduler_->invoke([this, generation, parse_error = std::move(parse_error)] {
+                if (!is_destroyed_ && connection_generation_ == generation && on_error_)
+                    on_error_("Failed to parse server message: " + parse_error);
+            });
             return;
         }
 
         LOG_INFO("synchronizer", "[%s] on_transport_message: type=%s entries=%zu (this=%p, db=%s)",
                  log_id(),
                  event->event_type == server_sent_event::type::audit_log ? "audit_log"
-                     : event->event_type == server_sent_event::type::replay_request ? "replay_request" : "ack",
-                 event->event_type == server_sent_event::type::audit_log
-                     ? event->audit_logs.size() : event->acked_ids.size(),
+                     : event->event_type == server_sent_event::type::replay_request ? "replay_request"
+                     : event->event_type == server_sent_event::type::nack ? "nack" : "ack",
+                 event->event_type == server_sent_event::type::audit_log ? event->audit_logs.size()
+                     : event->event_type == server_sent_event::type::nack ? event->nacked_ids.size()
+                     : event->acked_ids.size(),
                  (void*)this, db().config().path.c_str());
 
         if (event->event_type == server_sent_event::type::audit_log) {
@@ -1309,6 +1366,21 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if (on_sync_complete_) {
                     on_sync_complete_(ids);
                 }
+            });
+
+        } else if (event->event_type == server_sent_event::type::nack) {
+            // A rejection is not durability progress. Leave persisted sync
+            // state, upload floors and in-flight IDs intact; the existing
+            // window-local ACK watchdog retains its bounded backoff. Releasing
+            // IDs and uploading here would create a hot retry loop against a
+            // relay whose deterministic apply failure cannot be cured by retry.
+            auto reason = std::move(event->nack_reason);
+            const auto generation = connection_generation_.load();
+            scheduler_->invoke([this, generation, reason = std::move(reason)] {
+                if (is_destroyed_ || connection_generation_ != generation) return;
+                if (on_error_)
+                    on_error_("Sync upload rejected: " +
+                              (reason.empty() ? std::string("no reason supplied") : reason));
             });
 
         } else if (event->event_type == server_sent_event::type::replay_request) {

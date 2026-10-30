@@ -1,13 +1,17 @@
 # Changelog
 
-## [2.4.2] - 2026-10-28
+## [2.4.2] - 2026-10-30
 
 ### Fixed
 - Add checked dynamic-open factories so Swift consumers can report invalid-store and initialization failures without a native exception escaping the bridge. Preserve independent read-only connections and the existing unchecked overloads.
 - Close the partially opened SQLite connection when database initialization throws, including failed PRAGMAs, instead of leaking the connection.
+- Index reverse-link lookups for fresh and existing stores, while preserving union-table replay and the configured sync scheduler.
+- Recognize relay NACK responses without acknowledging rejected writes, advancing upload progress, or bypassing the existing retry timeout.
+- Report malformed sync frames and rejected uploads through the Swift and C receive boundaries instead of returning an unexplained empty success. Keep whole-frame validation and committed-prefix acknowledgement behavior.
 
 ### Compatibility
-- Additive C++/Swift bridge overloads; no persistent schema, sync wire format or public C ABI change. Rebuild Core and Swift bridge consumers together.
+- Additive C++/Swift bridge overloads and native sync-event fields; no public C ABI change. Existing relay NACK messages are now recognized. Rebuild Core and all native/C++ bridge consumers together.
+- Internal schema-format epoch advances from 6 to 7 so writable opens add reverse-link indexes to existing stores without a model schema-version bump. Read-only opens remain DDL-free, and the indexes do not replace or rewrite model data.
 - Swift consumers must use the matching checked adapter to receive these open failures as Swift errors.
 
 ## [2.4.1] - 2026-10-25

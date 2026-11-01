@@ -574,6 +574,17 @@ protected:
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
 
+    // Channel-private deliveries whose classification changes membership.
+    // Persist before resolving their source; only a matching ACK removes them.
+    void ensure_sync_outbox();
+    void sync_outbox_transaction(const std::function<void()>& body);
+    std::optional<audit_log_entry> stage_sync_delivery(
+        const audit_log_entry& source, audit_log_entry delivery, bool member);
+    std::vector<audit_log_entry> query_sync_outbox(size_t available, bool& pending);
+    std::vector<std::string> sync_outbox_sources(const std::vector<std::string>& ids);
+    void acknowledge_sync_outbox(const std::vector<std::string>& ids);
+    bool filter_reconciliation_pending_ = false;
+
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
     std::optional<std::optional<std::string>> get_filter_for_table(const std::string& table_name) const;
@@ -694,6 +705,9 @@ namespace test_hooks {
 /// entries are still returned (= acked), the failed chunk is retried once,
 /// then the delivery stops. nullptr (the default) in production.
 extern std::function<void(size_t chunk_start)> apply_chunk_begin;
+/// Test-only rollback seam after durable-delivery INSERT, before membership
+/// and source resolution. Throwing must roll the whole staging transaction back.
+extern std::function<void()> sync_outbox_after_insert;
 }  // namespace test_hooks
 
 // Apply remote audit log entries to a database (server-side receive path)

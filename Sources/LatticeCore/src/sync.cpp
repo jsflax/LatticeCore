@@ -11,6 +11,7 @@ namespace lattice {
 
 namespace test_hooks {
 std::function<void(size_t chunk_start)> apply_chunk_begin;
+std::function<void()> sync_outbox_after_insert;
 }  // namespace test_hooks
 
 using json = nlohmann::json;
@@ -739,6 +740,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     auto factory = get_network_factory();
     ws_client_ = factory->create_sync_transport(scheduler_);
+    ensure_sync_outbox();
     setup_transport_handlers();
     setup_observer();
 #ifndef __EMSCRIPTEN__
@@ -762,6 +764,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
     LOG_INFO("synchronizer", "[%s] CREATED (IPC, this=%p, db=%s, alive=%lld)",
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
+    ensure_sync_outbox();
     setup_transport_handlers();
     setup_observer();
 #ifndef __EMSCRIPTEN__
@@ -1250,10 +1253,9 @@ void synchronizer_base::on_websocket_open() {
             ws_client_->send(transport_message::from_binary({req.begin(), req.end()}));
         }
 
-        if (config_.sync_filter) {
-            LOG_DEBUG("synchronizer", "Reconciling sync filter on connect...");
-            reconcile_sync_filter();
-        }
+        // A previously admitted delivery must drain before reconciliation
+        // interprets the membership it already changed.
+        filter_reconciliation_pending_ = filter_reconciliation_pending_ || config_.sync_filter.has_value();
 
         LOG_DEBUG("synchronizer", "Calling upload_pending_changes...");
         upload_pending_changes();
@@ -1409,7 +1411,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     last_enumerated_id_ = 0;
                     stall_min_open_ = -1;
                 }
-                reconcile_sync_filter();
+                filter_reconciliation_pending_ = true;
                 upload_pending_changes();
             });
         }
@@ -1725,7 +1727,7 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
             std::lock_guard<std::mutex> lock(in_flight_mutex_);
             last_enumerated_id_ = 0;  // re-enumerate from the rewound floor
         }
-        reconcile_sync_filter();
+        filter_reconciliation_pending_ = true;
         // A filter change can make ALREADY-PENDING entries newly eligible
         // (reconcile's Phase-2 dedup intentionally does not re-synthesize rows
         // whose INSERT entries are still pending). Reconcile only uploads when
@@ -1738,9 +1740,8 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
 void synchronizer_base::clear_sync_filter() {
     scheduler_->invoke([this] {
         config_.sync_filter = std::nullopt;
-        // Clear THIS channel's sync set — without a filter, everything syncs
-        // via the normal path. Other channels' membership is untouched.
-        db().db().execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {config_.sync_id});
+        filter_reconciliation_pending_ = true;
+        upload_pending_changes();
     });
 }
 
@@ -2000,12 +2001,176 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enum
     return entries;
 }
 
+void synchronizer_base::sync_outbox_transaction(const std::function<void()>& body) {
+    if (db().store_write_gate())
+        database::maintenance_scope::probe_before_store_gate(db().db());
+    try {
+        {
+            lattice_db::store_write_gate_hold gate(db());
+            database::maintenance_scope ownership(db().db());
+            db().db().begin_transaction();
+            try {
+                body();
+                db().db().commit();
+                if (db().db().is_in_transaction())
+                    throw db_error("sync outbox commit did not settle its transaction");
+            } catch (...) {
+                try {
+                    if (db().db().is_in_transaction()) db().db().rollback();
+                    if (db().db().is_in_transaction())
+                        throw db_error("sync outbox rollback did not settle its transaction");
+                } catch (...) { db().db().closed_.store(true, std::memory_order_release); }
+                throw;
+            }
+        }
+    } catch (...) {
+        // Earlier committed notifications still drain, but never underneath
+        // this metadata transaction's SQLite mutex or shared-store gate.
+        try { db().db().drain_if_settled(); } catch (...) {}
+        throw;
+    }
+    db().db().drain_if_settled();
+}
+
+void synchronizer_base::ensure_sync_outbox() {
+    sync_outbox_transaction([&] {
+        db().db().execute(
+            "CREATE TABLE IF NOT EXISTS _lattice_sync_outbox ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, sync_id TEXT NOT NULL, "
+            "source_audit_id INTEGER, source_global_id TEXT, "
+            "event_global_id TEXT NOT NULL, payload TEXT NOT NULL, "
+            "UNIQUE(sync_id, event_global_id))");
+        db().db().execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_outbox_source "
+            "ON _lattice_sync_outbox(sync_id, source_audit_id)");
+    });
+}
+
+std::optional<audit_log_entry> synchronizer_base::stage_sync_delivery(
+        const audit_log_entry& source, audit_log_entry delivery, bool member) {
+    if (source.id <= 0 || source.global_id.empty())
+        throw std::runtime_error("sync delivery requires a durable source audit");
+    // The outbox owns retry, independently of source compaction/upload floors.
+    delivery.id = 0;
+    std::optional<audit_log_entry> staged;
+    sync_outbox_transaction([&] {
+        // A second owner may have enumerated this source before our transaction.
+        // Reuse its admitted delivery, or leave its already-resolved source alone.
+        auto existing = db().db().query(
+            "SELECT event_global_id, payload FROM _lattice_sync_outbox "
+            "WHERE sync_id=? AND source_audit_id=? ORDER BY id LIMIT 1",
+            {config_.sync_id, source.id});
+        if (!existing.empty()) {
+            auto saved = audit_log_entry::from_json(std::get<std::string>(existing[0].at("payload")));
+            if (!saved || saved->global_id != std::get<std::string>(existing[0].at("event_global_id")))
+                throw std::runtime_error("invalid stored sync delivery");
+            saved->id = 0;
+            staged = std::move(saved);
+            return;
+        }
+        auto eligible = db().db().query(
+            "SELECT a.id FROM AuditLog a LEFT JOIN _lattice_sync_state s "
+            "ON s.audit_entry_id=a.id AND s.sync_id=? "
+            "WHERE a.id=? AND a.globalId=? "
+            "AND COALESCE(s.is_synchronized, a.isSynchronized)=0",
+            {config_.sync_id, source.id, source.global_id});
+        if (eligible.empty()) return;
+        const auto count = db().db().query(
+            "SELECT COUNT(*) AS n FROM _lattice_sync_outbox WHERE sync_id=?", {config_.sync_id});
+        if (std::get<int64_t>(count[0].at("n")) >= static_cast<int64_t>(config_.chunk_size * 2))
+            return; // Also bound staging against a concurrent same-channel owner.
+        db().db().execute(
+            "INSERT INTO _lattice_sync_outbox "
+            "(sync_id, source_audit_id, source_global_id, event_global_id, payload) "
+            "VALUES (?, ?, ?, ?, ?)",
+            {config_.sync_id, source.id, source.global_id, delivery.global_id, delivery.to_json()});
+        if (test_hooks::sync_outbox_after_insert) test_hooks::sync_outbox_after_insert();
+        if (member) sync_set_add(delivery.table_name, delivery.global_row_id);
+        else sync_set_remove(delivery.table_name, delivery.global_row_id);
+        db().db().execute(
+            "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized) "
+            "VALUES (?, ?, 1) ON CONFLICT(audit_entry_id, sync_id) "
+            "DO UPDATE SET is_synchronized=1", {source.id, config_.sync_id});
+        staged = std::move(delivery);
+    });
+    // Advancing the source floor is safe only after its replacement is durable.
+    if (staged && config_.use_upload_floor) resolve_audit_ids({source.id});
+    return staged;
+}
+
+std::vector<audit_log_entry> synchronizer_base::query_sync_outbox(size_t available, bool& pending) {
+    std::unordered_set<std::string> in_flight;
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        for (const auto& item : in_flight_ids_) in_flight.insert(item.first);
+    }
+    auto rows = db().db().query(
+        "SELECT event_global_id, payload FROM _lattice_sync_outbox "
+        "WHERE sync_id=? ORDER BY id LIMIT ?",
+        {config_.sync_id, static_cast<int64_t>(available + in_flight.size())});
+    pending = !rows.empty();
+    std::vector<audit_log_entry> entries;
+    for (const auto& row : rows) {
+        const auto& id = std::get<std::string>(row.at("event_global_id"));
+        if (in_flight.count(id)) continue;
+        auto entry = audit_log_entry::from_json(std::get<std::string>(row.at("payload")));
+        if (!entry || entry->global_id != id)
+            throw std::runtime_error("invalid stored sync delivery");
+        entry->id = 0;
+        entries.push_back(std::move(*entry));
+        if (entries.size() == available) break;
+    }
+    return entries;
+}
+
+std::vector<std::string> synchronizer_base::sync_outbox_sources(const std::vector<std::string>& ids) {
+    std::vector<std::string> sources;
+    constexpr size_t chunk = 400;
+    for (size_t start = 0; start < ids.size(); start += chunk) {
+        const size_t end = std::min(start + chunk, ids.size());
+        std::string placeholders;
+        std::vector<column_value_t> parameters{config_.sync_id};
+        for (size_t index = start; index < end; ++index) {
+            placeholders += index == start ? "?" : ",?";
+            parameters.push_back(ids[index]);
+        }
+        const auto rows = db().db().query(
+            "SELECT source_global_id FROM _lattice_sync_outbox "
+            "WHERE sync_id=? AND event_global_id IN (" + placeholders + ")", parameters);
+        for (const auto& row : rows) {
+            const auto& value = row.at("source_global_id");
+            if (std::holds_alternative<std::string>(value))
+                sources.push_back(std::get<std::string>(value));
+        }
+    }
+    return sources;
+}
+
+void synchronizer_base::acknowledge_sync_outbox(const std::vector<std::string>& ids) {
+    if (ids.empty()) return;
+    sync_outbox_transaction([&] {
+        constexpr size_t chunk = 400;
+        for (size_t start = 0; start < ids.size(); start += chunk) {
+            const size_t end = std::min(start + chunk, ids.size());
+            std::string placeholders;
+            std::vector<column_value_t> parameters{config_.sync_id};
+            for (size_t index = start; index < end; ++index) {
+                placeholders += index == start ? "?" : ",?";
+                parameters.push_back(ids[index]);
+            }
+            db().db().execute(
+                "DELETE FROM _lattice_sync_outbox WHERE sync_id=? "
+                "AND event_global_id IN (" + placeholders + ")", parameters);
+        }
+    });
+}
+
 void synchronizer_base::classify_delete(audit_log_entry& entry, classified_entries& result) {
     if (sync_set_contains(entry.table_name, entry.global_row_id)) {
         // Row was in sync set: forward DELETE, remove from sync set
         LOG_DEBUG("synchronizer", "  -> DELETE, in sync set: forwarding");
-        result.to_send.push_back(entry);
-        sync_set_remove(entry.table_name, entry.global_row_id);
+        if (auto staged = stage_sync_delivery(entry, entry, false))
+            result.to_send.push_back(std::move(*staged));
     } else {
         // Row was never synced: mark as processed
         LOG_DEBUG("synchronizer", "  -> DELETE, NOT in sync set: marking synced (skip)");
@@ -2035,9 +2200,8 @@ void synchronizer_base::classify_insert_or_update(audit_log_entry& entry,
             auto insert_entry = build_insert_entry_from_current_row(entry.table_name, entry.global_row_id);
             if (insert_entry) {
                 LOG_DEBUG("synchronizer", "  -> built INSERT with %zu changed_fields", insert_entry->changed_fields.size());
-                result.to_send.push_back(std::move(*insert_entry));
-                sync_set_add(entry.table_name, entry.global_row_id);
-                result.to_mark_synced.push_back(entry.id);  // Original superseded
+                if (auto staged = stage_sync_delivery(entry, std::move(*insert_entry), true))
+                    result.to_send.push_back(std::move(*staged));
             } else {
                 LOG_DEBUG("synchronizer", "  -> row deleted, marking synced (skip)");
                 result.to_mark_synced.push_back(entry.id);
@@ -2056,9 +2220,8 @@ void synchronizer_base::classify_insert_or_update(audit_log_entry& entry,
         del.operation = "DELETE";
         del.global_row_id = entry.global_row_id;
         del.timestamp = entry.timestamp;
-        result.to_send.push_back(std::move(del));
-        sync_set_remove(entry.table_name, entry.global_row_id);
-        result.to_mark_synced.push_back(entry.id);  // Original entry superseded
+        if (auto staged = stage_sync_delivery(entry, std::move(del), false))
+            result.to_send.push_back(std::move(*staged));
     } else {
         // !matches && !in_set: mark as processed
         LOG_DEBUG("synchronizer", "  -> no match, not in set: marking synced (skip)");
@@ -2187,8 +2350,10 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
             }
             // Inline classify_delete with cached lookups
             else if (cached_sync_set_contains(entry.table_name, entry.global_row_id)) {
-                result.to_send.push_back(entry);
-                cached_sync_set_remove(entry.table_name, entry.global_row_id);
+                if (auto staged = stage_sync_delivery(entry, entry, false)) {
+                    result.to_send.push_back(std::move(*staged));
+                    if (preload) sync_set_cache.erase(entry.table_name + '\0' + entry.global_row_id);
+                }
             } else {
                 result.to_mark_synced.push_back(entry.id);
             }
@@ -2204,9 +2369,10 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
                 } else {
                     auto insert_entry = build_insert_entry_from_current_row(entry.table_name, entry.global_row_id);
                     if (insert_entry) {
-                        result.to_send.push_back(std::move(*insert_entry));
-                        cached_sync_set_add(entry.table_name, entry.global_row_id);
-                        result.to_mark_synced.push_back(entry.id);
+                        if (auto staged = stage_sync_delivery(entry, std::move(*insert_entry), true)) {
+                            result.to_send.push_back(std::move(*staged));
+                            if (preload) sync_set_cache.insert(entry.table_name + '\0' + entry.global_row_id);
+                        }
                     } else {
                         result.to_mark_synced.push_back(entry.id);
                     }
@@ -2220,9 +2386,10 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
                 del.operation = "DELETE";
                 del.global_row_id = entry.global_row_id;
                 del.timestamp = entry.timestamp;
-                result.to_send.push_back(std::move(del));
-                cached_sync_set_remove(entry.table_name, entry.global_row_id);
-                result.to_mark_synced.push_back(entry.id);
+                if (auto staged = stage_sync_delivery(entry, std::move(del), false)) {
+                    result.to_send.push_back(std::move(*staged));
+                    if (preload) sync_set_cache.erase(entry.table_name + '\0' + entry.global_row_id);
+                }
             } else {
                 result.to_mark_synced.push_back(entry.id);
             }
@@ -2570,6 +2737,37 @@ void synchronizer_base::upload_pending_changes() {
         LOG_DEBUG("synchronizer", "upload_pending_changes: not connected, skipping");
         return;
     }
+    // Classification changes membership and can replace a real audit row
+    // with a synthetic INSERT/DELETE. Do not classify work that cannot enter
+    // the transport window: otherwise send_entries truncates that synthetic
+    // after its source was already marked resolved, leaving no retry source.
+    size_t available;
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        const size_t capacity = config_.chunk_size * 2;
+        available = in_flight_ids_.size() >= capacity
+            ? 0 : capacity - in_flight_ids_.size();
+    }
+    if (available == 0) return; // ACK/timeout owns the next admission opportunity.
+    bool outbox_pending = false;
+    auto admitted = query_sync_outbox(available, outbox_pending);
+    if (outbox_pending) {
+        send_entries(admitted);
+        return; // Finish previously admitted work before new classification.
+    }
+    if (filter_reconciliation_pending_) {
+        filter_reconciliation_pending_ = false;
+        try {
+            if (config_.sync_filter) reconcile_sync_filter();
+            else db().db().execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {config_.sync_id});
+        } catch (...) {
+            filter_reconciliation_pending_ = true;
+            throw;
+        }
+        // Reconciliation can itself upload, so compute capacity again.
+        upload_pending_changes();
+        return;
+    }
     // DB-truth belt for the floor (runs before the horizon read so a swept
     // prefix can advance the floor this same pass).
     reconcile_open_with_db();
@@ -2611,6 +2809,10 @@ void synchronizer_base::upload_pending_changes() {
             }
         }
         return;
+    }
+    if (entries.size() > available) {
+        entries.resize(available);
+        enumeration_hit_limit = true;
     }
     auto classified = classify_entries(entries);
 
@@ -2656,7 +2858,13 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
              log_id(), global_ids.size(),
              (long long)progress_acked_.load(std::memory_order_relaxed));
-    mark_audit_entries_synced_for(db(), global_ids, config_.sync_id, config_.all_active_sync_ids);
+    auto audit_ids = sync_outbox_sources(global_ids);
+    audit_ids.insert(audit_ids.end(), global_ids.begin(), global_ids.end());
+    std::sort(audit_ids.begin(), audit_ids.end());
+    audit_ids.erase(std::unique(audit_ids.begin(), audit_ids.end()), audit_ids.end());
+    mark_audit_entries_synced_for(db(), audit_ids, config_.sync_id, config_.all_active_sync_ids);
+    // Do not release in-flight state or report completion before durable removal.
+    acknowledge_sync_outbox(global_ids);
 
     // Remove ACK'd entries from in-flight set; pending mirrors the set size
     // (store, not fetch_sub — an ACK straddling a reconnect clear must not

@@ -93,10 +93,10 @@ struct instance_guard {
     /// yield spin in ~lattice_db during the test suite). A callback that
     /// triggers destruction must not touch the lattice afterwards — which is
     /// inherently true for deinit-triggered teardown.
-    static std::unordered_map<const instance_guard*, int>& tls_depths() {
-        thread_local std::unordered_map<const instance_guard*, int> depths;
-        return depths;
-    }
+    // Keep the TLS accessor out of line. Combined-object builds may localize
+    // hidden inline TLS independently in Core, bridge, and caller objects;
+    // destruction must read the same map that callback admission increments.
+    static std::unordered_map<const instance_guard*, int>& tls_depths();
     static int tls_depth(const instance_guard* g) {
         auto& m = tls_depths();
         auto it = m.find(g);

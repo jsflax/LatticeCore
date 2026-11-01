@@ -26,6 +26,11 @@ static log_level initial_log_level() {
 }
 std::atomic<log_level> g_log_level{initial_log_level()};
 
+std::unordered_map<const instance_guard*, int>& instance_guard::tls_depths() {
+    thread_local std::unordered_map<const instance_guard*, int> depths;
+    return depths;
+}
+
 // Singleton instance - defined here to ensure single copy across all translation units
 instance_registry& instance_registry::instance() {
     // Intentionally leaked: prevents use-after-destroy when GCD callbacks

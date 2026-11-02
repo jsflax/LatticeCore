@@ -21,12 +21,11 @@ generic_scheduler::generic_scheduler(void* context,
     , is_on_thread_fn_(is_on_thread_fn)
     , is_same_as_fn_(is_same_as_fn)
     , can_invoke_fn_(can_invoke_fn)
-    , destroy_fn_(destroy_fn)
+    , context_owner_(own_context(context, destroy_fn))
 {}
 
 std::shared_ptr<scheduler> generic_scheduler::make_shared() const {
-    return std::make_shared<generic_scheduler>(context_, invoke_fn_, is_on_thread_fn_, is_same_as_fn_,
-                                               can_invoke_fn_, destroy_fn_);
+    return std::make_shared<generic_scheduler>(*this);
 }
 
 } // namespace lattice

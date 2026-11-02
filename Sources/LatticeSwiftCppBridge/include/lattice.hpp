@@ -883,6 +883,16 @@ public:
         }
     }
 
+    // Strict metadata query: zero is only a sealed failure sentinel.
+    int32_t stored_schema_version() SWIFT_NAME(storedSchemaVersion()) {
+        last_bridge_error().clear();
+        try { return lattice_db::stored_schema_version(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return 0;
+        }
+    }
+
     // count overloads: never throw into Swift — 0 on failure.
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
@@ -2898,9 +2908,24 @@ public:
         last_receive_error_.reset();
         try {
             std::string json_str(data.begin(), data.end());
-            auto event = server_sent_event::from_json(json_str);
+            std::string parse_error;
+            auto event = server_sent_event::from_json(json_str, &parse_error);
             if (!event) {
-                return {};  // Parse failed
+                // An empty success is reserved for messages that applied no
+                // entries (for example ACK bookkeeping). A rejected upload
+                // must reach Swift's receive() error path, otherwise the relay
+                // misclassifies it as an unexplained apply shortfall and retries.
+                last_receive_error_ = "Failed to parse sync data: " + parse_error;
+                return {};
+            }
+            if (event->event_type == server_sent_event::type::nack) {
+                // The shared C/Swift receive helper must not turn a newly
+                // recognized rejection into successful empty JSON. NACKs never
+                // mark entries synchronized or mutate the local upload state.
+                last_receive_error_ = "Sync upload rejected: " +
+                    (event->nack_reason.empty() ? std::string("no reason supplied")
+                                                : event->nack_reason);
+                return {};
             }
             std::vector<std::string> result;
 
@@ -3161,6 +3186,8 @@ namespace detail {
     inline std::string connection_fingerprint(const configuration& config) {
         std::string fp = config.read_only ? "R" : "W";
         fp += config.sync_is_observer ? 'O' : 'P';
+        fp += config.sync_autostart ? 'A' : 'D';
+        fp += config.background_sync_managed ? 'M' : 'U';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         append_cache_string(fp, config.authorization_token);
@@ -3483,10 +3510,34 @@ inline void swift_lattice::close() {
     lattice_db::close();
 }
 
+/// Copyable across the Swift/C++ boundary, including the iOS value path.
+/// Cancellation is nonblocking and can precede native connection setup.
+class swift_sync_cancellation {
+public:
+    swift_sync_cancellation() : token_(std::make_shared<std::atomic<bool>>(false)) {}
+    void cancel() const { token_->store(true, std::memory_order_release); }
+    bool is_cancelled() const { return token_->load(std::memory_order_acquire); }
+private:
+    friend class swift_lattice_ref;
+    std::shared_ptr<std::atomic<bool>> token_;
+};
+
+// Swift cannot import types nested in lattice_db (the enclosing native owner
+// is deliberately unavailable). Keep these bridge receipts plain values.
+enum class swift_background_sync_admission { started, already_running, not_owner, cancelled, closed, unsupported };
+struct swift_background_sync_start {
+    swift_background_sync_admission admission = swift_background_sync_admission::unsupported;
+    uint64_t generation = 0;
+};
+enum class swift_finite_sync_phase { inactive, running, work_complete, failed, cancelled };
+struct swift_background_sync_status {
+    swift_finite_sync_phase phase = swift_finite_sync_phase::inactive;
+};
+
 class swift_lattice_ref {
 public:
     // FRT path: the factories return a heap `swift_lattice_ref*` foreign
-    // reference. Value path (iOS 15): they return a `swift_lattice_ref` by value
+    // reference. Value path (iOS): they return a `swift_lattice_ref` by value
     // whose inner shared_ptr<swift_lattice> keeps the db alive. RefRet + _make +
     // the UNRETAINED macro let every factory body stay single-source.
 #if LATTICE_HAS_FRT
@@ -3534,16 +3585,16 @@ public:
     /// live database directly — no checkpoint required.
     static LATTICE_SLREF_RET create_dynamic(const swift_configuration& config)
         SWIFT_NAME(createDynamic(config:)) LATTICE_SLREF_UNRETAINED {
-        swift_configuration cfg = config;
-        cfg.read_only = true;
-        auto impl = std::make_shared<swift_lattice>(std::move(cfg));
-        // Register so managed objects hydrated from queries can resolve their
-        // owning lattice (managed::lattice_shared -> shared_for_lattice ->
-        // get_by_pointer). Bare make_shared bypasses get_or_create's cache.
-        detail::LatticeCache::instance().register_pointer(impl);
-        impl->open_dynamic();
-        return _make(impl);
+        return _make(create_dynamic_shared(config));
     }
+
+    /// Checked dynamic construction. Preserves the independent read-only
+    /// connection and schema reconstruction of create_dynamic(), but reports
+    /// native open failures instead of crossing Swift's exception boundary.
+    /// The returned ref is invalid when err is populated.
+    static LATTICE_SLREF_RET create_dynamic(const swift_configuration& config,
+                                            cxx_error& err)
+        SWIFT_NAME(createDynamic(config:error:)) LATTICE_SLREF_UNRETAINED;
 
     /// Factory method with Swift migration block.
     /// The migration block is called when schema changes are detected.
@@ -3653,7 +3704,7 @@ public:
     // value path returns an empty ref instead of nullptr).
     bool valid() const SWIFT_NAME(isValid()) { return impl_ != nullptr; }
 
-    // const so it's callable on a `let` value-type ref below the FRT floor.
+    // const so it's callable on a `let` value-type ref on the iOS path.
     int64_t hash_value() const {
         return reinterpret_cast<intptr_t>(impl_.get());
     }
@@ -3674,8 +3725,8 @@ private:
 
 public:
     // ---- Thin const forwarders to the underlying swift_lattice, so the db ops
-    //      are callable on this handle on both paths: on iOS 16.4+ it is a
-    //      foreign-reference class; below the floor it is a copyable value type
+    //      are callable on this handle on both paths: macOS/Linux use a
+    //      foreign-reference class; iOS uses a copyable value type
     //      whose inner shared_ptr aliases the same db. `const` is load-bearing:
     //      const member functions import into Swift as non-mutating, so the
     //      Swift side can hold the handle in a `let` (shallow const — calling
@@ -3731,6 +3782,10 @@ public:
 
     audit_read_fence read_audit_read_fence() const SWIFT_NAME(auditReadFence()) {
         return impl().read_audit_read_fence();
+    }
+
+    int32_t stored_schema_version() const SWIFT_NAME(storedSchemaVersion()) {
+        return impl().stored_schema_version();
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema
@@ -3863,10 +3918,58 @@ public:
     void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
 
+    // WSS lifecycle; sealed so startup failures cannot escape across Swift/C++.
+    void connect_sync() const { sealed([&] { impl().connect_sync(); }); }
+    void disconnect_sync() const { sealed([&] { impl().disconnect_sync(); }); }
+    void reconnect_sync() const { sealed([&] { impl().reconnect_sync(); }); }
+
+    bool is_background_sync_managed() const { return impl().config().background_sync_managed; }
+
+    swift_background_sync_start resume_background_sync(const swift_sync_cancellation& cancellation,
+                                                 bool finite_cycle) const {
+        return sealed([&] {
+            const auto native = impl().resume_background_sync(cancellation.token_, finite_cycle);
+            swift_background_sync_start result;
+            result.generation = native.generation;
+            switch (native.admission) {
+                case lattice_db::background_sync_admission::started: result.admission = swift_background_sync_admission::started; break;
+                case lattice_db::background_sync_admission::already_running: result.admission = swift_background_sync_admission::already_running; break;
+                case lattice_db::background_sync_admission::not_owner: result.admission = swift_background_sync_admission::not_owner; break;
+                case lattice_db::background_sync_admission::cancelled: result.admission = swift_background_sync_admission::cancelled; break;
+                case lattice_db::background_sync_admission::closed: result.admission = swift_background_sync_admission::closed; break;
+                case lattice_db::background_sync_admission::unsupported: break;
+            }
+            return result;
+        });
+    }
+    uint64_t current_background_sync_generation() const {
+        return sealed([&] { return impl().current_background_sync_generation(); });
+    }
+    swift_background_sync_status get_background_sync_status(uint64_t generation) const {
+        return sealed([&] {
+            const auto native = impl().get_background_sync_status(generation);
+            swift_background_sync_status result;
+            switch (native.phase) {
+                case synchronizer_base::finite_cycle_phase::inactive: break;
+                case synchronizer_base::finite_cycle_phase::running: result.phase = swift_finite_sync_phase::running; break;
+                case synchronizer_base::finite_cycle_phase::work_complete: result.phase = swift_finite_sync_phase::work_complete; break;
+                case synchronizer_base::finite_cycle_phase::failed: result.phase = swift_finite_sync_phase::failed; break;
+                case synchronizer_base::finite_cycle_phase::cancelled: result.phase = swift_finite_sync_phase::cancelled; break;
+            }
+            return result;
+        });
+    }
+    bool cancel_background_sync(uint64_t generation) const {
+        return sealed([&] { return impl().cancel_background_sync(generation); });
+    }
+    bool suspend_background_sync(uint64_t generation) const {
+        return sealed([&] { return impl().suspend_background_sync(generation); });
+    }
+
     // Sync status
     bool is_sync_agent() const { return impl().is_sync_agent(); }
     bool is_sync_connected() const { return impl().is_sync_connected(); }
-    void clear_sync_filter() const { impl().clear_sync_filter(); }
+    void clear_sync_filter() const { sealed([&] { impl().clear_sync_filter(); }); }
 
     // Spatial (R*Tree)
     std::vector<managed<swift_dynamic_object>> objects_within_bbox(
@@ -3953,15 +4056,15 @@ public:
     }
 
     // Sync filter
-    void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
+    void update_sync_filter(const SyncFilterVector& filter) const { sealed([&] { impl().update_sync_filter(filter); }); }
     void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const {
-        impl().update_sync_filter_for_channel(channel, filter);
+        sealed([&] { impl().update_sync_filter_for_channel(channel, filter); });
     }
     void clear_sync_filter_for_channel(const std::string& channel) const {
-        impl().clear_sync_filter_for_channel(channel);
+        sealed([&] { impl().clear_sync_filter_for_channel(channel); });
     }
     void remove_sync_channel_state(const std::string& sync_id) const {
-        impl().remove_sync_channel_state(sync_id);
+        sealed([&] { impl().remove_sync_channel_state(sync_id); });
     }
     /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
     /// see lattice_db::delete_rows_no_relay for why a normal delete is
@@ -4147,6 +4250,17 @@ public:
 
 private:
     swift_lattice_ref() = default;
+
+    static std::shared_ptr<swift_lattice> create_dynamic_shared(const swift_configuration& config) {
+        swift_configuration cfg = config;
+        cfg.read_only = true;
+        auto impl = std::make_shared<swift_lattice>(std::move(cfg));
+        // Register so managed objects hydrated from queries can resolve their
+        // owning lattice. Bare make_shared deliberately bypasses the keyed cache.
+        detail::LatticeCache::instance().register_pointer(impl);
+        impl->open_dynamic();
+        return impl;
+    }
 
     std::shared_ptr<swift_lattice> impl_;
 #if LATTICE_HAS_FRT

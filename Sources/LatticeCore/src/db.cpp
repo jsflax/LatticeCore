@@ -6,8 +6,124 @@
 #include <thread>
 #include <chrono>
 #include <exception>
+#include <memory>
 
 namespace lattice {
+
+namespace {
+template<typename Cancelled>
+int cancellable_busy_wait(int previous_calls, int budget_ms,
+        std::chrono::steady_clock::time_point& deadline, Cancelled&& cancelled) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (previous_calls == 0) deadline = now + std::chrono::milliseconds(budget_ms);
+    if (cancelled() || now >= deadline) return 0;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (remaining < 1) return 0;
+    // Short slices make cancellation observable while retaining the configured
+    // complete wait budget for operations that are allowed to continue.
+    sqlite3_sleep(static_cast<int>(remaining < 5 ? remaining : 5));
+    return !cancelled() && std::chrono::steady_clock::now() < deadline;
+}
+}
+
+struct database::bound_cancellation {
+    std::shared_ptr<const std::atomic<bool>> token;
+    int wait_budget_ms = 0;
+    std::chrono::steady_clock::time_point wait_deadline{};
+    static int busy(void* context, int previous_calls) noexcept {
+        auto& binding = *static_cast<bound_cancellation*>(context);
+        return cancellable_busy_wait(previous_calls, binding.wait_budget_ms,
+            binding.wait_deadline, [&] { return binding.token->load(std::memory_order_acquire); });
+    }
+};
+
+void database::bind_cancellation_token(std::shared_ptr<const std::atomic<bool>> cancelled) {
+    if (!cancelled) throw db_error("cancellation binding requires a token");
+    if (cancellable_operation::current_)
+        throw db_error("cannot bind cancellation inside a cancellable operation");
+    auto binding = std::make_unique<bound_cancellation>();
+    binding->token = std::move(cancelled);
+    auto* mutex = db_ ? sqlite3_db_mutex(db_) : nullptr;
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("cancellation binding requires a serialized connection");
+#endif
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK)
+        throw db_error("cancellation binding connection is busy");
+    struct unlock { sqlite3_mutex* mutex; ~unlock() { sqlite3_mutex_leave(mutex); } } lock{mutex};
+    if (!maintenance_scope::idle(*this))
+        throw db_error("cancellation binding requires an idle connection");
+    if (bound_cancellation_) throw db_error("connection cancellation is already bound");
+    if (binding->token->load(std::memory_order_acquire))
+        throw db_error("database operation cancelled");
+    bound_cancellation_ = std::move(binding);
+    configure_busy_timeout(busy_timeout_ms_);
+}
+
+database::cancellable_operation::cancellable_operation(
+        database& owner, const std::atomic<bool>& cancelled)
+    : owner_(owner), mutex_(owner.db_ ? sqlite3_db_mutex(owner.db_) : nullptr),
+      cancelled_(cancelled) {
+    if (current_) throw db_error("cancellable database operations cannot nest");
+#ifndef __EMSCRIPTEN__
+    if (!mutex_) throw db_error("cancellable operation requires a serialized connection");
+#endif
+    if (sqlite3_mutex_try(mutex_) != SQLITE_OK)
+        throw db_error("cancellable operation connection is busy");
+    if (!maintenance_scope::idle(owner_)) {
+        sqlite3_mutex_leave(mutex_);
+        throw db_error("cancellable operation requires an idle connection");
+    }
+    if (cancelled_.load(std::memory_order_acquire) || owner_.operation_cancelled()) {
+        sqlite3_mutex_leave(mutex_);
+        throw db_error("database operation cancelled");
+    }
+    current_ = this;
+    set_wait_budget(owner_.busy_timeout_ms_);
+}
+
+database::cancellable_operation::~cancellable_operation() noexcept {
+    // Moving this scope to another thread would unlock a mutex it does not own.
+    if (current_ != this) std::terminate();
+    current_ = nullptr;
+    owner_.configure_busy_timeout(owner_.busy_timeout_ms_);
+    sqlite3_mutex_leave(mutex_);
+}
+
+void database::cancellable_operation::set_wait_budget(int timeout_ms) noexcept {
+    wait_budget_ms_ = timeout_ms > 0 ? timeout_ms : 0;
+    sqlite3_busy_handler(owner_.db_, &cancellable_operation::busy, this);
+}
+
+int database::cancellable_operation::busy(void* context, int previous_calls) noexcept {
+    auto& scope = *static_cast<cancellable_operation*>(context);
+    return cancellable_busy_wait(previous_calls, scope.wait_budget_ms_,
+        scope.wait_deadline_, [&] { return scope.owner_.operation_cancelled(); });
+}
+
+void database::configure_busy_timeout(int timeout_ms) noexcept {
+    auto* operation = cancellable_operation::current_;
+    if (operation && &operation->owner_ == this) {
+        operation->set_wait_budget(timeout_ms);
+    } else if (bound_cancellation_) {
+        // SQLite invokes the busy callback while holding this connection's
+        // recursive mutex. Protect its context update as well as installation;
+        // sqlite3_busy_handler's own lock would otherwise come too late.
+        auto* mutex = sqlite3_db_mutex(db_);
+        sqlite3_mutex_enter(mutex);
+        bound_cancellation_->wait_budget_ms = timeout_ms > 0 ? timeout_ms : 0;
+        sqlite3_busy_handler(db_, &bound_cancellation::busy, bound_cancellation_.get());
+        sqlite3_mutex_leave(mutex);
+    } else {
+        sqlite3_busy_timeout(db_, timeout_ms);
+    }
+}
+
+bool database::operation_cancelled() const noexcept {
+    const auto* operation = cancellable_operation::current_;
+    return (operation && &operation->owner_ == this &&
+            operation->cancelled_.load(std::memory_order_acquire)) ||
+           (bound_cancellation_ && bound_cancellation_->token->load(std::memory_order_acquire));
+}
 
 database::statement_scope::statement_scope(database& db) noexcept
     : owner(db), mutex(sqlite3_db_mutex(db.db_)), previous(current) {
@@ -46,8 +162,9 @@ uint64_t database::thread_statement_count() {
 }
 
 
-database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
-    : database(path, mode, busy_timeout_ms, initialization_key(false)) {}
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
+                   std::shared_ptr<const std::atomic<bool>> cancellation)
+    : database(path, mode, busy_timeout_ms, initialization_key(false), std::move(cancellation)) {}
 
 std::shared_ptr<database> database::make_read_keeper(const std::string& path,
                                                    int busy_timeout_ms) {
@@ -56,8 +173,11 @@ std::shared_ptr<database> database::make_read_keeper(const std::string& path,
 }
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   initialization_key key)
+                   initialization_key key,
+                   std::shared_ptr<const std::atomic<bool>> cancellation)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
+    if (cancellation && cancellation->load(std::memory_order_acquire))
+        throw db_error("database operation cancelled");
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
     int rc;
@@ -82,9 +202,11 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         flags |= SQLITE_OPEN_URI;  // see read-only branch note
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
+    // A throwing constructor never reaches ~database(). Keep ownership local
+    // through every initialization statement, including failing PRAGMAs.
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> opening(db_, sqlite3_close_v2);
     if (rc != SQLITE_OK) {
         std::string error = sqlite3_errmsg(db_);
-        sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to open database: %s", error.c_str());
         throw db_error("Failed to open database: " + error);
@@ -97,7 +219,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     // "database is locked" instantly instead of waiting. Instances now
     // genuinely close and reopen (weak instance cache), so open-time races
     // are common rather than exceptional.
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);
+    if (cancellation) bind_cancellation_token(std::move(cancellation));
+    else configure_busy_timeout(busy_timeout_ms_);
 
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
@@ -114,7 +237,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
 #else
     // Native mode: Enable WAL mode for better concurrency (only on read-write connection)
     if (mode == open_mode::read_write) {
-        execute("PRAGMA journal_mode = WAL");
+        enable_wal_mode();
     }
 
     // Performance optimizations (matching Lattice.swift)
@@ -158,11 +281,54 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     // Initialize sqlite-vec extension for vector search
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
     if (vec_rc != SQLITE_OK) {
-        sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
     }
+    opening.release();  // Fully initialized: ~database() now owns the connection.
+}
+
+void database::enable_wal_mode() {
+    // Two fresh opens can both read the rollback-journal header before either
+    // upgrades to WAL. SQLite may return BUSY without invoking its busy handler
+    // to avoid a read-to-write lock deadlock. Retry only this idempotent bootstrap
+    // PRAGMA, releasing each failed statement/read lock before waiting again.
+    // One deadline includes time already spent inside SQLite's busy handler.
+    const auto budget = std::chrono::milliseconds(busy_timeout_ms_ > 0 ? busy_timeout_ms_ : 0);
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    constexpr const char* sql = "PRAGMA journal_mode = WAL";
+    try {
+        for (;;) {
+            if (operation_cancelled()) throw db_error("database operation cancelled");
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            configure_busy_timeout(remaining > 0 ? static_cast<int>(remaining) : 0);
+            char* raw_error = nullptr;
+            g_statement_count.fetch_add(1, std::memory_order_relaxed);
+            ++t_statement_count;
+            const int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &raw_error);
+            std::unique_ptr<char, decltype(&sqlite3_free)> error_owner(raw_error, sqlite3_free);
+            const std::string error = raw_error ? raw_error : sqlite3_errmsg(db_);
+            error_owner.reset();
+            // sqlite3_exec has finalized its statement on both success/failure.
+            // A cancelled constructor must not publish a connection even if the
+            // journal transition happened just before cancellation arrived.
+            if (operation_cancelled()) throw db_error("database operation cancelled");
+            if (rc == SQLITE_OK) break;
+            if ((rc & 0xff) != SQLITE_BUSY || std::chrono::steady_clock::now() >= deadline)
+                throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
+            sqlite3_sleep(1);
+            // Zero/expired budgets never get another attempt. Preserve the
+            // failed SQL's error rather than replacing it with a timeout label.
+            if (operation_cancelled()) throw db_error("database operation cancelled");
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
+        }
+    } catch (...) {
+        configure_busy_timeout(busy_timeout_ms_);
+        throw;
+    }
+    configure_busy_timeout(busy_timeout_ms_);
 }
 
 database::~database() {
@@ -186,6 +352,9 @@ database::~database() {
             int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
             LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
         }
+        // A raw outstanding statement can defer sqlite3_close_v2's final
+        // cleanup. It must not retain our soon-to-die callback context.
+        sqlite3_busy_handler(db_, nullptr, nullptr);
         int rc = sqlite3_close_v2(db_);
         if (rc != SQLITE_OK) {
             LOG_ERROR("db", "~database close failed: rc=%d (%s), path=%s", rc, sqlite3_errmsg(db_), path_.c_str());
@@ -241,6 +410,8 @@ void database::drain_if_settled() {
     sqlite3_mutex_enter(mutex);
     seal_if_settled_locked();
     const bool eligible = !statement_scope::active_for(db_) &&
+                          !(cancellable_operation::current_ &&
+                            &cancellable_operation::current_->owner_ == this) &&
         !update_hook_scope::active_for(db_) && !maintenance_scope::active_for(db_) &&
         sqlite3_get_autocommit(db_) != 0 && sqlite3_txn_state(db_, nullptr) != SQLITE_TXN_WRITE;
     const bool deliver = eligible && on_txn_settled_ &&
@@ -257,17 +428,28 @@ void database::discard_if_rolled_back() {
 }
 
 database::database(database&& other) noexcept
-    : db_(other.db_), path_(std::move(other.path_)) {
+    : db_(other.db_), path_(std::move(other.path_)), mode_(other.mode_),
+      busy_timeout_ms_(other.busy_timeout_ms_),
+      bound_cancellation_(std::move(other.bound_cancellation_)) {
+    if (cancellable_operation::current_ &&
+        &cancellable_operation::current_->owner_ == &other) std::terminate();
     other.db_ = nullptr;
 }
 
 database& database::operator=(database&& other) noexcept {
     if (this != &other) {
+        if (cancellable_operation::current_ &&
+            (&cancellable_operation::current_->owner_ == this ||
+             &cancellable_operation::current_->owner_ == &other)) std::terminate();
         if (db_) {
+            sqlite3_busy_handler(db_, nullptr, nullptr);
             sqlite3_close_v2(db_);
         }
         db_ = other.db_;
         path_ = std::move(other.path_);
+        mode_ = other.mode_;
+        busy_timeout_ms_ = other.busy_timeout_ms_;
+        bound_cancellation_ = std::move(other.bound_cancellation_);
         other.db_ = nullptr;
     }
     return *this;
@@ -713,7 +895,7 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
     // checkpoint(). Bound the wait: TRUNCATE holds the writer lock while
     // waiting out readers, so a held snapshot must fail fast (retry next
     // cycle) rather than stall every writer behind it.
-    sqlite3_busy_timeout(db_, truncate ? busy_budget_ms : 0);
+    configure_busy_timeout(truncate ? busy_budget_ms : 0);
     try {
         auto rows = query(truncate ? "PRAGMA wal_checkpoint(TRUNCATE)"
                                    : "PRAGMA wal_checkpoint(PASSIVE)");
@@ -735,7 +917,7 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
         LOG_DEBUG("db", "wal_checkpoint(%s) failed: %s, path=%s",
                   truncate ? "TRUNCATE" : "PASSIVE", e.what(), path_.c_str());
     }
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // restore statement-level timeout
+    configure_busy_timeout(busy_timeout_ms_);  // restore statement-level timeout
     return result;
 #endif
 }
@@ -791,6 +973,7 @@ database::maintenance_scope::~maintenance_scope() noexcept {
 
 void database::begin_transaction(bool exclusive) {
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
+    if (operation_cancelled()) throw db_error("database operation cancelled");
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
     // EXCLUSIVE: acquires write lock AND blocks all readers.
     // Use exclusive for migrations so stale connections can't read mid-migration.
@@ -817,10 +1000,13 @@ void database::begin_transaction(bool exclusive) {
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining < 1) remaining = 1;
-        sqlite3_busy_timeout(db_, static_cast<int>(remaining));
+        configure_busy_timeout(static_cast<int>(remaining));
 
         rc = sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
         if (rc == SQLITE_OK) break;
+        // A cancelled busy handler returns SQLITE_BUSY. Do not interpret that
+        // as permission to reinstall another wait and retry until the deadline.
+        if (operation_cancelled()) break;
 
         const bool past_deadline = std::chrono::steady_clock::now() >= deadline;
         if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
@@ -840,9 +1026,10 @@ void database::begin_transaction(bool exclusive) {
         break;  // non-retryable error
     }
 
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // Restore statement-level timeout
+    configure_busy_timeout(busy_timeout_ms_);  // Restore statement-level timeout
 
     if (rc != SQLITE_OK) {
+        if (operation_cancelled()) throw db_error("database operation cancelled");
         auto error = std::string(sqlite3_errmsg(db_));
         int ext = sqlite3_extended_errcode(db_);
         LOG_ERROR("db", "Failed to begin transaction (rc=%d, ext=%d, db=%p, path=%s): %s",
@@ -853,11 +1040,12 @@ void database::begin_transaction(bool exclusive) {
 
 bool database::try_begin_immediate(int /*timeout_ms*/) {
     if (closed_.load(std::memory_order_acquire)) return false;
+    if (operation_cancelled()) return false;
     // Non-blocking: temporarily set busy timeout to 0, try BEGIN IMMEDIATE once,
     // then restore the original timeout. This never sleeps.
-    sqlite3_busy_timeout(db_, 0);
+    configure_busy_timeout(0);
     int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // Restore configured timeout
+    configure_busy_timeout(busy_timeout_ms_);  // Restore configured timeout
     return rc == SQLITE_OK;
 }
 

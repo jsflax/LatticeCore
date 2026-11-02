@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdlib>
+#include <utility>
 
 extern "C" void lattice_set_log_level(int level) {
     lattice::set_log_level(static_cast<lattice::log_level>(level));
@@ -30,10 +31,50 @@ static void set_error(const std::string& msg) {
 // Opaque Type Definitions (internal)
 // =============================================================================
 
-// The C API types are just typedefs to void, but internally we cast to these
-using lattice_db_internal = lattice::swift_lattice_ref;
-using lattice_object_internal = lattice::dynamic_object_ref;
-using lattice_link_list_internal = lattice::link_list_ref;
+// The C ABI owns opaque heap handles on every platform. Its bridge dependency
+// chooses one ABI for the whole product: FRT on macOS/Linux, shared_ptr-backed
+// values on iOS. Never force a different layout in this translation unit.
+// FRT handles already provide the required retain/release counter; value
+// handles need a private C-ABI counter around their ordinary C++ lifetime.
+#if LATTICE_HAS_FRT
+template <class Ref> using capi_owned_ref = Ref;
+
+template <class Ref> Ref& bridge_ref(Ref* ref) { return *ref; }
+
+template <class Ref> Ref* adopt_capi_ref(Ref* ref) {
+    if (ref) ref->retain();
+    return ref;
+}
+
+template <class Ref, class... Args>
+Ref* make_capi_ref(Args&&... args) {
+    return adopt_capi_ref(new Ref(std::forward<Args>(args)...));
+}
+#else
+template <class Ref> struct capi_owned_ref {
+    explicit capi_owned_ref(Ref ref) : value(std::move(ref)) {}
+    Ref value;
+    std::atomic<int> ref_count{1};
+    void retain() { ref_count.fetch_add(1, std::memory_order_relaxed); }
+    bool release() { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
+};
+
+template <class Ref> Ref& bridge_ref(capi_owned_ref<Ref>* ref) { return ref->value; }
+
+template <class Ref> capi_owned_ref<Ref>* adopt_capi_ref(Ref ref) {
+    if (!ref.get()) return nullptr;
+    return new capi_owned_ref<Ref>(std::move(ref));
+}
+
+template <class Ref, class... Args>
+capi_owned_ref<Ref>* make_capi_ref(Args&&... args) {
+    return adopt_capi_ref(Ref(std::forward<Args>(args)...));
+}
+#endif
+
+using lattice_db_internal = capi_owned_ref<lattice::swift_lattice_ref>;
+using lattice_object_internal = capi_owned_ref<lattice::dynamic_object_ref>;
+using lattice_link_list_internal = capi_owned_ref<lattice::link_list_ref>;
 
 // Results wrapper - holds vector of managed objects
 struct lattice_results_internal {
@@ -106,8 +147,7 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
 
 extern "C" lattice_db_t* lattice_db_create_in_memory(void) {
     try {
-        auto* ref = lattice::swift_lattice_ref::create_in_memory();
-        ref->retain();  // Start with ref_count = 1
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create_in_memory());
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -121,8 +161,7 @@ extern "C" lattice_db_t* lattice_db_create_at_path(const char* path) {
         return nullptr;
     }
     try {
-        auto* ref = lattice::swift_lattice_ref::create_with_path(std::string(path));
-        ref->retain();  // Start with ref_count = 1
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create_with_path(std::string(path)));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -148,7 +187,7 @@ extern "C" bool lattice_db_is_sync_connected(lattice_db_t* db) {
     if (!db) return false;
     auto* ref = reinterpret_cast<lattice_db_internal*>(db);
     try {
-        return ref->get()->is_sync_connected();
+        return bridge_ref(ref).get()->is_sync_connected();
     } catch (...) {
         return false;
     }
@@ -163,10 +202,10 @@ extern "C" void lattice_db_close(lattice_db_t* db) {
     // Tear down C sync observers first so their destroy callbacks fire and
     // no callback lands mid-close (documented in lattice.h).
     try {
-        capi_teardown_sync_observers(ref->get());
+        capi_teardown_sync_observers(bridge_ref(ref).get());
     } catch (...) {}
     try {
-        ref->get()->close();
+        bridge_ref(ref).get()->close();
     } catch (...) {}
 }
 
@@ -246,8 +285,7 @@ extern "C" lattice_db_t* lattice_db_create_with_schemas(
         auto schema_vec = convert_schemas(schemas, schema_count);
 
         lattice::configuration config(db_path);
-        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
-        ref->retain();  // Start with ref_count = 1
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -336,8 +374,7 @@ extern "C" lattice_db_t* lattice_db_create_with_scheduler(
             config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
         }
 
-        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -368,8 +405,7 @@ extern "C" lattice_db_t* lattice_db_create_with_sync(
             config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
         }
 
-        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -387,8 +423,7 @@ extern "C" lattice_object_t* lattice_object_create(const char* table_name) {
         return nullptr;
     }
     try {
-        auto* ref = lattice::dynamic_object_ref::create(std::string(table_name));
-        ref->retain();  // Start with ref_count = 1
+        auto* ref = adopt_capi_ref(lattice::dynamic_object_ref::create(std::string(table_name)));
         return reinterpret_cast<lattice_object_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -427,8 +462,7 @@ extern "C" lattice_object_t* lattice_object_create_with_schema(
 
         // Wrap in dynamic_object and then dynamic_object_ref
         auto dyn_obj = std::make_shared<lattice::dynamic_object>(swift_obj);
-        auto* ref = lattice::dynamic_object_ref::wrap(dyn_obj);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::dynamic_object_ref::wrap(dyn_obj));
         return reinterpret_cast<lattice_object_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -446,7 +480,7 @@ extern "C" lattice_object_t* lattice_db_create_object(lattice_db_t* db, const ch
         std::string table_str(table_name);
 
         // Get schema from registered schemas (like Swift does)
-        const auto* props = db_ref->get()->get_properties_for_table(table_str);
+        const auto* props = bridge_ref(db_ref).get()->get_properties_for_table(table_str);
         if (!props) {
             set_error("No schema registered for table");
             return nullptr;
@@ -457,8 +491,7 @@ extern "C" lattice_object_t* lattice_db_create_object(lattice_db_t* db, const ch
 
         // Wrap in dynamic_object and then dynamic_object_ref
         auto dyn_obj = std::make_shared<lattice::dynamic_object>(swift_obj);
-        auto* ref = lattice::dynamic_object_ref::wrap(dyn_obj);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::dynamic_object_ref::wrap(dyn_obj));
         return reinterpret_cast<lattice_object_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -488,7 +521,7 @@ extern "C" int64_t lattice_object_get_int(lattice_object_t* obj, const char* fie
     if (!obj || !field) return 0;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        return ref->get_int(field);
+        return bridge_ref(ref).get_int(field);
     } catch (...) {
         return 0;
     }
@@ -498,7 +531,7 @@ extern "C" double lattice_object_get_double(lattice_object_t* obj, const char* f
     if (!obj || !field) return 0.0;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        return ref->get_double(field);
+        return bridge_ref(ref).get_double(field);
     } catch (...) {
         return 0.0;
     }
@@ -511,7 +544,7 @@ extern "C" const char* lattice_object_get_string(lattice_object_t* obj, const ch
     if (!obj || !field) return nullptr;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        g_returned_string = ref->get_string(field);
+        g_returned_string = bridge_ref(ref).get_string(field);
         return g_returned_string.c_str();
     } catch (...) {
         return nullptr;
@@ -523,7 +556,7 @@ extern "C" size_t lattice_object_get_blob(lattice_object_t* obj, const char* fie
     if (!obj || !field) return 0;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        auto data = ref->get_data(field);
+        auto data = bridge_ref(ref).get_data(field);
         if (buffer && buffer_size > 0) {
             size_t copy_size = std::min(buffer_size, data.size());
             std::memcpy(buffer, data.data(), copy_size);
@@ -538,7 +571,7 @@ extern "C" bool lattice_object_has_value(lattice_object_t* obj, const char* fiel
     if (!obj || !field) return false;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        return ref->has_value(field);
+        return bridge_ref(ref).has_value(field);
     } catch (...) {
         return false;
     }
@@ -552,7 +585,7 @@ extern "C" void lattice_object_set_int(lattice_object_t* obj, const char* field,
     if (!obj || !field) return;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        ref->set_int(field, value);
+        bridge_ref(ref).set_int(field, value);
     } catch (...) {}
 }
 
@@ -560,7 +593,7 @@ extern "C" void lattice_object_set_double(lattice_object_t* obj, const char* fie
     if (!obj || !field) return;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        ref->set_double(field, value);
+        bridge_ref(ref).set_double(field, value);
     } catch (...) {}
 }
 
@@ -568,7 +601,7 @@ extern "C" void lattice_object_set_string(lattice_object_t* obj, const char* fie
     if (!obj || !field) return;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        ref->set_string(field, value ? std::string(value) : std::string());
+        bridge_ref(ref).set_string(field, value ? std::string(value) : std::string());
     } catch (...) {}
 }
 
@@ -578,7 +611,7 @@ extern "C" void lattice_object_set_blob(lattice_object_t* obj, const char* field
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
         std::vector<uint8_t> vec(data, data + size);
-        ref->set_data(field, vec);
+        bridge_ref(ref).set_data(field, vec);
     } catch (...) {}
 }
 
@@ -586,7 +619,7 @@ extern "C" void lattice_object_set_null(lattice_object_t* obj, const char* field
     if (!obj || !field) return;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        ref->set_nil(field);
+        bridge_ref(ref).set_nil(field);
     } catch (...) {}
 }
 
@@ -598,8 +631,8 @@ extern "C" int64_t lattice_object_get_id(lattice_object_t* obj) {
     if (!obj) return 0;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        if (!ref->has_value("id")) return 0;
-        return ref->get_int("id");
+        if (!bridge_ref(ref).has_value("id")) return 0;
+        return bridge_ref(ref).get_int("id");
     } catch (...) {
         return 0;
     }
@@ -609,8 +642,8 @@ extern "C" const char* lattice_object_get_global_id(lattice_object_t* obj) {
     if (!obj) return nullptr;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        if (!ref->has_value("globalId")) return nullptr;
-        g_returned_string = ref->get_string("globalId");
+        if (!bridge_ref(ref).has_value("globalId")) return nullptr;
+        g_returned_string = bridge_ref(ref).get_string("globalId");
         return g_returned_string.empty() ? nullptr : g_returned_string.c_str();
     } catch (...) {
         return nullptr;
@@ -621,7 +654,7 @@ extern "C" const char* lattice_object_get_table_name(lattice_object_t* obj) {
     if (!obj) return nullptr;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        g_returned_string = ref->get()->get_table_name();
+        g_returned_string = bridge_ref(ref).get()->get_table_name();
         return g_returned_string.c_str();
     } catch (...) {
         return nullptr;
@@ -642,7 +675,7 @@ extern "C" lattice_object_t* lattice_db_add(lattice_db_t* db, lattice_object_t* 
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
 
         // Add the object to the database
-        db_ref->get()->add(*obj_ref->get());
+        bridge_ref(db_ref).get()->add(*bridge_ref(obj_ref).get());
 
         // Object is now managed - return the same reference
         obj_ref->retain();
@@ -660,15 +693,14 @@ extern "C" lattice_object_t* lattice_db_find(lattice_db_t* db, const char* table
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto result = db_ref->get()->object(id, std::string(table_name));
+        auto result = bridge_ref(db_ref).get()->object(id, std::string(table_name));
 
         if (!result) {
             return nullptr;
         }
 
         // Wrap in dynamic_object_ref
-        auto* ref = new lattice::dynamic_object_ref(*result);
-        ref->retain();
+        auto* ref = make_capi_ref<lattice::dynamic_object_ref>(*result);
         return reinterpret_cast<lattice_object_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -684,14 +716,13 @@ extern "C" lattice_object_t* lattice_db_find_by_global_id(lattice_db_t* db, cons
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto result = db_ref->get()->object_by_global_id(std::string(global_id), std::string(table_name));
+        auto result = bridge_ref(db_ref).get()->object_by_global_id(std::string(global_id), std::string(table_name));
 
         if (!result) {
             return nullptr;
         }
 
-        auto* ref = new lattice::dynamic_object_ref(*result);
-        ref->retain();
+        auto* ref = make_capi_ref<lattice::dynamic_object_ref>(*result);
         return reinterpret_cast<lattice_object_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -708,7 +739,7 @@ extern "C" lattice_status_t lattice_db_remove(lattice_db_t* db, lattice_object_t
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
 
-        bool success = db_ref->get()->remove(*obj_ref);
+        bool success = bridge_ref(db_ref).get()->remove(bridge_ref(obj_ref));
         return success ? LATTICE_OK : LATTICE_ERROR_NOT_FOUND;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -753,7 +784,7 @@ extern "C" lattice_results_t* lattice_db_query(
             offset_opt = offset;
         }
 
-        auto results = db_ref->get()->objects(table_name, where_opt, order_opt, limit_opt, offset_opt);
+        auto results = bridge_ref(db_ref).get()->objects(table_name, where_opt, order_opt, limit_opt, offset_opt);
 
         auto* wrapper = new lattice_results_internal();
         wrapper->objects = std::move(results);
@@ -773,7 +804,7 @@ extern "C" size_t lattice_db_count(
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto where_opt = where_clause ? std::optional<std::string>(where_clause) : std::nullopt;
-        return db_ref->get()->count(table_name, where_opt);
+        return bridge_ref(db_ref).get()->count(table_name, where_opt);
     } catch (...) {
         return 0;
     }
@@ -790,8 +821,8 @@ extern "C" size_t lattice_db_delete_where(
         auto where_opt = where_clause ? std::optional<std::string>(where_clause) : std::nullopt;
 
         // Get count before delete
-        size_t count = db_ref->get()->count(table_name, where_opt);
-        db_ref->get()->delete_where(table_name, where_opt);
+        size_t count = bridge_ref(db_ref).get()->count(table_name, where_opt);
+        bridge_ref(db_ref).get()->delete_where(table_name, where_opt);
         return count;
     } catch (...) {
         return 0;
@@ -814,8 +845,7 @@ extern "C" lattice_object_t* lattice_results_get(lattice_results_t* results, siz
     if (index >= wrapper->objects.size()) return nullptr;
 
     try {
-        auto* ref = new lattice::dynamic_object_ref(wrapper->objects[index]);
-        ref->retain();
+        auto* ref = make_capi_ref<lattice::dynamic_object_ref>(wrapper->objects[index]);
         return reinterpret_cast<lattice_object_t*>(ref);
     } catch (...) {
         return nullptr;
@@ -836,7 +866,7 @@ extern "C" lattice_status_t lattice_db_begin_transaction(lattice_db_t* db) {
     if (!db) return LATTICE_ERROR_NULL_POINTER;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->begin_transaction();
+        bridge_ref(db_ref).get()->begin_transaction();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -848,7 +878,7 @@ extern "C" lattice_status_t lattice_db_commit(lattice_db_t* db) {
     if (!db) return LATTICE_ERROR_NULL_POINTER;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->commit();
+        bridge_ref(db_ref).get()->commit();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -860,7 +890,7 @@ extern "C" lattice_status_t lattice_db_rollback(lattice_db_t* db) {
     if (!db) return LATTICE_ERROR_NULL_POINTER;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->db().execute("ROLLBACK");
+        bridge_ref(db_ref).get()->db().execute("ROLLBACK");
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -884,7 +914,7 @@ extern "C" uint64_t lattice_db_observe_table(
         // Use lattice_db::add_table_observer directly (bypass swift_lattice overloads)
         auto cb = callback;
         auto ctx = context;
-        return static_cast<lattice::lattice_db*>(db_ref->get())->add_table_observer(
+        return static_cast<lattice::lattice_db*>(bridge_ref(db_ref).get())->add_table_observer(
             std::string(table_name),
             [cb, ctx](const std::vector<lattice::lattice_db::change_event>& events) {
                 for (const auto& ev : events) {
@@ -914,7 +944,7 @@ extern "C" uint64_t lattice_db_observe_object(
             lattice_object_observer_fn user_callback;
         };
         auto* obs_ctx = new obj_observer_ctx{context, callback};
-        return db_ref->get()->add_object_observer(std::string(table_name), row_id, obs_ctx,
+        return bridge_ref(db_ref).get()->add_object_observer(std::string(table_name), row_id, obs_ctx,
             [](const char*, void* ctx) {
                 auto* oc = static_cast<obj_observer_ctx*>(ctx);
                 oc->user_callback(oc->user_context);
@@ -931,7 +961,7 @@ extern "C" void lattice_db_remove_table_observer(lattice_db_t* db, const char* t
     if (!db || !table_name) return;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->remove_table_observer(table_name, token);
+        bridge_ref(db_ref).get()->remove_table_observer(table_name, token);
     } catch (...) {}
 }
 
@@ -940,7 +970,7 @@ extern "C" void lattice_db_remove_object_observer(lattice_db_t* db, const char* 
     if (!db || !table_name) return;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->remove_object_observer(table_name, row_id, token);
+        bridge_ref(db_ref).get()->remove_object_observer(table_name, row_id, token);
     } catch (...) {}
 }
 
@@ -954,9 +984,9 @@ extern "C" void lattice_object_set_object(lattice_object_t* obj, const char* fie
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
         if (value) {
             auto* value_ref = reinterpret_cast<lattice_object_internal*>(value);
-            obj_ref->set_object(std::string(field), *value_ref);
+            bridge_ref(obj_ref).set_object(std::string(field), bridge_ref(value_ref));
         } else {
-            obj_ref->set_nil(std::string(field));
+            bridge_ref(obj_ref).set_nil(std::string(field));
         }
     } catch (...) {}
 }
@@ -965,7 +995,7 @@ extern "C" lattice_object_t* lattice_object_get_object(lattice_object_t* obj, co
     if (!obj || !field) return nullptr;
     try {
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
-        auto* linked = obj_ref->get_object(std::string(field));
+        auto* linked = adopt_capi_ref(bridge_ref(obj_ref).get_object(std::string(field)));
         return reinterpret_cast<lattice_object_t*>(linked);
     } catch (...) {
         return nullptr;
@@ -980,10 +1010,7 @@ extern "C" lattice_link_list_t* lattice_object_get_link_list(lattice_object_t* o
     if (!obj || !field) return nullptr;
     try {
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
-        auto* list_ref = obj_ref->get_link_list(std::string(field));
-        if (list_ref) {
-            list_ref->retain();
-        }
+        auto* list_ref = adopt_capi_ref(bridge_ref(obj_ref).get_link_list(std::string(field)));
         return reinterpret_cast<lattice_link_list_t*>(list_ref);
     } catch (...) {
         return nullptr;
@@ -1001,18 +1028,17 @@ extern "C" void lattice_link_list_release(lattice_link_list_t* list) {
 extern "C" size_t lattice_link_list_size(lattice_link_list_t* list) {
     if (!list) return 0;
     auto* list_ref = reinterpret_cast<lattice_link_list_internal*>(list);
-    return list_ref->size();
+    return bridge_ref(list_ref).size();
 }
 
 extern "C" lattice_object_t* lattice_link_list_get(lattice_link_list_t* list, size_t index) {
     if (!list) return nullptr;
     try {
         auto* list_ref = reinterpret_cast<lattice_link_list_internal*>(list);
-        if (index >= list_ref->size()) return nullptr;
+        if (index >= bridge_ref(list_ref).size()) return nullptr;
 
-        auto proxy = (*list_ref)[index];
-        auto* obj_ref = lattice::dynamic_object_ref::wrap(proxy.object);
-        obj_ref->retain();
+        auto proxy = bridge_ref(list_ref)[index];
+        auto* obj_ref = adopt_capi_ref(lattice::dynamic_object_ref::wrap(proxy.object));
         return reinterpret_cast<lattice_object_t*>(obj_ref);
     } catch (...) {
         return nullptr;
@@ -1024,7 +1050,7 @@ extern "C" void lattice_link_list_push_back(lattice_link_list_t* list, lattice_o
     try {
         auto* list_ref = reinterpret_cast<lattice_link_list_internal*>(list);
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
-        list_ref->push_back(*obj_ref);
+        bridge_ref(list_ref).push_back(bridge_ref(obj_ref));
     } catch (...) {}
 }
 
@@ -1032,8 +1058,8 @@ extern "C" void lattice_link_list_erase(lattice_link_list_t* list, size_t index)
     if (!list) return;
     try {
         auto* list_ref = reinterpret_cast<lattice_link_list_internal*>(list);
-        if (index < list_ref->size()) {
-            list_ref->erase(index);
+        if (index < bridge_ref(list_ref).size()) {
+            bridge_ref(list_ref).erase(index);
         }
     } catch (...) {}
 }
@@ -1042,7 +1068,7 @@ extern "C" void lattice_link_list_clear(lattice_link_list_t* list) {
     if (!list) return;
     try {
         auto* list_ref = reinterpret_cast<lattice_link_list_internal*>(list);
-        list_ref->clear();
+        bridge_ref(list_ref).clear();
     } catch (...) {}
 }
 
@@ -1078,9 +1104,9 @@ extern "C" char* lattice_db_receive_sync_data(
         // left already-executed entries unreported when a later entry threw
         // (docs/capi-gap-audit.md B-2).
         std::vector<uint8_t> bytes(data, data + data_size);
-        auto applied_ids = db_ref->get()->receive_sync_data(bytes);
+        auto applied_ids = bridge_ref(db_ref).get()->receive_sync_data(bytes);
 
-        if (auto err = db_ref->get()->last_receive_error()) {
+        if (auto err = bridge_ref(db_ref).get()->last_receive_error()) {
             set_error(*err);
             return nullptr;
         }
@@ -1109,7 +1135,7 @@ extern "C" char* lattice_db_get_pending_audit_log(lattice_db_t* db) {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
 
         // Query unsynchronized audit log entries
-        auto entries = lattice::query_audit_log(db_ref->get()->db(), true, std::nullopt);
+        auto entries = lattice::query_audit_log(bridge_ref(db_ref).get()->db(), true, std::nullopt);
 
         // Convert to JSON array
         nlohmann::json result = nlohmann::json::array();
@@ -1142,7 +1168,7 @@ extern "C" char* lattice_db_events_after(lattice_db_t* db, const char* checkpoin
             checkpoint = std::string(checkpoint_global_id);
         }
 
-        auto entries = lattice::events_after(db_ref->get()->db(), checkpoint);
+        auto entries = lattice::events_after(bridge_ref(db_ref).get()->db(), checkpoint);
 
         // Convert to JSON array
         nlohmann::json result = nlohmann::json::array();
@@ -1245,7 +1271,7 @@ extern "C" void lattice_db_mark_synced(lattice_db_t* db, const char* global_ids_
             global_ids.push_back(id.get<std::string>());
         }
 
-        lattice::mark_audit_entries_synced(*db_ref->get(), global_ids);
+        lattice::mark_audit_entries_synced(*bridge_ref(db_ref).get(), global_ids);
     } catch (...) {}
 }
 
@@ -1253,7 +1279,7 @@ extern "C" int64_t lattice_db_compact_audit_log(lattice_db_t* db) {
     if (!db) return 0;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        return db_ref->get()->compact_audit_log();
+        return bridge_ref(db_ref).get()->compact_audit_log();
     } catch (...) {
         return 0;
     }
@@ -1263,7 +1289,7 @@ extern "C" int64_t lattice_db_generate_history(lattice_db_t* db) {
     if (!db) return 0;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        return db_ref->get()->generate_history();
+        return bridge_ref(db_ref).get()->generate_history();
     } catch (...) {
         return 0;
     }
@@ -1272,7 +1298,7 @@ extern "C" int64_t lattice_db_generate_history(lattice_db_t* db) {
 extern "C" int64_t lattice_db_prune_audit_log(lattice_db_t* db, int64_t retention_seconds) {
     if (!db) { set_error("null argument"); return -1; }
     try {
-        return reinterpret_cast<lattice_db_internal*>(db)->get()->prune_audit_log(retention_seconds);
+        return bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get()->prune_audit_log(retention_seconds);
     } catch (const std::exception& e) {
         set_error(e.what());
         return -1;
@@ -1282,7 +1308,7 @@ extern "C" int64_t lattice_db_prune_audit_log(lattice_db_t* db, int64_t retentio
 extern "C" lattice_status_t lattice_db_record_audit_watermark(lattice_db_t* db) {
     if (!db) { set_error("null argument"); return LATTICE_ERROR_NULL_POINTER; }
     try {
-        reinterpret_cast<lattice_db_internal*>(db)->get()->record_audit_watermark();
+        bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get()->record_audit_watermark();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -1293,7 +1319,7 @@ extern "C" lattice_status_t lattice_db_record_audit_watermark(lattice_db_t* db) 
 extern "C" int64_t lattice_db_reclaim_space(lattice_db_t* db) {
     if (!db) { set_error("null argument"); return -1; }
     try {
-        auto r = reinterpret_cast<lattice_db_internal*>(db)->get()->reclaim_space();
+        auto r = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get()->reclaim_space();
         if (!r.ok) { set_error(r.error.c_str()); return -1; }
         return r.pages_after;
     } catch (const std::exception& e) {
@@ -1305,7 +1331,7 @@ extern "C" int64_t lattice_db_reclaim_space(lattice_db_t* db) {
 extern "C" lattice_status_t lattice_db_set_slot_observer(lattice_db_t* db, const char* sync_id, int32_t is_observer) {
     if (!db || !sync_id) { set_error("null argument"); return LATTICE_ERROR_NULL_POINTER; }
     try {
-        reinterpret_cast<lattice_db_internal*>(db)->get()->set_replication_slot_observer(
+        bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get()->set_replication_slot_observer(
             std::string(sync_id), is_observer != 0);
         return LATTICE_OK;
     } catch (const std::exception& e) {
@@ -1691,7 +1717,7 @@ extern "C" lattice_knn_result_t* lattice_db_query_nearest(
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto* impl = db_ref->get();
+        auto* impl = bridge_ref(db_ref).get();
 
         std::vector<uint8_t> vec(query_vector, query_vector + vector_size);
         auto cpp_metric = static_cast<lattice::lattice_db::distance_metric>(metric);
@@ -1747,7 +1773,7 @@ extern "C" lattice_results_t* lattice_db_query_fts(
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto* impl = db_ref->get();
+        auto* impl = bridge_ref(db_ref).get();
 
         // Build FTS5 WHERE clause using subquery
         std::string fts_table = "_" + std::string(table_name) + "_" + column_name + "_fts";
@@ -1790,7 +1816,7 @@ extern "C" lattice_results_t* lattice_db_query_within_bounds(
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto* impl = db_ref->get();
+        auto* impl = bridge_ref(db_ref).get();
 
         // Build WHERE clause using R*Tree subquery
         std::string rtree_table = "_" + std::string(table_name) + "_" + column_name + "_rtree";
@@ -1832,7 +1858,7 @@ extern "C" lattice_results_t* lattice_db_query_distinct(
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto* impl = db_ref->get();
+        auto* impl = bridge_ref(db_ref).get();
 
         std::optional<std::string> where_opt, order_opt, distinct_opt;
         std::optional<int64_t> limit_opt, offset_opt;
@@ -1868,7 +1894,7 @@ extern "C" size_t lattice_db_count_distinct(
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto* impl = db_ref->get();
+        auto* impl = bridge_ref(db_ref).get();
 
         std::optional<std::string> where_opt, group_opt, distinct_opt;
         if (where_clause) where_opt = where_clause;
@@ -1898,8 +1924,8 @@ extern "C" lattice_status_t lattice_db_attach(lattice_db_t* db, lattice_db_t* ot
         // last_attach_error() instead of throwing — discarding the bool made
         // attach failures return LATTICE_OK with no error set (P0, see
         // docs/capi-gap-audit.md B-1). The catch stays for older/other paths.
-        if (!db_ref->get()->attach(*other_ref->get())) {
-            auto reason = db_ref->get()->last_attach_error();
+        if (!bridge_ref(db_ref).get()->attach(*bridge_ref(other_ref).get())) {
+            auto reason = bridge_ref(db_ref).get()->last_attach_error();
             set_error(reason ? reason->c_str() : "attach failed");
             return LATTICE_ERROR_DATABASE;
         }
@@ -2012,8 +2038,7 @@ extern "C" lattice_db_t* lattice_db_create_with_migration(
             };
         }
 
-        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2038,7 +2063,7 @@ extern "C" lattice_object_t* lattice_db_add_with_global_id(
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
 
-        db_ref->get()->add_preserving_global_id(*obj_ref, std::string(global_id));
+        bridge_ref(db_ref).get()->add_preserving_global_id(bridge_ref(obj_ref), std::string(global_id));
 
         obj_ref->retain();
         return obj;
@@ -2079,8 +2104,7 @@ extern "C" lattice_db_t* lattice_db_create_with_ipc(
             }
         }
 
-        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2125,7 +2149,7 @@ extern "C" lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const c
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto* impl = db_ref->get();
+        auto* impl = bridge_ref(db_ref).get();
         impl->update_sync_filter(parse_sync_filter_json(filter_json));
         return LATTICE_OK;
     } catch (const std::exception& e) {
@@ -2141,7 +2165,7 @@ extern "C" lattice_status_t lattice_db_clear_sync_filter(lattice_db_t* db) {
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->clear_sync_filter();
+        bridge_ref(db_ref).get()->clear_sync_filter();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2185,7 +2209,7 @@ extern "C" uint64_t lattice_db_observe_cross_process(
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto cb = callback;
         auto ctx = context;
-        uint64_t token = static_cast<lattice::lattice_db*>(db_ref->get())->add_table_observer(
+        uint64_t token = static_cast<lattice::lattice_db*>(bridge_ref(db_ref).get())->add_table_observer(
             std::string(table_name),
             [cb, ctx](const std::vector<lattice::lattice_db::change_event>& events) {
                 for (const auto& ev : events) {
@@ -2217,7 +2241,7 @@ extern "C" void lattice_db_remove_cross_process_observer(lattice_db_t* db, uint6
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        db_ref->get()->remove_table_observer(table, token);
+        bridge_ref(db_ref).get()->remove_table_observer(table, token);
     } catch (...) {}
 }
 
@@ -2320,8 +2344,7 @@ extern "C" lattice_db_t* lattice_db_create_with_sync_options(
             config.sync_filter = parse_sync_filter_json(opts.sync_filter_json);
         }
 
-        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
-        ref->retain();
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
         return reinterpret_cast<lattice_db_t*>(ref);
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2346,7 +2369,7 @@ extern "C" lattice_status_t lattice_db_get_sync_progress(lattice_db_t* db,
     }
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        auto p = db_ref->get()->get_sync_progress();
+        auto p = bridge_ref(db_ref).get()->get_sync_progress();
 
         lattice_sync_progress_t full;
         std::memset(&full, 0, sizeof(full));
@@ -2538,7 +2561,7 @@ uint64_t observe_sync_common(lattice_db_t* db, sync_kind k, void* context,
                              void* fn, void (*destroy)(void*)) {
     if (!db || !fn) return 0;
     try {
-        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
         auto reg = sync_registry_for(impl, /*create_if_missing=*/true);
 
         std::lock_guard<std::mutex> install_lock(reg->install_mutex);
@@ -2628,7 +2651,7 @@ extern "C" uint64_t lattice_db_observe_sync_error(
 extern "C" void lattice_db_remove_sync_observer(lattice_db_t* db, uint64_t token) {
     if (!db || token == 0) return;
     try {
-        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
         auto reg = sync_registry_for(impl, /*create_if_missing=*/false);
         if (!reg) return;
 
@@ -2672,8 +2695,8 @@ extern "C" lattice_status_t lattice_db_detach(lattice_db_t* db, lattice_db_t* ot
         // Same contract as attach since ATT-3: bool return + reason in
         // last_attach_error(); idempotent (detaching a non-attached db is
         // success), never throws across the boundary.
-        if (!db_ref->get()->detach(*other_ref->get())) {
-            auto reason = db_ref->get()->last_attach_error();
+        if (!bridge_ref(db_ref).get()->detach(*bridge_ref(other_ref).get())) {
+            auto reason = bridge_ref(db_ref).get()->last_attach_error();
             set_error(reason ? reason->c_str() : "detach failed");
             return LATTICE_ERROR_DATABASE;
         }
@@ -2687,7 +2710,7 @@ extern "C" lattice_status_t lattice_db_detach(lattice_db_t* db, lattice_db_t* ot
 extern "C" const char* lattice_db_last_attach_error(lattice_db_t* db) {
     if (!db) return nullptr;
     try {
-        auto err = reinterpret_cast<lattice_db_internal*>(db)->get()->last_attach_error();
+        auto err = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get()->last_attach_error();
         if (!err) return nullptr;
         g_returned_string = *err;  // thread-safe copy (core accessor is mutex-guarded)
         return g_returned_string.c_str();
@@ -2706,7 +2729,7 @@ extern "C" lattice_status_t lattice_object_enable_row_cache(lattice_object_t* ob
         return LATTICE_ERROR_NULL_POINTER;
     }
     try {
-        reinterpret_cast<lattice_object_internal*>(obj)->enable_row_cache();
+        bridge_ref(reinterpret_cast<lattice_object_internal*>(obj)).enable_row_cache();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2720,7 +2743,7 @@ extern "C" lattice_status_t lattice_object_disable_row_cache(lattice_object_t* o
         return LATTICE_ERROR_NULL_POINTER;
     }
     try {
-        reinterpret_cast<lattice_object_internal*>(obj)->disable_row_cache();
+        bridge_ref(reinterpret_cast<lattice_object_internal*>(obj)).disable_row_cache();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2734,7 +2757,7 @@ extern "C" lattice_status_t lattice_object_refresh_row_cache(lattice_object_t* o
         return LATTICE_ERROR_NULL_POINTER;
     }
     try {
-        reinterpret_cast<lattice_object_internal*>(obj)->refresh_row_cache();
+        bridge_ref(reinterpret_cast<lattice_object_internal*>(obj)).refresh_row_cache();
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2745,7 +2768,7 @@ extern "C" lattice_status_t lattice_object_refresh_row_cache(lattice_object_t* o
 extern "C" bool lattice_object_is_row_cache_enabled(lattice_object_t* obj) {
     if (!obj) return false;
     try {
-        return reinterpret_cast<lattice_object_internal*>(obj)->is_row_cache_enabled();
+        return bridge_ref(reinterpret_cast<lattice_object_internal*>(obj)).is_row_cache_enabled();
     } catch (...) {
         return false;
     }
@@ -2759,7 +2782,7 @@ extern "C" lattice_status_t lattice_object_increment_int(lattice_object_t* obj,
         return LATTICE_ERROR_NULL_POINTER;
     }
     try {
-        reinterpret_cast<lattice_object_internal*>(obj)->increment_int_field(field, delta);
+        bridge_ref(reinterpret_cast<lattice_object_internal*>(obj)).increment_int_field(field, delta);
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2793,7 +2816,7 @@ extern "C" lattice_status_t lattice_db_checkpoint(lattice_db_t* db, int32_t mode
         return LATTICE_ERROR_INVALID_ARGUMENT;
     }
     try {
-        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
         if (mode == 1) {
             // TRUNCATE via the bridge member — logged outcome (partial
             // checkpoints under concurrent readers are how multi-GB WAL
@@ -2822,7 +2845,7 @@ extern "C" int64_t lattice_db_read_upload_floor(lattice_db_t* db, const char* sy
         return -1;
     }
     try {
-        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
         return lattice::read_upload_floor(impl->db(), std::string(sync_id));
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2844,7 +2867,7 @@ extern "C" char* lattice_object_to_json(lattice_object_t* obj, int32_t max_depth
         // Contract pinned to Swift's DynamicObject.jsonObject — implemented
         // once in the bridge (dynamic_object::to_json) so every consumer
         // (Swift, C, Kotlin/Python via this ABI) shares the walker.
-        const std::string json = ref->to_json(max_depth);
+        const std::string json = bridge_ref(ref).to_json(max_depth);
         char* ret = static_cast<char*>(malloc(json.size() + 1));
         if (ret) {
             std::memcpy(ret, json.c_str(), json.size() + 1);

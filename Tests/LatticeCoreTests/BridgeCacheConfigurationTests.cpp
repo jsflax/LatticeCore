@@ -105,6 +105,7 @@ TEST(BridgeCacheConfiguration, AuthorityFilterAndMaintenanceSettingsNeverAlias) 
     std::vector<lattice::swift_configuration> variants;
     auto token_a = base; token_a.authorization_token = "fixture-authority-A"; variants.push_back(token_a);
     auto token_b = base; token_b.authorization_token = "fixture-authority-B"; variants.push_back(token_b);
+    auto deferred = base; deferred.sync_autostart = false; variants.push_back(deferred);
     auto observer = base; observer.sync_is_observer = true; variants.push_back(observer);
     auto busy = base; busy.busy_timeout_ms = 111; variants.push_back(busy);
     auto retention = base; retention.audit_retention_seconds = 3600; variants.push_back(retention);
@@ -124,6 +125,7 @@ TEST(BridgeCacheConfiguration, AuthorityFilterAndMaintenanceSettingsNeverAlias) 
         for (const auto& previous : stores) EXPECT_NE(opened.get(), previous.get());
         EXPECT_EQ(opened.get(), cache.get_or_create(config, schemas).get());
         EXPECT_EQ(opened->config().sync_is_observer, config.sync_is_observer);
+        EXPECT_EQ(opened->config().sync_autostart, config.sync_autostart);
         EXPECT_EQ(opened->config().busy_timeout_ms, config.busy_timeout_ms);
         EXPECT_EQ(opened->config().audit_retention_seconds, config.audit_retention_seconds);
         EXPECT_TRUE(opened->config().authorization_token == config.authorization_token);
@@ -185,4 +187,74 @@ TEST(BridgeCacheConfiguration, TuningFingerprintPreservesEveryDoubleBitAndOption
             fingerprints.push_back(fingerprint);
         }
     }
+}
+
+TEST(BridgeCacheConfiguration, DeferredSyncStartsAndRestartsWithoutReplacingLocalHandle) {
+    const auto previous_factory = lattice::get_network_factory();
+    struct Restore { std::shared_ptr<lattice::network_factory> value;
+        ~Restore() { lattice::set_network_factory(value); } } restore{previous_factory};
+    auto factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(factory);
+    TempDB tmp{"deferred_sync"};
+    const auto schemas = cache_schemas();
+    lattice::swift_configuration config(tmp.str(), "ws://fixture.invalid/local-first", "fixture");
+    config.sync_autostart = false;
+    auto store = lattice::detail::LatticeCache::instance().get_or_create(config, schemas);
+    auto* primary = store->db().handle();
+    EXPECT_EQ(factory->last_websocket(), nullptr);
+    EXPECT_FALSE(store->is_sync_agent());
+    std::atomic<int> changes{0};
+    auto token = static_cast<lattice::lattice_db&>(*store).add_table_observer(schemas[0].table_name,
+        [&](const auto&) { ++changes; });
+    cache_insert(*store, schemas, "offline-before-start");
+    ASSERT_EQ(store->objects(schemas[0].table_name).size(), 1u);
+    store->connect_sync();
+    ASSERT_NE(factory->last_websocket(), nullptr);
+    EXPECT_TRUE(store->is_sync_connected());
+    store->disconnect_sync();
+    EXPECT_FALSE(store->is_sync_connected());
+    cache_insert(*store, schemas, "offline-after-pause");
+    EXPECT_EQ(changes.load(), 2);
+    store->connect_sync();
+    EXPECT_TRUE(store->is_sync_connected());
+    store->reconnect_sync();
+    EXPECT_TRUE(store->is_sync_connected());
+    EXPECT_EQ(store->db().handle(), primary);
+    EXPECT_EQ(store->objects(schemas[0].table_name).size(), 2u);
+    store->remove_table_observer(schemas[0].table_name, token);
+    store->disconnect_sync(); // Mock does not acknowledge uploads; avoid drain at close.
+    store->close();
+    store->connect_sync();
+    EXPECT_TRUE(store->is_closed());
+    EXPECT_FALSE(store->is_sync_agent());
+}
+
+TEST(BridgeCacheConfiguration, DeferredSetupFailureReleasesOwnershipForSameHandleRetry) {
+    class FailingFactory : public lattice::mock_network_factory {
+    public:
+        bool fail = true;
+        std::unique_ptr<lattice::sync_transport> create_sync_transport() override {
+            if (fail) throw std::runtime_error("fixture transport setup failure");
+            return lattice::mock_network_factory::create_sync_transport();
+        }
+    };
+    struct Restore { std::shared_ptr<lattice::network_factory> value;
+        ~Restore() { lattice::set_network_factory(value); } } restore{lattice::get_network_factory()};
+    auto factory = std::make_shared<FailingFactory>();
+    lattice::set_network_factory(factory);
+    TempDB tmp{"deferred_sync_retry"};
+    lattice::swift_configuration config(tmp.str(), "ws://fixture.invalid/retry", "fixture");
+    config.sync_autostart = false;
+    auto store = lattice::detail::LatticeCache::instance().get_or_create(config, cache_schemas());
+    cache_insert(*store, cache_schemas(), "local-survives");
+    auto* primary = store->db().handle();
+    EXPECT_THROW(store->connect_sync(), std::runtime_error);
+    EXPECT_FALSE(store->is_sync_agent());
+    EXPECT_EQ(store->objects("CacheConfigurationProbe").size(), 1u);
+    factory->fail = false;
+    store->connect_sync();
+    EXPECT_TRUE(store->is_sync_connected());
+    EXPECT_EQ(store->db().handle(), primary);
+    store->disconnect_sync();
+    store->close();
 }

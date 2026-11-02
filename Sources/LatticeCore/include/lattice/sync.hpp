@@ -117,6 +117,13 @@ struct audit_log_entry {
     /// ignore it (legacy upsert behavior — acceptable, they predate groups).
     bool synthesized = false;
 
+    /// Transport-only completeness metadata: these named no_history fields
+    /// contain an observed SQL NULL, not a raw UPDATE-history placeholder.
+    /// Optional on the wire; not persisted in AuditLog. Old peers ignore the
+    /// key and conservatively drop these clears. Receivers still check their
+    /// installed no_history flags and actual column nullability.
+    std::vector<std::string> no_history_nulls;
+
     // Generate SQL instruction from this audit entry
     // Returns {sql, params} for executing the change
     // schema maps column_name -> column_type for decoding hex-encoded BLOBs
@@ -150,31 +157,47 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack, replay_request };
+    enum class type { audit_log, ack, replay_request, nack, catch_up_complete };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
     std::vector<std::string> acked_ids;       // For ack type (UUIDs)
+    std::vector<std::string> nacked_ids;      // Rejected uploads; never acknowledgments
+    std::string nack_reason;
 
     // Serialize to JSON
     std::string to_json() const;
 
     // Deserialize from JSON
     static std::optional<server_sent_event> from_json(const std::string& json);
+    /// Optional payload-free diagnostic: fixed category and, for an invalid
+    /// audit entry, its zero-based position. Never includes wire values or
+    /// parser exception text. Cleared on a successful parse.
+    static std::optional<server_sent_event> from_json(
+        const std::string& json, std::string* error_out);
+
+    // Only emitted by a server after the negotiated initial replay.
+    static server_sent_event make_catch_up_complete() {
+        return {type::catch_up_complete, {}, {}, {}, {}};
+    }
 
     // Factory methods
     static server_sent_event make_audit_log(std::vector<audit_log_entry> logs) {
-        return {type::audit_log, std::move(logs), {}};
+        return {type::audit_log, std::move(logs), {}, {}, {}};
     }
 
     static server_sent_event make_ack(std::vector<std::string> ids) {
-        return {type::ack, {}, std::move(ids)};
+        return {type::ack, {}, std::move(ids), {}, {}};
+    }
+
+    static server_sent_event make_nack(std::vector<std::string> ids, std::string reason) {
+        return {type::nack, {}, {}, std::move(ids), std::move(reason)};
     }
 
     /// Fresh-peer catch-up request. IPC transports ONLY — never sent over WSS
     /// (deployed servers on older protocol versions would fail to parse it).
     static server_sent_event make_replay_request() {
-        return {type::replay_request, {}, {}};
+        return {type::replay_request, {}, {}, {}, {}};
     }
 };
 
@@ -245,6 +268,10 @@ struct sync_config {
     /// is flagged is_observer=1, excluded from every compaction floor, and
     /// evicted on a clean disconnect. See configuration::sync_is_observer.
     bool is_observer = false;
+
+    /// One fresh WSS connection, fixed upload prefix, negotiated initial replay.
+    /// No automatic reconnect. The owner supplies deadline and cleanup.
+    bool finite_cycle = false;
 
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
@@ -324,6 +351,23 @@ public:
     synchronizer_base(synchronizer_base&&) = delete;
     synchronizer_base& operator=(synchronizer_base&&) = delete;
 
+    // Internal work receipt; work_complete is not a transport/SQLite cleanup receipt.
+    enum class finite_cycle_phase { inactive, running, work_complete, failed, cancelled };
+    enum class finite_cycle_failure {
+        none, transport, invalid_frame, partial_apply, storage, configuration_changed
+    };
+    struct finite_cycle_status {
+        finite_cycle_phase phase = finite_cycle_phase::inactive;
+        finite_cycle_failure failure = finite_cycle_failure::none;
+        uint64_t connection_generation = 0;
+        bool horizon_captured = false;
+        int64_t upload_horizon = 0;
+        bool catch_up_received = false;
+    };
+    // Metadata-only: safe under the native store's short ownership lock.
+    finite_cycle_status get_finite_cycle_status() const;
+    void cancel_finite_cycle();
+
     // Connection management
     void connect();
     void disconnect();
@@ -363,7 +407,12 @@ public:
     void set_on_state_change(on_state_change_handler handler) {
         on_state_change_ = std::move(handler);
         if (on_state_change_ && is_connected_) {
-            scheduler_->invoke([this] { on_state_change_(true); });
+            const auto generation = connection_generation_.load();
+            scheduler_->invoke([this, generation] {
+                if (!is_destroyed_ && connection_generation_ == generation &&
+                    is_connected_ && on_state_change_)
+                    on_state_change_(true);
+            });
         }
     }
 
@@ -400,8 +449,13 @@ protected:
     }
 
     std::atomic<bool> is_connected_{false};
+    std::atomic<bool> is_connecting_{false};
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
     std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
+    // Explicit disconnect/reconnect invalidates delayed retries before another
+    // transport call can start. Recursive for transports that callback inline.
+    std::recursive_mutex connection_mutex_;
+    std::atomic<uint64_t> connection_generation_{0};
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -528,8 +582,16 @@ protected:
     void on_websocket_error(const std::string& error);
     void on_websocket_close(int code, const std::string& reason);
 
+    mutable std::mutex finite_cycle_mutex_;
+    finite_cycle_status finite_cycle_status_;
+    bool finite_cycle_ready_ = false; // guarded by finite_cycle_mutex_
+    void fail_finite_cycle(finite_cycle_failure reason, uint64_t generation);
+    bool finite_cycle_accepts_work(uint64_t generation, bool download = false) const;
+    void complete_finite_cycle_if_drained();
+
     // Sync operations
     void upload_pending_changes();
+    void upload_pending_changes_impl();
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
 
@@ -545,6 +607,17 @@ protected:
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
+
+    // Channel-private deliveries whose classification changes membership.
+    // Persist before resolving their source; only a matching ACK removes them.
+    void ensure_sync_outbox();
+    void sync_outbox_transaction(const std::function<void()>& body);
+    std::optional<audit_log_entry> stage_sync_delivery(
+        const audit_log_entry& source, audit_log_entry delivery, bool member);
+    std::vector<audit_log_entry> query_sync_outbox(size_t available, bool& pending);
+    std::vector<std::string> sync_outbox_sources(const std::vector<std::string>& ids);
+    void acknowledge_sync_outbox(const std::vector<std::string>& ids);
+    bool filter_reconciliation_pending_ = false;
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
@@ -610,13 +683,15 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 /// min_id_exclusive bounds the no-sync-state branch (`a.id > ?`) — pass the
 /// slot's upload_floor. limit (0 = unbounded) caps the result to one send
 /// window; entries are ordered by id ASC so the window is always the oldest
-/// pending work.
+/// pending work. max_id_inclusive bounds BOTH branches for a finite cycle;
+/// zero is a real empty prefix, while nullopt preserves the unbounded query.
 std::vector<audit_log_entry> query_audit_log_for_sync(
     database& db,
     const std::string& sync_id,
     const std::optional<std::vector<sync_filter_entry>>& sync_filter = std::nullopt,
     int64_t min_id_exclusive = 0,
-    size_t limit = 0);
+    size_t limit = 0,
+    std::optional<int64_t> max_id_inclusive = std::nullopt);
 
 /// Read the slot's upload_floor (0 when absent). Monotonic advance helper.
 int64_t read_upload_floor(database& db, const std::string& sync_id);
@@ -642,11 +717,13 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
 /// peer must therefore fill such columns with the row's CURRENT value first:
 /// for every UPDATE entry whose table schema marks columns no_history and
 /// whose changedFieldsNames lists them with a null/missing value, read the
-/// live row and fill them in; if the row is gone, drop the column from both
+/// live row and fill them in (marking observed NULLs in noHistoryNulls); if
+/// the row is gone, drop the column from both
 /// changedFields and changedFieldsNames (its DELETE entry follows). Invariant
 /// a consumer can rely on: a no_history column syncs its latest value at
 /// upload/push time, not every intermediate value. Called by
 /// query_audit_log_for_sync and events_after; exposed for other shippers.
+/// Full INSERT payloads also mark their explicit no_history NULLs.
 void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries);
 
 /// The same fill for ONE row, as the wire JSON object ({"col": {"kind":..,
@@ -664,6 +741,9 @@ namespace test_hooks {
 /// entries are still returned (= acked), the failed chunk is retried once,
 /// then the delivery stops. nullptr (the default) in production.
 extern std::function<void(size_t chunk_start)> apply_chunk_begin;
+/// Test-only rollback seam after durable-delivery INSERT, before membership
+/// and source resolution. Throwing must roll the whole staging transaction back.
+extern std::function<void()> sync_outbox_after_insert;
 }  // namespace test_hooks
 
 // Apply remote audit log entries to a database (server-side receive path)

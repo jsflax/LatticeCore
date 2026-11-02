@@ -3,6 +3,7 @@
 #ifndef __EMSCRIPTEN__
 #include <lattice/scheduler.hpp>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -112,8 +113,16 @@ public:
 
 // A derived immediate scheduler may override dispatch policy; preserve it.
 inline std::shared_ptr<scheduler> make_synchronizer_scheduler(std::shared_ptr<scheduler> original) {
-    if (original && typeid(*original) == typeid(immediate_scheduler))
-        return std::make_shared<sync_immediate_scheduler>();
+    if (original) {
+        const auto& actual = typeid(*original);
+        const auto& builtin = typeid(immediate_scheduler);
+        // Apple arm64 can give the same type unequal RTTI identities when a
+        // default-visible caller crosses into our hidden-visibility library.
+        // Compare the complete ABI type name as a fallback, preserving the
+        // exact-type rule: derived schedulers keep their dispatch policy.
+        if (actual == builtin || std::strcmp(actual.name(), builtin.name()) == 0)
+            return std::make_shared<sync_immediate_scheduler>();
+    }
     return original;
 }
 

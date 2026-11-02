@@ -1,5 +1,162 @@
 # Changelog
 
+## [2.5.1] - 2026-11-02
+
+### Fixed
+- Let concurrent first opens of a file finish enabling WAL within the configured
+  busy timeout. SQLite can decline to call its busy handler during this lock
+  upgrade; retry only that idempotent initialization statement after releasing
+  the failed attempt, with one deadline and cancellation checks.
+- Preserve immediate failure for zero wait budgets and non-contention errors.
+  Read-only and in-memory behavior, ordinary SQL execution, and the public ABI
+  remain unchanged.
+
+## [2.5.0] - 2026-11-01
+
+### Added
+- Add generation-scoped native background sync control: cancellable setup,
+  finite work receipts, settled WSS suspension, and same-store foreground
+  resumption. Managed stores start suspended and preserve the primary handle,
+  local data, observers, and Results identity.
+- Bound a finite connection to its starting upload horizon and a negotiated
+  initial-replay completion marker. Older servers remain usable, but cannot
+  certify completion. Keep application progress, error, and state subscriptions
+  independent from the finite operation's receipt.
+
+### Fixed
+- Keep one shared-pointer-backed Swift handle layout across iOS deployment
+  targets and Swift explicit modules. This fixes iOS 15 imports when Xcode
+  builds the Clang module for a newer SDK and avoids mismatched native layouts.
+- Persist filtered membership transitions in a channel-private outbox before
+  resolving their source history. Preserve immutable deliveries and UUIDs
+  through full send windows, lost acknowledgements, restart, filter changes,
+  and source-history compaction.
+- Cancel owned SQLite busy waits during setup and cleanup without interrupting
+  unrelated application transactions. Stop managed retention and autonomous
+  readers, reject new keeper acquisition while suspended, and release sync
+  ownership only after private work settles. Ordinary finite calls restore
+  their prior parent-maintenance state.
+- Fence queued messages across connection generations and prevent a stale
+  expiration or callback from changing a successor's ownership. Keep callback
+  registration safe while a session is being replaced or retired.
+- Release replaced callback captures outside registration locks, so a capture's
+  destructor can reenter registration or close its store without deadlocking.
+- Match UUID acknowledgements regardless of hexadecimal letter case, including
+  durable filtered deliveries, so mixed Swift/Core UUID formatting cannot leave
+  phantom in-flight work waiting for the acknowledgement watchdog.
+- Resume foreground readers and observation even when another handle owns WSS.
+  Managed local borrowers, including read-only file handles, join lifecycle
+  suspension without acquiring a transport; explicit connect can retry WSS
+  ownership with a fresh cancellation generation.
+- Share observer callback depth across linked modules, avoiding a destructor
+  self-wait when SwiftBuild combines Core into an aggregate object.
+- Seal Swift bridge filter mutations so lifecycle contention is reported
+  through the bridge error slot instead of escaping as a native exception.
+
+### Compatibility
+- iOS bridge handles now consistently use the existing value representation,
+  including builds targeting iOS 16.4 or newer, simulators, and Mac Catalyst.
+  Rebuild all native bridge and Swift consumers together; do not mix previously
+  compiled iOS FRT objects with this bridge. macOS/Linux FRT behavior is unchanged.
+- LatticeCAPI now uses its dependency's selected bridge ABI. On iOS, private
+  retained heap handles own the bridge values; its public opaque C handles and
+  retain/release contract remain unchanged. macOS/Linux retain their existing
+  FRT handles. Linked-object getters now return one owned reference consistently
+  with the other C handle factories.
+- Additive C++ and Swift bridge APIs; no public C ABI change. Rebuild Core and
+  native bridge consumers together. The iOS scheduler adapter requires the
+  matching Lattice SDK; Core alone does not register Apple tasks.
+- The new `_lattice_sync_outbox` is durable sync state. Upgrade and restart all
+  processes that own a store's sync channels together. Older owners do not
+  replay pending outbox rows; downgrading with pending rows is not supported.
+- Servers send the new initial-replay marker only when requested by the client.
+  Finite completion covers an upload prefix and one replay pass, not ongoing
+  global convergence. Finite sync and the SDK's public background policy require
+  a writable file store, configured WSS, and no unmanaged IPC targets. Internal
+  managed local borrowers may be read-only and omit WSS, but remain file-only
+  and cannot perform finite sync themselves.
+
+## [2.4.2] - 2026-10-30
+
+### Fixed
+- Add checked dynamic-open factories so Swift consumers can report invalid-store and initialization failures without a native exception escaping the bridge. Preserve independent read-only connections and the existing unchecked overloads.
+- Close the partially opened SQLite connection when database initialization throws, including failed PRAGMAs, instead of leaking the connection.
+- Index reverse-link lookups for fresh and existing stores, while preserving union-table replay and the configured sync scheduler.
+- Recognize relay NACK responses without acknowledging rejected writes, advancing upload progress, or bypassing the existing retry timeout.
+- Report malformed sync frames and rejected uploads through the Swift and C receive boundaries instead of returning an unexplained empty success. Keep whole-frame validation and committed-prefix acknowledgement behavior.
+
+### Compatibility
+- Additive C++/Swift bridge overloads and native sync-event fields; no public C ABI change. Existing relay NACK messages are now recognized. Rebuild Core and all native/C++ bridge consumers together.
+- Internal schema-format epoch advances from 6 to 7 so writable opens add reverse-link indexes to existing stores without a model schema-version bump. Read-only opens remain DDL-free, and the indexes do not replace or rewrite model data.
+- Swift consumers must use the matching checked adapter to receive these open failures as Swift errors.
+
+## [2.4.1] - 2026-10-25
+
+### Fixed
+- Replicate an observed null for nullable NoHistory fields, so clearing a previously cached value reaches the receiving store. Preserve the distinction between an explicit clear and a legacy unavailable-value placeholder.
+- Validate observed-null transport metadata before duplicate handling and require the receiver field to be both NoHistory and physically nullable.
+- Clear the nullable-field cache with the existing schema caches after a chunk rollback, allowing a corrected retry to use current column metadata.
+
+### Compatibility
+- Optional sync metadata and additive C++/Swift bridge fields; no persistent schema or public C ABI change. Rebuild Core and Swift bridge consumers together.
+- Use the matching Swift adapter to preserve observed-null metadata through Codable and bridge transport. Older peers retain their previous null behavior; this release does not retroactively repair already-acknowledged clears.
+
+## [2.4.0] - 2026-10-24
+
+### Added
+- Allow configured WSS sync to start explicitly after local rows are read, with
+  `configuration.sync_autostart = false`. Connect, disconnect and reconnect keep
+  the primary database handle and local observers; automatic startup remains the
+  default. Full close is still required to release sync ownership before app
+  suspension.
+
+### Fixed
+- Preserve fetched row values during Swift bridge hydration so materialized
+  reads do not issue another query per row or silently hydrate a newer row image.
+- Fence delayed reconnects and in-flight open callbacks across explicit transport
+  restarts, publish disconnected state on terminal errors, and retire external
+  transport contexts only at destruction.
+- Keep dormant deferred siblings out of sync ownership handoff, release ownership
+  after failed setup, and tolerate partial transport construction during cleanup.
+- Include the existing scheduler implementation in the CMake library target.
+
+### Compatibility
+- Additive Core and Swift bridge API; no persistent schema, sync wire format or
+  public C API change. Rebuild native and Swift bridge consumers together. Local
+  schema/integrity initialization and configured IPC startup are unchanged;
+  deferred WSS performs sync-only repair when explicitly started.
+
+## [2.3.1] - 2026-10-23
+
+### Fixed
+- Accept the null placeholders produced by UPDATE audit triggers in sync
+  `changedFieldsNames` arrays, including the legacy JSON-string form. Swift
+  audit-log encoding preserves those slots; rejecting them discarded complete
+  deliveries containing valid mutations and their receipts.
+- Keep whole-frame rejection for malformed containers, non-string/non-null
+  name elements, missing mutation fields and invalid transport identities.
+
+### Compatibility
+- No persistent schema, wire-format layout or public API changes. Restores
+  compatibility with existing audit rows and Swift audit-log senders.
+
+## [2.3.0] - 2026-10-23
+
+### Added
+- Expose the actual persisted schema version through a checked Core and Swift
+  bridge query. Missing, malformed, nonpositive, ambiguous and out-of-range
+  metadata fails explicitly; read-only clients never infer compatibility from
+  their configured migration target or write a replacement version.
+
+### Fixed
+- Share callback-context ownership across generic scheduler copies and
+  `make_shared()`. The final owner invokes the destroy callback exactly once,
+  allowing Swift actor contexts to be released safely after short-lived reads.
+
+### Compatibility
+- Additive Core/Swift bridge API; no persistent schema, sync wire format or
+  public C API change. Rebuild Core and generated C++/Swift consumers together.
+
 ## [2.2.8] - 2026-10-22
 
 ### Fixed

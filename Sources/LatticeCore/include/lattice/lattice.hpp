@@ -93,10 +93,10 @@ struct instance_guard {
     /// yield spin in ~lattice_db during the test suite). A callback that
     /// triggers destruction must not touch the lattice afterwards — which is
     /// inherently true for deinit-triggered teardown.
-    static std::unordered_map<const instance_guard*, int>& tls_depths() {
-        thread_local std::unordered_map<const instance_guard*, int> depths;
-        return depths;
-    }
+    // Keep the TLS accessor out of line. Combined-object builds may localize
+    // hidden inline TLS independently in Core, bridge, and caller objects;
+    // destruction must read the same map that callback admission increments.
+    static std::unordered_map<const instance_guard*, int>& tls_depths();
     static int tls_depth(const instance_guard* g) {
         auto& m = tls_depths();
         auto it = m.find(g);
@@ -485,6 +485,19 @@ struct configuration {
 
     /// Authorization token for sync. Required if websocket_url is set.
     std::string authorization_token;
+
+    /// Defer WSS ownership, sync repair and transport creation until connect_sync().
+    /// Local schema/integrity initialization and configured IPC remain unchanged.
+    bool sync_autostart = true;
+
+    /// SDK-managed application lifecycle. Starts suspended; explicit managed
+    /// resume grants WSS/maintenance activity without changing store identity.
+    bool background_sync_managed = false;
+
+    /// Internal private-sync connection control. Never bind this to an
+    /// application's shared writer; the managed owner supplies it only when
+    /// constructing its dedicated WSS database and readers.
+    std::shared_ptr<const std::atomic<bool>> private_sync_cancellation;
 
     /// Target schema version. Default is 1 (initial schema).
     /// If the database is at a lower version, migrations will run.
@@ -903,18 +916,21 @@ public:
     }
 
     explicit lattice_db(const configuration& config, bool defer_sync = false)
-        : config_(config)
+        : config_(validate_background_sync_configuration(config))
         , db_(std::make_shared<database>(resolve_path(config),
               config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
-              config.busy_timeout_ms))
+              config.busy_timeout_ms, config.private_sync_cancellation))
         , read_db_(config.read_only ? nullptr :
-                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
+                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, config.private_sync_cancellation) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
-                         std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
+                         std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, config.private_sync_cancellation) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
         config_.path = resolve_path(config);
+        sync_start_requested_ = config.sync_autostart && !config.background_sync_managed;
+        background_sync_suspended_ = config.background_sync_managed;
+        audit_maintenance_cancellable_ = config.background_sync_managed;
         setup_store_write_gate();
         auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
         LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
@@ -924,7 +940,10 @@ public:
         if (!config.read_only) {
             LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
-            heal_collapsed_sync_state();
+            // The deferred WSS path exposes local rows before sync-only repair.
+            // IPC still starts at open and therefore still needs this repair.
+            if ((config.sync_autostart && !config.background_sync_managed) || config.is_ipc_enabled())
+                heal_collapsed_sync_state();
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
             if (!defer_sync) {
@@ -1977,13 +1996,7 @@ public:
     /// Returns true if this instance owns a sync agent (WSS or IPC).
     /// Used by Swift to decide whether to observe progress from the in-process
     /// synchronizer or fall back to AuditLog-based passive observation.
-    bool is_sync_agent() const {
-        if (sync_lock_fd_ >= 0) return true;
-        for (const auto& ipc : ipc_synchronizers_) {
-            if (ipc.lock_fd >= 0) return true;
-        }
-        return false;
-    }
+    bool is_sync_agent() const;
 
     /// Manually trigger sync (uploads pending changes)
     void sync_now();
@@ -2011,11 +2024,33 @@ public:
     /// Clear ONE channel's sync filter ("" = WSS).
     void clear_sync_filter(const std::string& channel);
 
-    /// Connect to sync server (called automatically if configured)
+    /// Start/resume configured WSS on this same primary database handle.
+    /// Already-open/connecting transport is left alone.
     void connect_sync();
 
-    /// Disconnect from sync server
+    /// Pause WSS and cancel pending retries without closing local storage.
+    /// This retains sync ownership; use close() before application suspension.
     void disconnect_sync();
+
+    /// Replace the WSS connection attempt, preserving local storage and observers.
+    void reconnect_sync();
+
+    // Native background lifecycle. A generation owns local producers and at
+    // most one private WSS session; suspension is their settlement barrier.
+    enum class background_sync_admission { started, already_running, not_owner, cancelled, closed, unsupported };
+    struct background_sync_start {
+        background_sync_admission admission = background_sync_admission::unsupported;
+        uint64_t generation = 0;
+    };
+    background_sync_start resume_background_sync(
+        std::shared_ptr<std::atomic<bool>> cancellation = {}, bool finite_cycle = false);
+    uint64_t current_background_sync_generation() const;
+    synchronizer_base::finite_cycle_status get_background_sync_status(uint64_t generation) const;
+    bool cancel_background_sync(uint64_t generation);
+    // Returns true only after this generation's transport, queued work, private
+    // connections and retention have settled. Reentrant callbacks return false
+    // and retire off-thread; callers must not report success from that receipt.
+    bool suspend_background_sync(uint64_t generation);
 
     /// Set callback for sync state changes
     void set_on_sync_state_change(std::function<void(bool connected)> handler);
@@ -2464,7 +2499,7 @@ public:
     // checkpoint runs in the resulting reader gap (§3.4).
 
     /// Acquire a new read generation. Returns its id, or 0 when this storage
-    /// refuses keepers (memory family, Emscripten, closed instance) or the
+    /// refuses keepers (memory family, Emscripten, closed/suspended managed instance) or the
     /// store cannot be pinned — callers treat 0 as "no keeper" and fall back
     /// to their non-generation path.
     ///
@@ -2477,7 +2512,15 @@ public:
 #ifdef __EMSCRIPTEN__
         return 0;
 #else
-        if (closed_.load(std::memory_order_seq_cst)) return 0;
+        // Fence even an opening keeper that is not yet in live_generations_.
+        // Suspension waits for these borrows before its final retire-all pass.
+        std::optional<sync_borrow> lifecycle;
+        if (config_.background_sync_managed) {
+            lifecycle.emplace(*this);
+            if (!lifecycle->admitted()) return 0;
+        }
+        if (closed_.load(std::memory_order_seq_cst) ||
+            (config_.background_sync_managed && background_sync_suspended_.load(std::memory_order_acquire))) return 0;
         if (config_.is_in_memory()) return 0;  // §4.1: NO keepers (covers named shared-cache memory)
         run_pending_wal_eviction_if_any(/*checkpoint_busy_budget_ms=*/0);
 
@@ -2515,14 +2558,20 @@ public:
         gen->conn = std::move(conn);
         gen->pinned_at = std::chrono::steady_clock::now();
         gen->last_read_steady_ms.store(steady_ms_now(), std::memory_order_relaxed);
+        bool rejected = false;
         {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
-            gen->id = next_read_generation_id_++;
-            live_generations_.push_back(gen);
+            rejected = closed_.load(std::memory_order_seq_cst) ||
+                (config_.background_sync_managed && background_sync_suspended_.load(std::memory_order_acquire));
+            if (!rejected) {
+                gen->id = next_read_generation_id_++;
+                live_generations_.push_back(gen);
+            }
         }
-        if (closed_.load(std::memory_order_seq_cst)) {
-            // Lost the race with close(): its retire-all pass may have missed
-            // this generation. Undo — post-close acquisitions must not leak
+        if (rejected || closed_.load(std::memory_order_seq_cst) ||
+            (config_.background_sync_managed && background_sync_suspended_.load(std::memory_order_acquire))) {
+            // Lost the race with close or managed suspension. Its retire-all
+            // pass may have missed this generation; undo rather than leak
             // a held read transaction.
             force_retire_generation(gen);
             return 0;
@@ -2658,6 +2707,11 @@ public:
     /// exactly-once delivery keeps untouched shapes' caches valid across the
     /// re-pin). (c) Executes pending WAL-threshold evictions (§3.4).
     void run_read_pool_maintenance() {
+        std::optional<sync_borrow> lifecycle;
+        if (config_.background_sync_managed) {
+            lifecycle.emplace(*this);
+            if (!lifecycle->admitted() || background_sync_suspended_.load(std::memory_order_acquire)) return;
+        }
         const int64_t now_ms = steady_ms_now();
         const int64_t ttl_ms = read_generation_ttl_ms_.load(std::memory_order_relaxed);
         const int64_t max_age_ms = read_generation_max_age_ms_.load(std::memory_order_relaxed);
@@ -2797,9 +2851,18 @@ public:
     /// shared-cache memory stores). Thread-affine and re-entrant; an
     /// unpaired release (e.g. a defensive rollback with no matching begin)
     /// is a no-op.
-    void acquire_store_write_gate() {
+    void acquire_store_write_gate(const std::atomic<bool>* cancelled = nullptr) {
+        if (cancelled && cancelled->load(std::memory_order_acquire))
+            throw db_error("database maintenance cancelled");
         if (!store_write_gate_) return;
-        store_write_gate_->lock();
+        if (cancelled) {
+            while (!store_write_gate_->try_lock_for(std::chrono::milliseconds(5))) {
+                if (cancelled->load(std::memory_order_acquire))
+                    throw db_error("database maintenance cancelled");
+            }
+        } else {
+            store_write_gate_->lock();
+        }
         ++tls_store_gate_depths()[this];
     }
     void release_store_write_gate() {
@@ -2823,8 +2886,8 @@ public:
     /// capture txn). Never construct inside a hook frame (§2.3).
     struct store_write_gate_hold {
         lattice_db* db;
-        explicit store_write_gate_hold(lattice_db& d) : db(&d) {
-            db->acquire_store_write_gate();
+        explicit store_write_gate_hold(lattice_db& d, const std::atomic<bool>* cancelled = nullptr) : db(&d) {
+            db->acquire_store_write_gate(cancelled);
         }
         ~store_write_gate_hold() { db->release_store_write_gate(); }
         store_write_gate_hold(const store_write_gate_hold&) = delete;
@@ -3316,6 +3379,35 @@ public:
         return result;
     }
 
+    /// The persisted store version on the current read/transaction route.
+    /// Unlike migration bootstrap, a missing or invalid value is an error:
+    /// read-only consumers must never infer compatibility from a fallback.
+    int32_t stored_schema_version() {
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed())
+            throw db_error("Stored schema version connection is closed");
+        const auto rows = connection->query(
+            "SELECT value FROM _lattice_meta WHERE key = 'schema_version' LIMIT 2");
+        if (is_closed() || connection->is_closed())
+            throw db_error("Stored schema version connection is closed");
+        if (rows.size() != 1)
+            throw db_error("Missing or ambiguous stored schema version");
+        const auto found = rows.front().find("value");
+        if (found == rows.front().end() || !std::holds_alternative<std::string>(found->second))
+            throw db_error("Invalid stored schema version type");
+        const auto& text = std::get<std::string>(found->second);
+        if (text.empty()) throw db_error("Invalid stored schema version");
+        int32_t value = 0;
+        for (const unsigned char digit : text) {
+            if (digit < '0' || digit > '9'
+                || value > (std::numeric_limits<int32_t>::max() - (digit - '0')) / 10)
+                throw db_error("Invalid or out-of-range stored schema version");
+            value = value * 10 + (digit - '0');
+        }
+        if (value <= 0) throw db_error("Stored schema version must be positive");
+        return value;
+    }
+
     size_t count(const std::string& table_name,
                  std::optional<std::string> where_clause = std::nullopt,
                  std::optional<std::string> group_by = std::nullopt,
@@ -3664,6 +3756,12 @@ public:
     int64_t prune_audit_log(int64_t retention_seconds) {
         if (retention_seconds <= 0) return 0;
         return with_audit_prune_transaction_([&]() -> int64_t {
+            return prune_audit_log_in_transaction_(retention_seconds);
+        });
+    }
+
+private:
+    int64_t prune_audit_log_in_transaction_(int64_t retention_seconds) {
             const double now = now_epoch_();
             const double cutoff = now - static_cast<double>(retention_seconds);
             record_audit_watermark_(now);   // always sample, so a bound exists next time
@@ -3693,8 +3791,9 @@ public:
                 "AND CAST(substr(key, 10) AS REAL) < ?",
                 {cutoff - static_cast<double>(retention_seconds)});
             return delete_audit_below_in_transaction_(bound, audit_cursor_row_needed_());
-        });
     }
+
+public:
 
     /// Store a (now, MAX(id)) watermark for prune_audit_log(). Cheap (one
     /// pk-btree MAX + one meta upsert); safe to call from any process.
@@ -3785,13 +3884,16 @@ private:
             return result;
         });
     }
+    friend struct background_sync_lifecycle_test_access;
     template<typename F>
-    int64_t with_audit_prune_transaction_(F&& body) {
+    int64_t with_audit_prune_transaction_(F&& body, const std::atomic<bool>* cancelled = nullptr) {
         int64_t result = 0;
         if (store_write_gate_)
             database::maintenance_scope::probe_before_store_gate(*db_);
         {
-            store_write_gate_hold gate(*this);
+            store_write_gate_hold gate(*this, cancelled);
+            std::optional<database::cancellable_operation> cancellation;
+            if (cancelled) cancellation.emplace(*db_, *cancelled);
             database::maintenance_scope ownership(*db_);
             // Ownership rejects an existing same-connection transaction.
             // BEGIN then excludes every other connection until COMMIT.
@@ -3907,14 +4009,19 @@ public:
     // ---- retention maintenance thread (armed only when audit_retention_seconds > 0)
 
     void start_audit_maintenance() {
-        if (config_.read_only || config_.audit_retention_seconds <= 0) return;
+        if (is_closed() || background_sync_suspended_.load(std::memory_order_acquire) ||
+            config_.read_only || config_.audit_retention_seconds <= 0) return;
         if (audit_maint_thread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(audit_maint_mutex_);
+            audit_maint_stop_.store(false, std::memory_order_release);
+        }
         audit_maint_thread_ = std::thread([this] {
             const auto period = std::chrono::seconds(
                 std::max<int64_t>(1, config_.audit_retention_seconds / 2));
             std::unique_lock<std::mutex> lock(audit_maint_mutex_);
             for (;;) {
-                audit_maint_cv_.wait_for(lock, period, [this] { return audit_maint_stop_; });
+                audit_maint_cv_.wait_for(lock, period, [this] { return audit_maint_stop_.load(std::memory_order_acquire); });
                 if (audit_maint_stop_) return;
                 // DB work runs with the maintenance mutex RELEASED (the pacer's
                 // ABBA lesson: connection work under a wake-up mutex deadlocks
@@ -3944,6 +4051,25 @@ public:
     void run_audit_retention_tick() {
         if (closed_.load(std::memory_order_acquire)) return;
         try {
+            if (audit_maintenance_cancellable_.load(std::memory_order_acquire)) {
+                (void)with_audit_prune_transaction_([&]() -> int64_t {
+                    const double now = now_epoch_();
+                    const double half = static_cast<double>(config_.audit_retention_seconds) / 2.0;
+                    const auto rows = db_->query(
+                        "SELECT CAST(value AS REAL) AS t FROM _lattice_meta WHERE key = 'audit_prune_at'");
+                    if (!rows.empty()) {
+                        const auto& value = rows[0].at("t");
+                        const double last = std::holds_alternative<double>(value)
+                            ? std::get<double>(value)
+                            : (std::holds_alternative<int64_t>(value) ? std::get<int64_t>(value) : 0);
+                        if (now - last < half) { record_audit_watermark_(now); return 0; }
+                    }
+                    db_->execute("INSERT OR REPLACE INTO _lattice_meta(key,value) VALUES('audit_prune_at',?)",
+                                 {std::to_string(now)});
+                    return prune_audit_log_in_transaction_(config_.audit_retention_seconds);
+                }, &audit_maint_stop_);
+                return;
+            }
             const double now = now_epoch_();
             const double half = static_cast<double>(config_.audit_retention_seconds) / 2.0;
             auto rows = db_->query(
@@ -4694,6 +4820,12 @@ public:
             ")";
             db_->execute(sql);
         }
+
+        // Parent/target lookups traverse links in the opposite direction from the
+        // (lhs, rhs) primary key. Cover both filtering and the returned source ID,
+        // including existing tables; otherwise every child query scans all links.
+        db_->execute("CREATE INDEX IF NOT EXISTS idx_" + link_table_name +
+                     "_rhs_lhs ON " + link_table_name + "(rhs, lhs)");
 
         // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
         create_link_table_triggers(link_table_name);
@@ -6234,6 +6366,15 @@ private:
     friend class synchronizer;
 
     configuration config_;
+    static configuration validate_background_sync_configuration(const configuration& config) {
+        // The SDK's public policy validates a writable WSS owner. Its derived
+        // file handles use this same internal local-producer lifecycle without
+        // registering a task or constructing another transport.
+        if (config.background_sync_managed && (config.is_in_memory() || config.is_ipc_enabled()))
+            throw db_error("managed background lifecycle requires a file store without IPC");
+        return config;
+    }
+    std::atomic<bool> background_sync_suspended_{false};
     // Publication only: never hold this mutex across SQLite, callbacks, or
     // destruction. attach -> publication is the only nested lock direction.
     std::mutex connection_ownership_mutex_;
@@ -6250,6 +6391,57 @@ private:
     std::atomic<bool> closed_{false};
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
+    // Shared so a close reached from a WSS callback can defer final destruction
+    // without retaining the primary handle or using a dead parent in a lease.
+    struct sync_lifecycle_state {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool transitioning = false;
+        std::thread::id transition_thread;
+        size_t borrowers = 0;
+        std::map<std::thread::id, size_t> borrower_threads;
+        uint64_t sequence = 0;
+        uint64_t generation = 0;
+        uint64_t settled_generation = 0;
+        uint64_t restore_parent_generation = 0;
+        bool prior_parent_suspended = false;
+        bool prior_retention_running = false;
+        std::shared_ptr<std::atomic<bool>> cancellation;
+        std::shared_ptr<scheduler> worker;
+        uint64_t callback_epoch = 0;
+        uint64_t state_callback_revision = 0;
+        uint64_t state_delivered_revision = 0;
+        bool connected = false;
+        std::function<void(bool)> state_handler;
+        std::function<void(const std::string&)> error_handler;
+        synchronizer::on_progress_handler progress_handler;
+    };
+    std::shared_ptr<sync_lifecycle_state> sync_lifecycle_ = std::make_shared<sync_lifecycle_state>();
+    class sync_borrow {
+    public:
+        explicit sync_borrow(const lattice_db& owner, bool mutation = false);
+        ~sync_borrow();
+        sync_borrow(const sync_borrow&) = delete;
+        sync_borrow& operator=(const sync_borrow&) = delete;
+        synchronizer* get() const { return pointer_; }
+        synchronizer* operator->() const { return pointer_; }
+        explicit operator bool() const { return pointer_ != nullptr; }
+        bool admitted() const { return admitted_; }
+    private:
+        std::shared_ptr<sync_lifecycle_state> state_;
+        synchronizer* pointer_ = nullptr;
+        bool admitted_ = false;
+    };
+    // Transition admission never holds its mutex over SQL, callbacks or joins.
+    bool begin_sync_transition(bool wait);
+    void end_sync_transition();
+    void setup_sync_owned(bool finite_cycle = false,
+                          std::shared_ptr<std::atomic<bool>> cancellation = {},
+                          bool allow_sibling_kick = true);
+    bool retire_wss_owned(bool drain, bool handoff);
+    void restore_parent_after_sync_owned(uint64_t generation);
+    static void replay_sync_state_subscription(const std::shared_ptr<sync_lifecycle_state>& state);
+    std::atomic<bool> sync_start_requested_{true};
 
     // IPC sync
     struct ipc_sync_state {
@@ -6369,7 +6561,8 @@ private:
     std::atomic<bool> history_generation_active_{false};
     std::mutex audit_maint_mutex_;
     std::condition_variable audit_maint_cv_;
-    bool audit_maint_stop_ = false;
+    std::atomic<bool> audit_maint_stop_{false};
+    std::atomic<bool> audit_maintenance_cancellable_{false};
     // Shared mutex captured by the xproc callback lambda so it outlives this
     // object.  The destructor locks it while unregistering, preventing the
     // callback from accessing a partially-destroyed lattice_db.
@@ -7463,7 +7656,10 @@ protected:
     /// snapshots; guarded ALTER in ensure_audit_log_table). Epoch 5 ships
     /// alone as Engram Groups increment 0; this train is increment 1.
     /// Renumbered from 5 by the same rebase.
-    static constexpr int kLatticeSchemaFormatEpoch = 6;
+    /// Epoch 7: regular link tables gained a covering (rhs, lhs) index for
+    /// reverse traversal. Both Core and Swift schema fingerprints must force
+    /// one guarded ensure pass on stores written before the index existed.
+    static constexpr int kLatticeSchemaFormatEpoch = 7;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as
@@ -7959,9 +8155,13 @@ protected:
         }
 
         // Populate the source object's values from the row
-        if constexpr (has_source_member<T>::value) {
+        // The row image belongs to the managed wrapper, not T itself
+        // (swift_dynamic_object has values, while managed<T> has source).
+        // Preserve the fetched scalars so opting into row-cache reads does
+        // not re-query every row, possibly at a newer generation.
+        if constexpr (has_source_member<managed<T>>::value) {
             for (const auto& [key, value] : row) {
-                if (key != "id" && key != "globalId" && key != "_source") {
+                if (key != "id" && key != "_source") {
                     obj.source.values[key] = value;
                 }
             }
@@ -8785,84 +8985,37 @@ namespace lattice {
 // ============================================================================
 
 inline void lattice_db::teardown_sync(bool fire_handoff) {
-    // Phase 0: Bounded drain — give connected synchronizers a short window to
-    // flush pending uploads and collect ACKs before disconnecting. Without
-    // this, dropping the last reference to a Lattice right after a write cuts
-    // the in-flight entry: the daemon shutting down, a task-scoped instance
-    // going out of scope, and the A→B sync handoff all lose data otherwise.
-    // The deadline is shared across all synchronizers so teardown latency is
-    // bounded regardless of how many are attached.
     {
-        auto drain_deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(2000);
-        for (auto& ipc : ipc_synchronizers_) {
-            if (ipc.sync) ipc.sync->drain(drain_deadline);
-        }
-        if (synchronizer_) synchronizer_->drain(drain_deadline);
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        if (sync_lifecycle_->generation && sync_lifecycle_->cancellation)
+            sync_lifecycle_->cancellation->store(true, std::memory_order_release);
+        if ((is_closed() || !guard_->alive.load(std::memory_order_acquire)) &&
+            audit_maintenance_cancellable_.load(std::memory_order_acquire))
+            background_sync_suspended_.store(true, std::memory_order_release);
     }
-
-    // Phase 1: Disconnect ALL synchronizers (joins transport read threads,
-    // removes AuditLog observers). This must complete for every synchronizer
-    // BEFORE destroying any of them, because flush_changes() on one sync's
-    // db iterates ALL registered instances — destroying one sync's db while
-    // another sync's thread is in flush_changes causes a use-after-free on
-    // observers_mutex_.
-    for (auto& ipc : ipc_synchronizers_) {
-        if (ipc.sync) ipc.sync->disconnect();
-    }
-    if (synchronizer_) synchronizer_->disconnect();
-
-    // Phase 2: All transport threads stopped. Destroy IPC synchronizers
-    // and unregister their keys from the sync registry.
-    // Each synchronizer destructor drains its scheduler before destroying
-    // its owned lattice_db, so in-flight work completes safely while all
-    // remaining instances are still alive and registered.
-    for (const auto& target : config_.ipc_targets) {
+    if (!begin_sync_transition(true)) return;
+    if (is_closed() || !guard_->alive.load(std::memory_order_acquire))
+        stop_audit_maintenance();
+    // Managed lifecycles reject IPC at admission. Ordinary close retains the
+    // existing all-channel disconnect ordering before any private DB dies.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    for (auto& ipc : ipc_synchronizers_) if (ipc.sync) ipc.sync->drain(deadline);
+    for (auto& ipc : ipc_synchronizers_) if (ipc.sync) ipc.sync->disconnect();
+    if (synchronizer_ && !ipc_synchronizers_.empty()) synchronizer_->disconnect();
+    for (const auto& target : config_.ipc_targets)
         unregister_sync_key(config_.path, "ipc:" + target.channel);
-    }
     for (auto& ipc : ipc_synchronizers_) {
-        if (ipc.sync) ipc.sync.reset();
-        if (ipc.endpoint) {
-            ipc.endpoint->stop();
-            ipc.endpoint.reset();
-        }
-        if (ipc.lock_fd >= 0) {
-            ::flock(ipc.lock_fd, LOCK_UN);
-            ::close(ipc.lock_fd);
-            ipc.lock_fd = -1;
-        }
+        ipc.sync.reset();
+        if (ipc.endpoint) { ipc.endpoint->stop(); ipc.endpoint.reset(); }
+        if (ipc.lock_fd >= 0) { ::flock(ipc.lock_fd, LOCK_UN); ::close(ipc.lock_fd); }
     }
     ipc_synchronizers_.clear();
-
-    // Phase 3: Destroy WSS synchronizer
-    if (!synchronizer_) return;
-    unregister_sync_key(config_.path, config_.websocket_url);
-    synchronizer_.reset();
-
-    // Release the cross-process flock so another process (or sibling) can
-    // acquire it and take over WSS sync responsibility.
-    if (sync_lock_fd_ >= 0) {
-        ::flock(sync_lock_fd_, LOCK_UN);
-        ::close(sync_lock_fd_);
-        sync_lock_fd_ = -1;
+    bool managed;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        managed = sync_lifecycle_->generation != 0;
     }
-
-    // Hand off sync responsibility to a surviving sibling instance with
-    // the same URL. Skipped when caller passed `fire_handoff = false` —
-    // i.e. the URL-change kick path in `setup_sync_if_configured`, which
-    // wants the flock free WITHOUT another sibling immediately re-grabbing
-    // it under the now-stale URL.
-    if (!fire_handoff) return;
-    bool handed_off = false;
-    instance_registry::instance().for_each_alive(config_.path,
-        [&](lattice_db* sibling) {
-            if (!handed_off && sibling != this &&
-                sibling->config_.is_sync_enabled() &&
-                sibling->config_.websocket_url == config_.websocket_url) {
-                sibling->setup_sync_if_configured();
-                handed_off = true;
-            }
-        });
+    retire_wss_owned(!managed, fire_handoff && !managed);
 }
 
 inline void lattice_db::close() {
@@ -8888,7 +9041,6 @@ inline void lattice_db::close() {
     }
     // 3. Stop all sync threads while all members are still alive — the
     //    retention thread first (it owns no sync state, but it does write).
-    stop_audit_maintenance();
     teardown_sync();
     // 4. Drain the scheduler before unregistering — the xproc callback may
     //    have queued observer work on the scheduler. Must complete while
@@ -8924,8 +9076,7 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
              (void*)this, config_.path.c_str(), (long long)n);
     // close() may have already been called; each step is idempotent.
-    // 0. The retention thread must be joined before any member is torn down.
-    stop_audit_maintenance();
+    // 0. Retention is joined under the sync lifecycle transition below.
     // 1. Mark as dying (idempotent if close() already ran).
     LOG_INFO("lattice_db", "~dtor: setting alive=false, refcount=%d",
              (int)guard_->notify_refcount.load(std::memory_order_seq_cst));
@@ -8967,195 +9118,213 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "~dtor: complete");
 }
 
+inline bool lattice_db::is_sync_agent() const {
+    sync_borrow current(*this);
+    if (!current.admitted()) return false;
+    if (sync_lock_fd_ >= 0) return true;
+    for (const auto& ipc : ipc_synchronizers_) if (ipc.lock_fd >= 0) return true;
+    return false;
+}
+
 inline bool lattice_db::is_sync_connected() const {
-    return synchronizer_ && synchronizer_->is_connected();
+    sync_borrow current(*this);
+    return current && current->is_connected();
 }
 
 inline void lattice_db::sync_now() {
-    if (synchronizer_) {
-        synchronizer_->sync_now();
-    }
+    sync_borrow current(*this, true);
+    if (current) current->sync_now();
 }
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
-    LOG_INFO("lattice_db", "update_sync_filter: %zu entries, wss=%d, ipc_syncs=%zu (db=%s)",
-             filter.size(), synchronizer_ ? 1 : 0, ipc_synchronizers_.size(), config_.path.c_str());
-    if (synchronizer_) {
-        synchronizer_->update_sync_filter(filter);
-    }
+    sync_borrow current(*this, true);
+    if (!current.admitted()) return;
+    config_.sync_filter = filter;
+    if (current) current->update_sync_filter(filter);
     for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
-        // Update the config so lazily-created synchronizers (accept callback
-        // hasn't fired yet) pick up the latest filter.
-        if (i < config_.ipc_targets.size()) {
-            config_.ipc_targets[i].sync_filter = filter;
-        }
-        if (ipc_synchronizers_[i].sync) {
-            ipc_synchronizers_[i].sync->update_sync_filter(filter);
-        }
+        if (i < config_.ipc_targets.size()) config_.ipc_targets[i].sync_filter = filter;
+        if (ipc_synchronizers_[i].sync) ipc_synchronizers_[i].sync->update_sync_filter(filter);
     }
 }
 
 inline void lattice_db::update_sync_filter(const std::string& channel,
-                                           std::vector<sync_filter_entry> filter) {
+                                          std::vector<sync_filter_entry> filter) {
+    sync_borrow current(*this, true);
+    if (!current.admitted()) return;
     if (channel.empty()) {
-        LOG_INFO("lattice_db", "update_sync_filter(wss): %zu entries (db=%s)",
-                 filter.size(), config_.path.c_str());
         config_.sync_filter = filter;
-        if (synchronizer_) {
-            synchronizer_->update_sync_filter(std::move(filter));
-        }
+        if (current) current->update_sync_filter(std::move(filter));
         return;
     }
     for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
         if (config_.ipc_targets[i].channel != channel) continue;
-        LOG_INFO("lattice_db", "update_sync_filter(%s): %zu entries (db=%s)",
-                 channel.c_str(), filter.size(), config_.path.c_str());
-        // Config write first — lazily-created synchronizers (accept callback
-        // hasn't fired yet) read their filter from the config entry.
         config_.ipc_targets[i].sync_filter = filter;
-        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync)
             ipc_synchronizers_[i].sync->update_sync_filter(std::move(filter));
-        }
         return;
     }
-    LOG_ERROR("lattice_db", "update_sync_filter: unknown channel '%s' (db=%s)",
-              channel.c_str(), config_.path.c_str());
 }
 
 inline void lattice_db::clear_sync_filter() {
-    if (synchronizer_) {
-        synchronizer_->clear_sync_filter();
-    }
-    for (auto& ipc : ipc_synchronizers_) {
-        if (ipc.sync) {
-            ipc.sync->clear_sync_filter();
-        }
-    }
+    sync_borrow current(*this, true);
+    if (!current.admitted()) return;
+    config_.sync_filter = std::nullopt;
+    if (current) current->clear_sync_filter();
+    for (auto& ipc : ipc_synchronizers_) if (ipc.sync) ipc.sync->clear_sync_filter();
 }
 
 inline void lattice_db::clear_sync_filter(const std::string& channel) {
+    sync_borrow current(*this, true);
+    if (!current.admitted()) return;
     if (channel.empty()) {
         config_.sync_filter = std::nullopt;
-        if (synchronizer_) synchronizer_->clear_sync_filter();
+        if (current) current->clear_sync_filter();
         return;
     }
     for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
         if (config_.ipc_targets[i].channel != channel) continue;
         config_.ipc_targets[i].sync_filter = std::nullopt;
-        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync)
             ipc_synchronizers_[i].sync->clear_sync_filter();
-        }
         return;
     }
-    LOG_ERROR("lattice_db", "clear_sync_filter: unknown channel '%s' (db=%s)",
-              channel.c_str(), config_.path.c_str());
 }
 
 inline void lattice_db::trigger_sync_upload() {
-    // Dispatch via scheduler instead of calling sync_now() synchronously.
-    // This method is called from the WAL hook; a synchronous sync_now()
-    // would call upload_pending_changes() which sends data over the transport.
-    // The remote ACK can arrive on the receive thread and call
-    // mark_as_synced() → begin_transaction() while we're still inside the
-    // WAL hook, causing "cannot start a transaction within a transaction".
-    if (synchronizer_ && synchronizer_->is_connected()) {
+    // The queued operation borrows again: a pause may retire the owner between
+    // scheduling and execution. No raw synchronizer survives the admission gate.
+    sync_borrow current(*this);
+    if (!current.admitted()) return;
+    if (current && current->is_connected()) {
         scheduler_->invoke([this]() {
-            if (synchronizer_ && synchronizer_->is_connected()) {
-                synchronizer_->sync_now();
-            }
+            sync_borrow owner(*this);
+            if (owner && owner->is_connected()) owner->sync_now();
         });
     }
-    for (auto& ipc : ipc_synchronizers_) {
+    for (size_t index = 0; index < ipc_synchronizers_.size(); ++index) {
+        const auto& ipc = ipc_synchronizers_[index];
         if (ipc.sync && ipc.sync->is_connected()) {
-            scheduler_->invoke([&ipc]() {
-                if (ipc.sync && ipc.sync->is_connected()) {
-                    ipc.sync->sync_now();
-                }
+            scheduler_->invoke([this, index]() {
+                sync_borrow owner(*this);
+                if (!owner.admitted() || index >= ipc_synchronizers_.size()) return;
+                auto& current_ipc = ipc_synchronizers_[index];
+                if (current_ipc.sync && current_ipc.sync->is_connected()) current_ipc.sync->sync_now();
             });
         }
     }
 }
 
 inline void lattice_db::connect_sync() {
-    if (synchronizer_) {
-        synchronizer_->connect();
-    } else if (config_.is_sync_enabled()) {
-        // Lazily create synchronizer if config is set but sync wasn't started
-        setup_sync_if_configured();
+    if (is_closed() || config_.read_only || !config_.is_sync_enabled()) return;
+    const auto generation = current_background_sync_generation();
+    if (generation && (!is_sync_agent() ||
+        get_background_sync_status(generation).phase != synchronizer_base::finite_cycle_phase::inactive)) {
+        // Explicit foreground takeover gives a finite/local-only operation a
+        // fresh owner. A local receipt retries WSS after another owner exits;
+        // its old expiration token can never cancel the successor.
+        if (!suspend_background_sync(generation))
+            throw db_error("sync lifecycle transition is in progress");
     }
+    if (config_.background_sync_managed || generation || background_sync_suspended_.load(std::memory_order_acquire)) {
+        const auto started = resume_background_sync({}, false);
+        if (started.admission != background_sync_admission::already_running) return;
+        sync_borrow current(*this, true);
+        if (current) current->connect();
+        // A local-only foreground receipt must not fall through to ordinary
+        // setup, which would bypass its cancellation token and ownership rules.
+        return;
+    }
+    sync_start_requested_ = true;
+    {
+        sync_borrow current(*this, true);
+        if (!current.admitted()) return;
+        if (current) { current->connect(); return; }
+    }
+    setup_sync_if_configured();
 }
 
 inline void lattice_db::disconnect_sync() {
-    if (synchronizer_) {
-        synchronizer_->disconnect();
-    }
+    sync_borrow current(*this, true);
+    sync_start_requested_ = false;
+    if (current) current->disconnect();
+}
+
+inline void lattice_db::reconnect_sync() {
+    disconnect_sync();
+    connect_sync();
 }
 
 inline void lattice_db::set_on_sync_state_change(std::function<void(bool connected)> handler) {
-    on_sync_state_change_ = std::move(handler);
-    if (synchronizer_) {
-        synchronizer_->set_on_state_change(on_sync_state_change_);
+    auto shared_handler = handler;
+    std::function<void(bool)> retired_shared, retired_ipc;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        retired_shared.swap(sync_lifecycle_->state_handler);
+        sync_lifecycle_->state_handler.swap(shared_handler);
+        ++sync_lifecycle_->state_callback_revision;
     }
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        retired_ipc.swap(on_sync_state_change_);
+        on_sync_state_change_.swap(handler);
+    }
+    replay_sync_state_subscription(sync_lifecycle_);
+    // Retired captures may close/reenter this store. Release both copies only
+    // after leaving every registration lock and completing pointer access.
 }
 
 inline void lattice_db::set_on_sync_error(std::function<void(const std::string& error)> handler) {
-    on_sync_error_ = std::move(handler);
-    if (synchronizer_) {
-        synchronizer_->set_on_error(on_sync_error_);
+    auto shared_handler = handler;
+    std::function<void(const std::string&)> retired_shared, retired_ipc;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        retired_shared.swap(sync_lifecycle_->error_handler);
+        sync_lifecycle_->error_handler.swap(shared_handler);
+    }
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        retired_ipc.swap(on_sync_error_);
+        on_sync_error_.swap(handler);
     }
 }
 
 inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
-    // Walk all instances on the same path — the synchronizer may live on a sibling.
     synchronizer::sync_progress agg;
-    instance_registry::instance().for_each_alive(config_.path,
-        [&agg](lattice_db* sibling) {
-            if (sibling->synchronizer_) {
-                auto p = sibling->synchronizer_->get_progress();
-                agg.pending_upload += p.pending_upload;
-                agg.total_upload += p.total_upload;
-                agg.acked += p.acked;
-                agg.received += p.received;
-            }
-            for (const auto& ipc : sibling->ipc_synchronizers_) {
-                if (ipc.sync) {
-                    auto p = ipc.sync->get_progress();
-                    agg.pending_upload += p.pending_upload;
-                    agg.total_upload += p.total_upload;
-                    agg.acked += p.acked;
-                    agg.received += p.received;
-                }
-            }
-        });
+    instance_registry::instance().for_each_alive(config_.path, [&agg](lattice_db* sibling) {
+        sync_borrow current(*sibling);
+        if (!current.admitted()) return;
+        auto add = [&](const synchronizer::sync_progress& p) {
+            agg.pending_upload += p.pending_upload; agg.total_upload += p.total_upload;
+            agg.acked += p.acked; agg.received += p.received;
+        };
+        if (current) add(current->get_progress());
+        for (const auto& ipc : sibling->ipc_synchronizers_) if (ipc.sync) add(ipc.sync->get_progress());
+    });
     return agg;
 }
 
 inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler handler) {
-    LOG_INFO("lattice_db", "set_on_sync_progress called (this=%p, path=%s, handler=%s)",
-             (void*)this, config_.path.c_str(), handler ? "SET" : "NULL");
-    // Walk all instances on the same path — the synchronizer may live on a sibling.
-    // Lock ipc_callbacks_mutex_ on each sibling to synchronize with the IPC accept
-    // callback, which creates synchronizers on the accept thread.
-    instance_registry::instance().for_each_alive(config_.path,
-        [&handler](lattice_db* sibling) {
+    instance_registry::instance().for_each_alive(config_.path, [&handler](lattice_db* sibling) {
+        auto shared_handler = handler;
+        auto ipc_handler = handler;
+        synchronizer::on_progress_handler retired_shared, retired_ipc;
+        {
+            std::lock_guard<std::mutex> lock(sibling->sync_lifecycle_->mutex);
+            retired_shared.swap(sibling->sync_lifecycle_->progress_handler);
+            sibling->sync_lifecycle_->progress_handler.swap(shared_handler);
+        }
+        // WSS wrappers read the shared registration even during transitions.
+        // IPC retains its existing accept-thread publication and fanout path.
+        {
+            sync_borrow current(*sibling);
             std::lock_guard<std::mutex> lock(sibling->ipc_callbacks_mutex_);
-            sibling->on_sync_progress_ = handler;
-            LOG_INFO("lattice_db", "  visiting sibling=%p, sync=%p, ipc_count=%zu",
-                     (void*)sibling,
-                     sibling->synchronizer_ ? (void*)sibling->synchronizer_.get() : nullptr,
-                     sibling->ipc_synchronizers_.size());
-            if (sibling->synchronizer_) {
-                sibling->synchronizer_->set_on_progress(handler);
-            }
-            for (size_t i = 0; i < sibling->ipc_synchronizers_.size(); ++i) {
-                auto& ipc = sibling->ipc_synchronizers_[i];
-                LOG_INFO("lattice_db", "  ipc[%zu].sync=%p", i,
-                         ipc.sync ? (void*)ipc.sync.get() : nullptr);
-                if (ipc.sync) {
-                    ipc.sync->set_on_progress(handler);
-                }
-            }
-        });
+            retired_ipc.swap(sibling->on_sync_progress_);
+            sibling->on_sync_progress_.swap(ipc_handler);
+            if (current.admitted())
+                for (auto& ipc : sibling->ipc_synchronizers_) if (ipc.sync) ipc.sync->set_on_progress(handler);
+        }
+        // Last-release destructors run after both locks AND the borrow lease.
+    });
 }
 
 // Implementation of managed<std::vector<uint8_t>> methods that need lattice_db

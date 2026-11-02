@@ -161,6 +161,7 @@ private:
     disconnect_fn_ptr disconnect_;
     state_fn_ptr state_;
     send_fn_ptr send_;
+    disconnect_fn_ptr destroy_ = nullptr;
 
     on_open_handler on_open_;
     on_message_handler on_message_;
@@ -182,7 +183,11 @@ public:
     {
     }
 
-    ~generic_sync_transport() = default;
+    // Set only after placing the transport in its final owned location (the
+    // Swift bridge copies a temporary into that location). Disconnect is reusable;
+    // this callback retires/releases the external context exactly at destruction.
+    void set_destroy_callback(disconnect_fn_ptr callback) { destroy_ = callback; }
+    ~generic_sync_transport() override { if (destroy_) destroy_(user_data_); }
 
     void connect(const std::string& url,
                  const std::map<std::string, std::string>& headers = {}) override {

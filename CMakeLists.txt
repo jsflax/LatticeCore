@@ -64,6 +64,7 @@ target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
     Sources/LatticeCore/src/schema.cpp
+    Sources/LatticeCore/src/scheduler.cpp
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp
@@ -192,6 +193,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/StartupSyncRepairTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
+    Tests/LatticeCoreTests/GenericSchedulerLifetimeTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
@@ -246,6 +248,10 @@ add_executable(LatticeAuditedWritesPreparationTests
     Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
     Tests/LatticeCoreTests/AuditHygieneTests.cpp)
 target_link_libraries(LatticeAuditedWritesPreparationTests PRIVATE LatticeCore gtest_main)
+
+# Focused no-history transport tests, using synthetic real-Core stores only.
+add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)
+target_link_libraries(LatticeNoHistoryNullTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp

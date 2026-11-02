@@ -2,6 +2,10 @@
 #ifndef __linux__
 #include <lattice.hpp>          // swift_lattice, swift_lattice_ref
 #include <dynamic_object.hpp>   // dynamic_object, dynamic_object_ref
+#include <fstream>
+#include <memory>
+#include <fcntl.h>
+#include <limits.h>
 
 // ============================================================================
 // Bridge Layer Tests — swift_lattice + dynamic_object (what Swift actually uses)
@@ -460,6 +464,101 @@ TEST(Bridge, ReceiveSyncDataInsert) {
     ASSERT_EQ(results.size(), 1u);
     EXPECT_EQ(results[0].get_string("name"), "Synced Person");
     EXPECT_EQ(int(results[0].get_int("age")), 42);
+}
+
+TEST(Bridge, ReceiveMalformedSyncDataReportsErrorAndNextValidReceiveClearsIt) {
+    TempDB tmp{"bridge_sync_decode_error"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgePerson", {{"name", text_prop("name")}})
+    };
+    lattice::swift_configuration config(tmp.str());
+    std::unique_ptr<lattice::swift_lattice_ref> ref(
+        lattice::swift_lattice_ref::create(config, schemas));
+    ASSERT_NE(ref, nullptr);
+    auto& db = *ref->get();
+
+    lattice::audit_log_entry prefix;
+    prefix.global_id = "must-not-apply-prefix";
+    prefix.table_name = "BridgePerson";
+    prefix.operation = "INSERT";
+    prefix.global_row_id = "must-not-create-prefix-row";
+    prefix.changed_fields = {{"name", lattice::any_property("Uncommitted prefix")}};
+    prefix.changed_fields_names = {"name"};
+    prefix.timestamp = "2026-10-29T00:00:00Z";
+
+    // Parse failures used to be reported as successful empty applies. Include
+    // a valid prefix followed by an invalid entry to prove decoding failure
+    // cannot partially persist a frame before its bad position is discovered.
+    const std::vector<std::string> malformed = {
+        R"({"auditLog":["private-payload-marker")",
+        R"({"auditLog":[{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})",
+        std::string("{\"auditLog\":[") + prefix.to_json() +
+            R"(,{"globalId":"rejected-entry","tableName":"BridgePerson","operation":"INSERT","globalRowId":"rejected-row","changedFields":{},"changedFieldsNames":42}]})"
+    };
+    for (size_t i = 0; i < malformed.size(); ++i) {
+        const auto& wire = malformed[i];
+        const auto applied = db.receive_sync_data(lattice::ByteVector(wire.begin(), wire.end()));
+        EXPECT_TRUE(applied.empty());
+        const auto error = db.last_receive_error();
+        ASSERT_TRUE(error.has_value());
+        EXPECT_NE(error->find("Failed to parse sync data:"), std::string::npos);
+        if (i == 1) EXPECT_NE(error->find("invalid auditLog entry at index 0"), std::string::npos);
+        if (i == 2) EXPECT_NE(error->find("invalid auditLog entry at index 1"), std::string::npos);
+        EXPECT_EQ(error->find("private-payload-marker"), std::string::npos);
+        EXPECT_TRUE(db.objects("BridgePerson").empty());
+        EXPECT_TRUE(db.db().query("SELECT globalId FROM AuditLog").empty());
+    }
+
+    lattice::audit_log_entry entry;
+    entry.global_id = "valid-after-error";
+    entry.table_name = "BridgePerson";
+    entry.operation = "INSERT";
+    entry.global_row_id = "valid-row-after-error";
+    entry.changed_fields = {{"name", lattice::any_property("Recovered")}};
+    entry.changed_fields_names = {"name"};
+    entry.timestamp = "2026-10-29T00:00:00Z";
+    const auto wire = lattice::server_sent_event::make_audit_log({entry}).to_json();
+    const auto applied = db.receive_sync_data(lattice::ByteVector(wire.begin(), wire.end()));
+    EXPECT_EQ(applied, std::vector<std::string>{entry.global_id});
+    EXPECT_FALSE(db.last_receive_error().has_value());
+    auto rows = db.objects("BridgePerson");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].get_string("name"), "Recovered");
+}
+
+TEST(Bridge, ReceiveNackReportsReasonWithoutAcknowledgingLocalEntries) {
+    TempDB tmp{"bridge_sync_nack"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgePerson", {{"name", text_prop("name")}})
+    };
+    lattice::swift_configuration config(tmp.str());
+    std::unique_ptr<lattice::swift_lattice_ref> ref(
+        lattice::swift_lattice_ref::create(config, schemas));
+    ASSERT_NE(ref, nullptr);
+    auto& db = *ref->get();
+    auto sdo = make_sdo("BridgePerson", schemas[0].properties);
+    sdo.values["name"] = std::string("Still pending");
+    lattice::dynamic_object object(sdo);
+    db.add(object);
+    const auto before = db.db().query(
+        "SELECT globalId, isSynchronized FROM AuditLog ORDER BY id");
+    ASSERT_FALSE(before.empty());
+    const auto id = std::get<std::string>(before[0].at("globalId"));
+
+    // Exact Swift wire keys. A NACK must not enter the successful ACK path.
+    const auto wire = std::string(R"({"kind":"nack","nack":[")") + id +
+        R"("],"nackReason":"relay rejected this upload"})";
+    EXPECT_TRUE(db.receive_sync_data(lattice::ByteVector(wire.begin(), wire.end())).empty());
+    const auto error = db.last_receive_error();
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(*error, "Sync upload rejected: relay rejected this upload");
+    EXPECT_EQ(db.db().query("SELECT globalId, isSynchronized FROM AuditLog ORDER BY id"), before);
+
+    // A legitimate empty ACK remains a successful bookkeeping message and
+    // clears the preceding per-call receive error.
+    const std::string ack = R"({"kind":"ack","ack":[]})";
+    EXPECT_TRUE(db.receive_sync_data(lattice::ByteVector(ack.begin(), ack.end())).empty());
+    EXPECT_FALSE(db.last_receive_error().has_value());
 }
 
 TEST(Bridge, ReceiveSyncDataWithBlob) {
@@ -1093,6 +1192,99 @@ lattice::property_descriptor nullable_text_prop(const std::string& name) {
 }
 }  // namespace
 
+// Include hydration and cache admission in the statement budget. The old
+// tests began counting only AFTER enable_row_cache's per-row refetch.
+TEST(Bridge, RowCacheBatchHydrationUsesFetchedValues) {
+    TempDB tmp{"rowcache_batch"};
+    lattice::SchemaVector schemas = {make_schema("RcBatch", {
+        {"name", text_prop("name")}, {"age", int_prop("age")},
+        {"email", nullable_text_prop("email")},
+    })};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int64_t i = 0; i < 128; ++i) {
+        auto sdo = make_sdo("RcBatch", schemas[0].properties);
+        sdo.values["name"] = std::string("row-") + std::to_string(i);
+        sdo.values["age"] = i;
+        sdo.values["email"] = nullptr;
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    (void)db.objects("RcBatch"); // Open the reader/schema cache before budgeting.
+    const auto before = lattice::database::thread_statement_count();
+    auto rows = db.objects("RcBatch", std::nullopt, std::string("age ASC"));
+    ASSERT_EQ(rows.size(), 128u);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        ASSERT_TRUE(rows[i].source.values.contains("globalId"));
+        ASSERT_TRUE(rows[i].source.values.contains("email"));
+        EXPECT_FALSE(rows[i].source.values.contains("id"));
+        lattice::dynamic_object cached(rows[i]);
+        cached.enable_row_cache();
+        EXPECT_EQ(cached.get_int("id"), rows[i].id());
+        EXPECT_EQ(cached.get_string("globalId"), rows[i].global_id());
+        EXPECT_EQ(cached.get_string("name"), "row-" + std::to_string(i));
+        EXPECT_EQ(cached.get_int("age"), static_cast<int64_t>(i));
+        EXPECT_FALSE(cached.has_value("email"));
+    }
+    EXPECT_EQ(lattice::database::thread_statement_count() - before, 1u)
+        << "one row query must serve all scalar hydration and materialization";
+    delete ref;
+}
+
+TEST(Bridge, RowCacheRetainsGenerationValuesBeforeMaterialization) {
+    TempDB tmp{"rowcache_generation"};
+    lattice::SchemaVector schemas = {make_schema("RcGeneration", {
+        {"name", text_prop("name")}, {"age", int_prop("age")},
+    })};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    auto sdo = make_sdo("RcGeneration", schemas[0].properties);
+    sdo.values["name"] = std::string("before"); sdo.values["age"] = int64_t(1);
+    { lattice::dynamic_object obj(sdo); db.add(obj); }
+    const auto generation = ref->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    auto rows = ref->objects_at(generation, "RcGeneration");
+    ASSERT_FALSE(ref->last_generation_read_stale());
+    ASSERT_EQ(rows.size(), 1u);
+    db.db().execute("UPDATE RcGeneration SET name = 'after', age = 2");
+    const auto before = lattice::database::thread_statement_count();
+    lattice::dynamic_object cached(rows[0]);
+    cached.enable_row_cache();
+    EXPECT_EQ(cached.get_string("name"), "before");
+    EXPECT_EQ(cached.get_int("age"), 1);
+    EXPECT_EQ(lattice::database::thread_statement_count() - before, 0u);
+    lattice::dynamic_object live(rows[0]);
+    EXPECT_EQ(live.get_string("name"), "after") << "ordinary handles remain live";
+    cached.refresh_row_cache();
+    EXPECT_EQ(cached.get_int("age"), 2);
+    ref->release_read_generation(generation);
+    delete ref;
+}
+
+TEST(Bridge, RowCacheBatchQueryFailuresRemainDistinguishableFromEmpty) {
+    TempDB tmp{"rowcache_failure"};
+    lattice::SchemaVector schemas = {make_schema("RcFailure", {{"name", text_prop("name")}})};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    auto failed = db.objects("RcFailure", std::string("no_such_column = 1"));
+    EXPECT_TRUE(failed.empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    auto empty = db.objects("RcFailure");
+    EXPECT_TRUE(empty.empty());
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+    const auto generation = ref->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    EXPECT_TRUE(ref->objects_at(generation, "RcFailure", std::string("no_such_column = 1")).empty());
+    EXPECT_TRUE(ref->last_generation_read_stale());
+    EXPECT_TRUE(ref->objects_at(generation, "RcFailure").empty());
+    EXPECT_FALSE(ref->last_generation_read_stale());
+    ref->release_read_generation(generation);
+    delete ref;
+}
+
 TEST(Bridge, RowCacheMaterializedReads) {
     TempDB tmp{"rowcache"};
     lattice::SchemaVector schemas = {
@@ -1289,6 +1481,95 @@ TEST(BridgeTuning, CreateUncachedNeverAliasesParent) {
     auto clone = lattice::detail::LatticeCache::instance().create_uncached(cfg, lattice::SchemaVector{});
     EXPECT_NE(parent.get(), clone.get())
         << "query-clone must be a distinct instance even with an identical config";
+}
+
+TEST(BridgeDynamicOpen, MissingFileReportsErrorThenValidOpenRecovers) {
+    TempDB tmp{"bridge_dynamic_checked"};
+    lattice::swift_configuration cfg(tmp.str());
+    lattice::cxx_error error(std::runtime_error("previous failure"));
+
+    std::unique_ptr<lattice::swift_lattice_ref> missing;
+    ASSERT_NO_THROW(missing.reset(lattice::swift_lattice_ref::create_dynamic(cfg, error)));
+    ASSERT_NE(missing, nullptr);
+    EXPECT_FALSE(missing->valid());
+    EXPECT_FALSE(error.msg.empty());
+    EXPECT_NE(error.msg, "previous failure");
+    EXPECT_FALSE(std::filesystem::exists(tmp.path)) << "dynamic open must not create a missing file";
+
+    const lattice::SchemaVector schemas = {
+        make_schema("CheckedDynamicRow", {{"amount", int_prop("amount")}})
+    };
+    std::unique_ptr<lattice::swift_lattice_ref> writer(
+        lattice::swift_lattice_ref::create(cfg, schemas));
+    auto row = make_sdo("CheckedDynamicRow", schemas[0].properties);
+    row.values["amount"] = int64_t(19);
+    lattice::dynamic_object object(row);
+    writer->get()->add(object);
+    const auto audit_before = writer->get()->count("AuditLog");
+
+    std::unique_ptr<lattice::swift_lattice_ref> reader;
+    ASSERT_NO_THROW(reader.reset(lattice::swift_lattice_ref::create_dynamic(cfg, error)));
+    ASSERT_NE(reader, nullptr);
+    ASSERT_TRUE(error.name.empty() && error.msg.empty());
+    ASSERT_TRUE(reader->valid());
+    EXPECT_EQ(reader->get()->count("CheckedDynamicRow"), 1u);
+    EXPECT_NE(reader->get(), writer->get());
+    EXPECT_EQ(lattice::detail::LatticeCache::instance().get_by_pointer(reader->get()).get(), reader->get());
+
+    std::unique_ptr<lattice::swift_lattice_ref> second(
+        lattice::swift_lattice_ref::create_dynamic(cfg, error));
+    ASSERT_TRUE(error.name.empty() && error.msg.empty());
+    ASSERT_NE(second, nullptr);
+    ASSERT_TRUE(second->valid());
+    EXPECT_NE(second->get(), reader->get()) << "dynamic opens must remain independent";
+    EXPECT_THROW(reader->get()->db().execute("UPDATE CheckedDynamicRow SET amount=20"), lattice::db_error);
+    EXPECT_EQ(writer->get()->count("AuditLog"), audit_before);
+    reader->get()->close();
+    EXPECT_EQ(second->get()->count("CheckedDynamicRow"), 1u);
+    EXPECT_EQ(writer->get()->count("CheckedDynamicRow"), 1u);
+}
+
+TEST(BridgeDynamicOpen, InvalidDatabaseReportsErrorWithoutChangingItsBytes) {
+    TempDB tmp{"bridge_dynamic_invalid"};
+    const std::string content = "This is not a SQLite database.\n";
+    {
+        std::ofstream output(tmp.path, std::ios::binary);
+        ASSERT_TRUE(output);
+        output << content;
+    }
+    // Count only this unique fixture's descriptors: unrelated process activity
+    // cannot turn a leaked SQLite connection into a passing total-FD comparison.
+    const auto expected_path = std::filesystem::canonical(tmp.path);
+    const auto open_handles = [&] {
+        size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator("/dev/fd")) {
+            const auto fd = std::stoi(entry.path().filename().string());
+            char path[PATH_MAX];
+            if (fcntl(fd, F_GETPATH, path) == 0 && std::filesystem::path(path) == expected_path) ++count;
+        }
+        return count;
+    };
+    const auto before = open_handles();
+    {
+        std::ifstream oracle(tmp.path, std::ios::binary);
+        ASSERT_TRUE(oracle);
+        ASSERT_EQ(open_handles(), before + 1) << "descriptor oracle must observe this exact fixture";
+    }
+    ASSERT_EQ(open_handles(), before);
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        lattice::cxx_error error(std::runtime_error("previous failure"));
+        std::unique_ptr<lattice::swift_lattice_ref> invalid;
+        ASSERT_NO_THROW(invalid.reset(lattice::swift_lattice_ref::create_dynamic(
+            lattice::swift_configuration(tmp.str()), error)));
+        ASSERT_NE(invalid, nullptr);
+        EXPECT_FALSE(invalid->valid());
+        EXPECT_FALSE(error.msg.empty());
+        EXPECT_NE(error.msg, "previous failure");
+        EXPECT_EQ(open_handles(), before) << "failed open leaked a descriptor on attempt " << attempt;
+    }
+    std::ifstream input(tmp.path, std::ios::binary);
+    const std::string after((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(after, content);
 }
 
 // ============================================================================

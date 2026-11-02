@@ -130,6 +130,156 @@ TEST(Schema, LinkCreatesJunction) {
     EXPECT_EQ(tables.size(), 1u);
 }
 
+namespace {
+constexpr const char* reverse_link_index = "idx__ReverseNode_ReverseNode_parent_rhs_lhs";
+struct ReverseLinkNodeTag {};
+
+void register_reverse_link_schema() {
+    // Supply the target table explicitly, as Swift/C ABI schema registration does.
+    // The older native LATTICE_SCHEMA pointer helper leaves target_table empty.
+    lattice::model_schema schema;
+    schema.table_name = "ReverseNode";
+    lattice::property_descriptor parent;
+    parent.name = "parent"; parent.kind = lattice::property_kind::link;
+    parent.type = lattice::column_type::integer; parent.nullable = true;
+    parent.target_table = "ReverseNode";
+    schema.properties.push_back(parent);
+    lattice::schema_registry::instance().register_model(typeid(ReverseLinkNodeTag), std::move(schema));
+}
+
+// Reproduce the released epoch-6 fingerprint, rather than deleting all markers:
+// an old cookie-valid marker must not skip the new index migration on reopen.
+struct LegacyLinkFingerprint : lattice::lattice_db {
+    static std::string key() {
+        std::ostringstream out;
+        out << "epoch:6\ntarget_schema_version:1\n";
+        auto schemas = lattice::schema_registry::instance().all_schemas();
+        std::sort(schemas.begin(), schemas.end(), [](const auto* a, const auto* b) {
+            return a->table_name < b->table_name;
+        });
+        for (const auto* schema : schemas) {
+            out << "table:" << schema->table_name << '\n';
+            for (const auto& prop : schema->properties) serialize_property_for_fingerprint(out, prop);
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
+        return "schema_fingerprint:" + hex.str();
+    }
+};
+
+void make_legacy_link_store(const std::string& path) {
+    register_reverse_link_schema();
+    {
+        lattice::lattice_db db(path);
+        db.db().execute("INSERT INTO ReverseNode(globalId) VALUES('parent'),('child')");
+        db.db().execute("INSERT INTO _ReverseNode_ReverseNode_parent(lhs,rhs,globalId) "
+                        "VALUES('child','parent','link')");
+    }
+    // Stamp after the normal close's possible PRAGMA optimize DDL, so the old
+    // marker really matches the cookie at the next open.
+    lattice::database raw(path);
+    raw.execute(std::string("DROP INDEX ") + reverse_link_index);
+    raw.execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%'");
+    auto cookie = raw.query("PRAGMA schema_version");
+    raw.execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)",
+                {LegacyLinkFingerprint::key(), std::to_string(std::get<int64_t>(cookie[0].at("schema_version")))});
+}
+} // namespace
+
+TEST(Schema, ReverseLinkLookupUsesCoveringIndex) {
+    register_reverse_link_schema();
+    lattice::lattice_db db;
+    const auto info = db.db().query(std::string("PRAGMA index_info('") + reverse_link_index + "')");
+    ASSERT_EQ(info.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(info[0].at("name")), "rhs");
+    EXPECT_EQ(std::get<std::string>(info[1].at("name")), "lhs");
+    const auto plan = db.db().query("EXPLAIN QUERY PLAN SELECT lhs FROM _ReverseNode_ReverseNode_parent WHERE rhs = ?",
+                                    {std::string("target")});
+    ASSERT_EQ(plan.size(), 1u);
+    const auto detail = std::get<std::string>(plan[0].at("detail"));
+    EXPECT_NE(detail.find("SEARCH"), std::string::npos);
+    EXPECT_NE(detail.find("COVERING INDEX"), std::string::npos);
+    EXPECT_NE(detail.find(reverse_link_index), std::string::npos);
+}
+
+TEST(Schema, LegacyReverseLinkIndexMigratesWithoutChangingRows) {
+    TempDB tmp{"reverse_link_upgrade"};
+    make_legacy_link_store(tmp.str());
+    lattice::database observer(tmp.str(), lattice::database::open_mode::read_only);
+    const auto marker = observer.query("SELECT value FROM _lattice_meta WHERE key = ?", {LegacyLinkFingerprint::key()});
+    const auto cookie = observer.query("PRAGMA schema_version");
+    ASSERT_EQ(marker.size(), 1u);
+    ASSERT_EQ(std::get<std::string>(marker[0].at("value")),
+              std::to_string(std::get<int64_t>(cookie[0].at("schema_version"))));
+    const auto links = observer.query("SELECT * FROM _ReverseNode_ReverseNode_parent ORDER BY globalId");
+    const auto audits = observer.query("SELECT * FROM AuditLog ORDER BY id");
+    {
+        lattice::lattice_db db(tmp.str());
+        EXPECT_EQ(db.db().query("SELECT * FROM _ReverseNode_ReverseNode_parent ORDER BY globalId"), links);
+        EXPECT_EQ(db.db().query("SELECT * FROM AuditLog ORDER BY id"), audits);
+        EXPECT_EQ(db.db().query(std::string("PRAGMA index_info('") + reverse_link_index + "')").size(), 2u);
+    }
+    // Repeat-open must return to the existing write-free schema fast path.
+    const auto version = observer.query("PRAGMA data_version");
+    {
+        lattice::lattice_db db(tmp.str());
+        EXPECT_EQ(sqlite3_total_changes(db.db().handle()), 0);
+        EXPECT_EQ(observer.query("PRAGMA data_version"), version);
+    }
+}
+
+TEST(Schema, ReadOnlyLegacyLinksDoNotAttemptIndexMigration) {
+    TempDB tmp{"reverse_link_readonly"};
+    make_legacy_link_store(tmp.str());
+    lattice::database observer(tmp.str(), lattice::database::open_mode::read_only);
+    const auto schema = observer.query("SELECT * FROM sqlite_master ORDER BY name");
+    lattice::configuration config;
+    config.path = tmp.str(); config.read_only = true;
+    {
+        lattice::lattice_db db(config);
+        EXPECT_EQ(db.db().query("SELECT lhs FROM _ReverseNode_ReverseNode_parent").size(), 1u);
+        EXPECT_EQ(db.db().query(std::string("PRAGMA index_info('") + reverse_link_index + "')").size(), 0u);
+    }
+    EXPECT_EQ(observer.query("SELECT * FROM sqlite_master ORDER BY name"), schema);
+}
+
+TEST(Schema, ReverseLinkIndexPreservesResultsWithBoundedQueryWork) {
+    register_reverse_link_schema();
+    lattice::lattice_db db;
+    db.db().execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2048) "
+                    "INSERT INTO ReverseNode(globalId) SELECT 'node-'||x FROM n");
+    db.db().execute("INSERT INTO _ReverseNode_ReverseNode_parent(lhs,rhs,globalId) "
+                    "SELECT globalId, CASE WHEN globalId='node-2048' THEN 'node-1' ELSE 'node-2' END, "
+                    "'link-'||globalId FROM ReverseNode");
+    db.db().execute("DROP INDEX idx__ReverseNode_ReverseNode_parent_rhs_lhs");
+    const char* sql = "SELECT globalId FROM ReverseNode WHERE globalId IN "
+        "(SELECT lhs FROM _ReverseNode_ReverseNode_parent WHERE rhs IN "
+        "(SELECT globalId FROM ReverseNode WHERE globalId = 'node-1')) ORDER BY globalId";
+    struct Read { std::vector<std::string> rows; int steps; int scans; };
+    auto read = [&]() -> Read {
+        sqlite3_stmt* statement = nullptr;
+        if (sqlite3_prepare_v2(db.db().handle(), sql, -1, &statement, nullptr) != SQLITE_OK)
+            throw std::runtime_error(sqlite3_errmsg(db.db().handle()));
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> owned(statement, sqlite3_finalize);
+        Read result{};
+        int status;
+        while ((status = sqlite3_step(statement)) == SQLITE_ROW)
+            result.rows.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(statement, 0)));
+        if (status != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db.db().handle()));
+        result.steps = sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 0);
+        result.scans = sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_FULLSCAN_STEP, 0);
+        return result;
+    };
+    const auto before = read();
+    db.ensure_link_table("_ReverseNode_ReverseNode_parent", "ReverseNode", "ReverseNode");
+    const auto after = read();
+    EXPECT_EQ(before.rows, (std::vector<std::string>{"node-2048"}));
+    EXPECT_EQ(after.rows, before.rows);
+    EXPECT_GE(before.scans, 2047);
+    EXPECT_EQ(after.scans, 0);
+    EXPECT_LT(after.steps * 10, before.steps);
+}
+
 TEST(Schema, GeoCreatesRTree) {
     lattice::lattice_db db;
     db.add(TestPlace{"Test", lattice::geo_bounds::point(0, 0)});

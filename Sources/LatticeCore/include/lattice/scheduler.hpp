@@ -154,102 +154,80 @@ using SharedScheduler = std::shared_ptr<scheduler>;
 
 #ifndef __EMSCRIPTEN__
 class std_thread_scheduler : public scheduler {
+    struct loop_state {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::queue<std::function<void()>> queue;
+        std::atomic<bool> running{true};
+        bool exited=false;
+    };
 public:
     static std::atomic<int64_t>& alive_count() {
-        static std::atomic<int64_t> count{0};
-        return count;
+        static std::atomic<int64_t> count{0};return count;
     }
-
-    std_thread_scheduler() : running_(true) {
-        auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
-        worker_ = std::thread([this] { run_loop(); });
-        thread_id_ = worker_.get_id();
-        LOG_INFO("scheduler", "std_thread_scheduler CREATED (this=%p, alive=%lld)", (void*)this, (long long)n);
+    std_thread_scheduler():state_(std::make_shared<loop_state>()) {
+        worker_=std::thread([state=state_] {run_loop(std::move(state));});
+        thread_id_=worker_.get_id();
+        auto n=alive_count().fetch_add(1,std::memory_order_relaxed)+1;
+        LOG_INFO("scheduler","std_thread_scheduler CREATED (this=%p, alive=%lld)",(void*)this,(long long)n);
     }
-
     ~std_thread_scheduler() override {
-        shutdown();
-        auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
-        LOG_INFO("scheduler", "std_thread_scheduler DESTROYED (this=%p, alive=%lld)", (void*)this, (long long)n);
+        shutdown();auto n=alive_count().fetch_sub(1,std::memory_order_relaxed)-1;
+        LOG_INFO("scheduler","std_thread_scheduler DESTROYED (this=%p, alive=%lld)",(void*)this,(long long)n);
     }
-
     void shutdown() override {
+        const auto state=state_;
+        {std::lock_guard<std::mutex> lock(state->mutex);state->running=false;}
+        state->cv.notify_all();
+        const bool on_worker=std::this_thread::get_id()==thread_id_;
+        std::thread joining;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!running_) return;  // already shut down
-            running_ = false;
-        }
-        cv_.notify_one();
-        // Self-join guard: shutdown() can be reached from a task running ON
-        // the worker (an observer callback releasing the last lattice
-        // reference → ~lattice_db → scheduler shutdown). join(self) throws
-        // resource_deadlock_would_occur; detach instead — running_ is false,
-        // so the loop exits after the current task.
-        if (worker_.joinable()) {
-            if (std::this_thread::get_id() == worker_.get_id()) {
-                worker_.detach();
-            } else {
-                worker_.join();
+            std::lock_guard<std::mutex> lock(worker_mutex_);
+            if(worker_.joinable()) {
+                if(on_worker) worker_.detach();
+                else joining=std::move(worker_);
             }
         }
-    }
-
-    void invoke(std::function<void()>&& fn) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!running_) return;
-            queue_.push(std::move(fn));
+        // Never hold worker_mutex_ during join: a currently executing task may itself close
+        // its owner. The shared state outlives this scheduler if the last release is on-worker.
+        if(joining.joinable()) joining.join();
+        else if(!on_worker) {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock,[&] {return state->exited;});
         }
-        cv_.notify_one();
     }
-
-    [[nodiscard]] bool is_on_thread() const noexcept override {
-        return std::this_thread::get_id() == thread_id_;
+    void invoke(std::function<void()>&& fn) override {
+        const auto state=state_;
+        {std::lock_guard<std::mutex> lock(state->mutex);if(!state->running) return;state->queue.push(std::move(fn));}
+        state->cv.notify_one();
     }
-
+    [[nodiscard]] bool is_on_thread() const noexcept override {return std::this_thread::get_id()==thread_id_;}
     [[nodiscard]] bool is_same_as(const scheduler* other) const noexcept override {
-        auto* g = dynamic_cast<const std_thread_scheduler*>(other);
-        return g && g->thread_id_ == thread_id_;
+        const auto* value=dynamic_cast<const std_thread_scheduler*>(other);
+        return value && value->state_==state_;
     }
-
-    [[nodiscard]] bool can_invoke() const noexcept override {
-        return running_;
-    }
-
+    [[nodiscard]] bool can_invoke() const noexcept override {return state_->running;}
 private:
-    void run_loop() {
-        while (true) {
+    static void run_loop(std::shared_ptr<loop_state> state) {
+        for(;;) {
             std::function<void()> fn;
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
-
-                if (!running_ && queue_.empty()) {
-                    return;
-                }
-
-                fn = std::move(queue_.front());
-                queue_.pop();
+                std::unique_lock<std::mutex> lock(state->mutex);
+                state->cv.wait(lock,[&] {return !state->queue.empty() || !state->running;});
+                if(!state->running && state->queue.empty()) {state->exited=true;state->cv.notify_all();return;}
+                fn=std::move(state->queue.front());state->queue.pop();
             }
-
-            if (fn) {
-                try {
-                    fn();
-                } catch (const std::exception& e) {
-                    LOG_ERROR("scheduler", "Work item threw exception: %s", e.what());
-                } catch (...) {
-                    LOG_ERROR("scheduler", "Work item threw unknown exception");
-                }
+            if(fn) {
+                try {fn();}
+                catch(const std::exception& error) {LOG_ERROR("scheduler","Work item threw exception: %s",error.what());}
+                catch(...) {LOG_ERROR("scheduler","Work item threw unknown exception");}
             }
         }
     }
-
+    const std::shared_ptr<loop_state> state_;
     std::thread worker_;
     std::thread::id thread_id_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::queue<std::function<void()>> queue_;
-    std::atomic<bool> running_;
+    std::mutex worker_mutex_;
 };
 #endif // !__EMSCRIPTEN__
 

@@ -10,6 +10,8 @@
 #include "cross_process_notifier.hpp"
 #include "sync.hpp"  // for sync_filter_entry (used by configuration)
 #include "ipc.hpp"   // for ipc_endpoint (used by setup_ipc)
+#include "ipc_publication.hpp"
+#include "sync_storage.hpp"
 #include <vector>
 #include <list>
 #include <memory>
@@ -93,15 +95,33 @@ struct instance_guard {
     /// yield spin in ~lattice_db during the test suite). A callback that
     /// triggers destruction must not touch the lattice afterwards — which is
     /// inherently true for deinit-triggered teardown.
-    // Keep the TLS accessor out of line. Combined-object builds may localize
-    // hidden inline TLS independently in Core, bridge, and caller objects;
-    // destruction must read the same map that callback admission increments.
-    static std::unordered_map<const instance_guard*, int>& tls_depths();
-    static int tls_depth(const instance_guard* g) {
-        auto& m = tls_depths();
-        auto it = m.find(g);
-        return it == m.end() ? 0 : it->second;
+    struct callback_frame {
+        instance_guard* guard;
+        callback_frame* previous;
+    };
+    // Keep one out-of-line, trivially destructible TLS head across Core,
+    // bridge and callers. Swift/Foundation pthread-key destructors can close
+    // a store AFTER C++ TLS destructors; a TLS container is already dead then.
+    // Frames live only on the active callback stack: no per-thread heap leak.
+    static callback_frame*& tls_frames() noexcept;
+    static int tls_depth(const instance_guard* g) noexcept {
+        int depth = 0;
+        for (auto* frame = tls_frames(); frame; frame = frame->previous)
+            if (frame->guard == g) ++depth;
+        return depth;
     }
+    struct callback_hold {
+        callback_frame frame;
+        explicit callback_hold(instance_guard* g) noexcept : frame{g, tls_frames()} {
+            tls_frames() = &frame;
+        }
+        callback_hold(const callback_hold&) = delete;
+        callback_hold& operator=(const callback_hold&) = delete;
+        ~callback_hold() {
+            tls_frames() = frame.previous;
+            frame.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+        }
+    };
 };
 
 class instance_registry {
@@ -164,17 +184,7 @@ public:
             // RAII: an observer exception now legally unwinds through here to
             // the writer (docs/design-deferred-memory-delivery.md) — a leaked
             // refcount would wedge the instance's destructor drain-wait.
-            auto* g = e.guard.get();
-            struct hold_release {
-                instance_guard* g;
-                ~hold_release() {
-                    auto& depths = instance_guard::tls_depths();
-                    if (--depths[g] == 0) depths.erase(g);
-                    g->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
-                }
-            };
-            ++instance_guard::tls_depths()[g];
-            hold_release release{g};
+            instance_guard::callback_hold release{e.guard.get()};
             fn(e.ptr);
         }
     }
@@ -503,6 +513,10 @@ struct configuration {
     /// If the database is at a lower version, migrations will run.
     /// If the database is at a higher version, an error is thrown.
     int32_t target_schema_version = 1;
+
+    /// Zero preserves normal schema setup. Positive values require this exact existing version;
+    /// no creation, migration, schema repair or automatic open/close maintenance is permitted.
+    int32_t required_existing_schema_version = 0;
 
     /// Migration block. Called when schema changes are detected, BEFORE auto-migration.
     /// This allows you to transform data before columns are removed or types change.
@@ -851,6 +865,18 @@ private:
 // Main database interface
 // ============================================================================
 
+struct audit_cursor {
+    int64_t head = 0;
+    std::string head_global_id;
+    int64_t floor = 0;
+};
+
+struct audit_read_fence {
+    audit_cursor cursor;
+    bool has_history_generation = false;
+    std::string history_generation;
+};
+
 class lattice_db {
 public:
     // Construct with path (uses default scheduler, no sync)
@@ -903,14 +929,30 @@ public:
         return config.path;
     }
 
+    static database::open_mode configured_open_mode(const configuration& config) {
+        if (config.required_existing_schema_version < 0)
+            throw db_error("Required existing schema version must be positive");
+        if (config.required_existing_schema_version != 0 && config.is_in_memory())
+            throw db_error("Required existing schema needs an existing file");
+        if (config.required_existing_schema_version != 0 &&
+            config.required_existing_schema_version != config.target_schema_version)
+            throw db_error("Required existing schema version conflicts with target version");
+        if (config.required_existing_schema_version != 0 &&
+            (!config.websocket_url.empty() || config.is_ipc_enabled()))
+            throw db_error("Existing schema handles do not own sync transports");
+        if (config.read_only) return database::open_mode::read_only;
+        return config.required_existing_schema_version != 0
+            ? database::open_mode::read_write_existing : database::open_mode::read_write;
+    }
+
     explicit lattice_db(const configuration& config, bool defer_sync = false)
         : config_(validate_background_sync_configuration(config))
         , db_(std::make_shared<database>(resolve_path(config),
-              config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
+              configured_open_mode(config),
               config.busy_timeout_ms, config.private_sync_cancellation))
-        , read_db_(config.read_only ? nullptr :
+        , read_db_(config.read_only || config.required_existing_schema_version != 0 ? nullptr :
                    (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, config.private_sync_cancellation) : nullptr))
-        , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
+        , xproc_read_db_(!config.is_in_memory() && !config.read_only && config.required_existing_schema_version == 0 ?
                          std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, config.private_sync_cancellation) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
@@ -920,17 +962,40 @@ public:
         background_sync_suspended_ = config.background_sync_managed;
         audit_maintenance_cancellable_ = config.background_sync_managed;
         setup_store_write_gate();
+        // Strict admission runs before ensure_tables, repair, hooks, registration or maintenance.
+        // Every query uses THIS opened connection, never a path probe or a stale read generation.
+        if (config.required_existing_schema_version != 0) {
+            db_->execute(config.read_only ? "BEGIN" : "BEGIN IMMEDIATE");
+            try {
+                require_existing_schema_in_transaction();
+                require_existing_fingerprint_in_transaction(compute_core_fingerprint_key());
+                if (!config.read_only) {
+                    register_sql_functions();
+                    note_tables_for_all_schemas();
+                }
+                if (defer_sync) strict_admission_pending_ = true;
+                else db_->execute("COMMIT");
+            } catch (...) {
+                try { db_->execute("ROLLBACK"); } catch (...) {}
+                throw;
+            }
+        }
         auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
         LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
                  (void*)this, config.path.c_str(), config.is_ipc_enabled() ? 1 : 0,
                  config.is_sync_enabled() ? 1 : 0, (long long)n);
         LOG_DEBUG("lattice_db", "ctor start path=%s read_only=%d", config.path.c_str(), config.read_only);
+        // The Swift constructor completes its fingerprint check under THIS transaction before
+        // publishing hooks, instance registration or any lifecycle work.
+        if (strict_admission_pending_) return;
+        if (config.required_existing_schema_version != 0) strict_admission_complete_ = true;
         if (!config.read_only) {
             LOG_DEBUG("lattice_db", "ensure_tables");
-            ensure_tables();
+            if (config.required_existing_schema_version == 0) ensure_tables();
             // The deferred WSS path exposes local rows before sync-only repair.
             // IPC still starts at open and therefore still needs this repair.
-            if ((config.sync_autostart && !config.background_sync_managed) || config.is_ipc_enabled())
+            if (config.required_existing_schema_version == 0 &&
+                ((config.sync_autostart && !config.background_sync_managed) || config.is_ipc_enabled()))
                 heal_collapsed_sync_state();
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
@@ -946,7 +1011,7 @@ public:
         adopt_path_wal_eviction_threshold();
         LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
         setup_cross_process_notifier();
-        start_audit_maintenance();   // no-op unless audit_retention_seconds > 0
+        if (config.required_existing_schema_version == 0) start_audit_maintenance();
         LOG_DEBUG("lattice_db", "ctor done");
     }
 
@@ -2509,6 +2574,7 @@ public:
         }
         if (closed_.load(std::memory_order_seq_cst) ||
             (config_.background_sync_managed && background_sync_suspended_.load(std::memory_order_acquire))) return 0;
+        if (config_.required_existing_schema_version != 0) return 0;
         if (config_.is_in_memory()) return 0;  // §4.1: NO keepers (covers named shared-cache memory)
         run_pending_wal_eviction_if_any(/*checkpoint_busy_budget_ms=*/0);
 
@@ -2991,6 +3057,7 @@ private:
     /// leave the request pending even when no later write re-flags it.
     void run_pending_wal_eviction_if_any(int checkpoint_busy_budget_ms = 250) {
 #ifndef __EMSCRIPTEN__
+        if (config_.required_existing_schema_version != 0) return;
         if (config_.is_in_memory()) return;
         bool pending = false;
         instance_registry::instance().for_each_alive(config_.path,
@@ -3314,16 +3381,17 @@ public:
         return rows;
     }
 
+
+
     /// The persisted store version on the current read/transaction route.
     /// Unlike migration bootstrap, a missing or invalid value is an error:
     /// read-only consumers must never infer compatibility from a fallback.
-    int32_t stored_schema_version() {
-        auto connection = borrow_read_connection();
-        if (is_closed() || connection->is_closed())
-            throw db_error("Stored schema version connection is closed");
-        const auto rows = connection->query(
-            "SELECT value FROM _lattice_meta WHERE key = 'schema_version' LIMIT 2");
-        if (is_closed() || connection->is_closed())
+    static int32_t read_stored_schema_version(database& connection) {
+        if (connection.is_closed()) throw db_error("Stored schema version connection is closed");
+        const auto rows = connection.query(
+            "SELECT CASE WHEN typeof(value) = 'text' AND length(value) BETWEEN 1 AND 10 "
+            "THEN value ELSE NULL END AS value FROM main._lattice_meta WHERE key = 'schema_version' LIMIT 2");
+        if (connection.is_closed())
             throw db_error("Stored schema version connection is closed");
         if (rows.size() != 1)
             throw db_error("Missing or ambiguous stored schema version");
@@ -3341,6 +3409,184 @@ public:
         }
         if (value <= 0) throw db_error("Stored schema version must be positive");
         return value;
+    }
+
+    int32_t stored_schema_version() {
+        auto connection = borrow_read_connection();
+        if (is_closed()) throw db_error("Stored schema version connection is closed");
+        const auto version = read_stored_schema_version(*connection);
+        if (is_closed()) throw db_error("Stored schema version connection is closed");
+        return version;
+    }
+
+    /// Check the primary connection that owns this lattice's writes, not a
+    /// separately opened read/keeper connection. Publication locks never cover
+    /// SQLite, final shared-owner destruction or application callbacks.
+    void require_main_file_unmoved(const std::string& expected_path) {
+        std::shared_ptr<database> primary;
+        uint64_t revision;
+        {
+            std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+            if (is_closed() || !db_) throw db_error("Main file primary connection is unavailable");
+            primary = db_; revision = connection_revision_;
+        }
+        primary->require_main_file_unmoved(expected_path);
+        {
+            std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+            if (is_closed() || primary->is_closed() || db_ != primary || connection_revision_ != revision)
+                throw db_error("Main file primary connection changed during currentness check");
+        }
+    }
+
+    /// One SQL snapshot, three bounded scalars. Never select changedFields or hydrate an audit row.
+    audit_cursor read_audit_cursor() {
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed()) throw db_error("Audit cursor connection is closed");
+        const auto rows = connection->query(
+            "SELECT COALESCE((SELECT id FROM main.AuditLog ORDER BY id DESC LIMIT 1), 0) AS head, "
+            "(SELECT CASE WHEN typeof(globalId) = 'text' AND length(globalId) = 36 "
+            "THEN globalId ELSE NULL END FROM main.AuditLog ORDER BY id DESC LIMIT 1) AS head_global_id, "
+            "COALESCE((SELECT id FROM main.AuditLog ORDER BY id ASC LIMIT 1), 0) AS floor");
+        if (is_closed() || connection->is_closed()) throw db_error("Audit cursor connection is closed");
+        if (rows.size() != 1) throw db_error("Invalid audit cursor result");
+        const auto& row = rows.front();
+        const auto head_value = row.find("head"), floor_value = row.find("floor"), id_value = row.find("head_global_id");
+        if (head_value == row.end() || floor_value == row.end() || id_value == row.end() ||
+            !std::holds_alternative<int64_t>(head_value->second) || !std::holds_alternative<int64_t>(floor_value->second))
+            throw db_error("Invalid audit cursor types");
+        audit_cursor cursor;
+        cursor.head = std::get<int64_t>(head_value->second);
+        cursor.floor = std::get<int64_t>(floor_value->second);
+        if (cursor.head == 0 && cursor.floor == 0 && std::holds_alternative<std::nullptr_t>(id_value->second)) return cursor;
+        if (cursor.head <= 0 || cursor.floor <= 0 || cursor.floor > cursor.head ||
+            !std::holds_alternative<std::string>(id_value->second)) throw db_error("Invalid audit cursor values");
+        cursor.head_global_id = std::get<std::string>(id_value->second);
+        if (cursor.head_global_id.size() != 36) throw db_error("Invalid audit cursor identity");
+        for (size_t index = 0; index < cursor.head_global_id.size(); ++index) {
+            const char c = cursor.head_global_id[index];
+            const bool dash = index == 8 || index == 13 || index == 18 || index == 23;
+            if (dash ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                throw db_error("Invalid audit cursor identity");
+        }
+        return cursor;
+    }
+
+    /// One owned SQL snapshot of the scalar cursor and cooperative history-generation token.
+    /// Pruning can preserve an older remote cursor while removing newer local mutations; comparing
+    /// head/floor alone therefore does not establish an uninterrupted audit interval. No metadata
+    /// is created here. A missing token is the explicit pre-protocol state, not query failure.
+    audit_read_fence read_audit_read_fence() {
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed()) throw db_error("Audit read fence connection is closed");
+        auto result = read_audit_read_fence_on(*connection);
+        if (is_closed() || connection->is_closed()) throw db_error("Audit read fence connection is closed");
+        return result;
+    }
+
+    /// Internal owned-connection variant. The caller retains and serializes this exact connection;
+    /// detached reads use it before/after selected-column capture in the same read transaction.
+    static audit_read_fence read_audit_read_fence_on(database& connection) {
+        if (connection.is_closed()) throw db_error("Audit read fence connection is closed");
+        const auto rows = connection.query(
+            "SELECT COALESCE((SELECT id FROM main.AuditLog ORDER BY id DESC LIMIT 1),0) AS head, "
+            "(SELECT CASE WHEN typeof(globalId)='text' AND length(CAST(globalId AS BLOB))=36 "
+            "THEN globalId END FROM main.AuditLog ORDER BY id DESC LIMIT 1) AS head_global_id, "
+            "COALESCE((SELECT id FROM main.AuditLog ORDER BY id ASC LIMIT 1),0) AS floor, "
+            "(SELECT COUNT(*) FROM main._lattice_meta WHERE key='history_generation_revision_v1') AS generation_count, "
+            "(SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))=36 THEN value END "
+            "FROM main._lattice_meta WHERE key='history_generation_revision_v1' LIMIT 1) AS generation");
+        if (connection.is_closed()) throw db_error("Audit read fence connection is closed");
+        if (rows.size()!=1) throw db_error("Invalid audit read fence result");
+        const auto& row=rows.front();
+        const auto integer=[&](const char* key) {
+            const auto found=row.find(key);
+            if(found==row.end() || !std::holds_alternative<int64_t>(found->second))
+                throw db_error("Invalid audit read fence integer");
+            return std::get<int64_t>(found->second);
+        };
+        const auto uuid=[&](const char* key) {
+            const auto found=row.find(key);
+            if(found==row.end() || !std::holds_alternative<std::string>(found->second))
+                throw db_error("Invalid audit read fence identity");
+            const auto value=std::get<std::string>(found->second);
+            if(value.size()!=36) throw db_error("Invalid audit read fence identity");
+            for(size_t i=0;i<value.size();++i) {
+                const char c=value[i]; const bool dash=i==8 || i==13 || i==18 || i==23;
+                if(dash ? c!='-' : !((c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F')))
+                    throw db_error("Invalid audit read fence identity");
+            }
+            return value;
+        };
+        audit_read_fence result;
+        result.cursor.head=integer("head"); result.cursor.floor=integer("floor");
+        if(result.cursor.head==0 && result.cursor.floor==0) {
+            if(!std::holds_alternative<std::nullptr_t>(row.at("head_global_id")))
+                throw db_error("Invalid empty audit read fence");
+        } else {
+            if(result.cursor.head<=0 || result.cursor.floor<=0 || result.cursor.floor>result.cursor.head)
+                throw db_error("Invalid audit read fence bounds");
+            result.cursor.head_global_id=uuid("head_global_id");
+        }
+        const auto count=integer("generation_count");
+        if(count==0) {
+            if(!std::holds_alternative<std::nullptr_t>(row.at("generation")))
+                throw db_error("Invalid absent audit history generation");
+        } else if(count==1) {
+            result.history_generation=uuid("generation"); result.has_history_generation=true;
+        } else throw db_error("Ambiguous audit history generation");
+        return result;
+    }
+
+    /// Called only while the opened writer/read connection owns its admission transaction.
+    void require_existing_schema_in_transaction() {
+        const auto required = config_.required_existing_schema_version;
+        if (required <= 0) throw db_error("Required existing schema version must be positive");
+        if (read_stored_schema_version(*db_) != required)
+            throw db_error("Existing schema version does not match required version");
+    }
+
+    void finish_existing_schema_admission() {
+        if (!strict_admission_pending_) throw db_error("No pending existing schema admission");
+        db_->execute("COMMIT");
+        strict_admission_pending_ = false;
+        strict_admission_complete_ = true;
+        if (!config_.read_only) setup_change_hook();
+        instance_registry::instance().register_instance(config_.path, this, guard_);
+        setup_cross_process_notifier();
+    }
+
+    void abandon_existing_schema_admission() noexcept {
+        if (!strict_admission_pending_) return;
+        try { db_->execute("ROLLBACK"); } catch (...) {}
+        strict_admission_pending_ = false;
+    }
+
+    void require_existing_fingerprint_in_transaction(const std::string& key) {
+        const auto cookie_rows = db_->query("PRAGMA main.schema_version");
+        if (cookie_rows.size() != 1) throw db_error("Invalid existing schema cookie");
+        const auto cookie_value = cookie_rows.front().find("schema_version");
+        if (cookie_value == cookie_rows.front().end() || !std::holds_alternative<int64_t>(cookie_value->second))
+            throw db_error("Invalid existing schema cookie");
+        const int64_t cookie = std::get<int64_t>(cookie_value->second);
+        if (cookie < 0) throw db_error("Invalid existing schema cookie");
+        const auto rows = db_->query("SELECT CASE WHEN typeof(value) = 'text' AND length(value) BETWEEN 1 AND 19 "
+            "THEN value ELSE NULL END AS value FROM main._lattice_meta WHERE key = ? LIMIT 2", {key});
+        if (rows.size() != 1) throw db_error("Missing or ambiguous existing schema fingerprint");
+        const auto value = rows.front().find("value");
+        if (value == rows.front().end() || !std::holds_alternative<std::string>(value->second))
+            throw db_error("Invalid existing schema fingerprint");
+        int64_t stored = 0;
+        for (const unsigned char digit : std::get<std::string>(value->second)) {
+            if (digit < '0' || digit > '9' || stored > (std::numeric_limits<int64_t>::max() - (digit - '0')) / 10)
+                throw db_error("Invalid existing schema fingerprint");
+            stored = stored * 10 + (digit - '0');
+        }
+        // A stats-only ANALYZE/optimize may advance SQLite's cookie without changing the
+        // activated model schema. The exact structural receipt remains authoritative; a
+        // cookie alone is neither a compatibility proof nor permission to repair this file.
+        const auto receipt = read_schema_structure_receipt(key);
+        if (receipt != schema_structure_receipt_in_transaction())
+            throw db_error("Existing schema structure does not match activated receipt");
     }
 
     size_t count(const std::string& table_name,
@@ -3496,6 +3742,13 @@ public:
         return 0;
     }
 
+    /// Explicitly prepare a store whose owner requires ordinary writes to be
+    /// audited. Validate the canonical control table and its single 0/1 flag,
+    /// then normalize a legacy disabled flag in an exclusively owned write
+    /// transaction. Returns true only when 1 changed to 0. Ordinary opens and
+    /// generic maintenance preserve deliberately disabled auditing.
+    bool prepare_for_audited_writes();
+
     /// Hard-delete rows WITHOUT relaying the deletes: each row's DELETE
     /// audit entry carries the `__lattice_filter_removal` marker, which WSS
     /// receivers skip-and-ack (they never apply it) and IPC receivers record
@@ -3518,11 +3771,8 @@ public:
     int64_t delete_rows_no_relay(const std::string& table,
                                  const std::vector<std::string>& global_row_ids) {
         if (global_row_ids.empty()) return 0;
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        int64_t deleted = 0;
-        db_->begin_transaction();
-        try {
-            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        return with_sync_suppressed_transaction_([&]() -> int64_t {
+            int64_t deleted = 0;
             for (const auto& gid : global_row_ids) {
                 db_->execute("DELETE FROM \"" + table + "\" WHERE globalId = ? COLLATE NOCASE",
                              {gid});
@@ -3537,17 +3787,8 @@ public:
                     "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
                     {generate_global_id(), table, gid});
             }
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->commit();
-        } catch (...) {
-            db_->rollback();
-            // The flag write above rolled back with everything else, but
-            // restore defensively in case the txn died after a partial step.
-            try { db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1",
-                               {prev_disabled}); } catch (...) {}
-            throw;
-        }
-        return deleted;
+            return deleted;
+        });
     }
 
     /// Repair audit rows whose timestamp landed in the REAL column as TEXT.
@@ -3572,21 +3813,65 @@ public:
         return generate_history_owned_(20000, true, true);
     }
 
-    /// Re-arm a synchronizer's filtered snapshot for a fresh peer: forget
-    /// per-sync upload tracking and filtered-set membership so the next
-    /// reconcile_sync_filter() re-synthesizes INSERTs for the full filtered
-    /// subset. Local data is untouched; upload volume stays proportional to
-    /// the filter, never the whole AuditLog.
-    ///
-    /// The sync-set wipe is scoped to this sync_id (per-sync_id shape) — it
-    /// cannot corrupt other synchronizers' filtered-set membership, so the
-    /// full re-arm is safe on any topology, including multi-channel hubs.
+    /// Rewind this channel's ordinary audit tracking on a quiescent channel. Active durable
+    /// filtered state uses reset_filtered_peer_snapshot instead; generic rewind cannot safely
+    /// resurrect its old wire identities and therefore refuses without changing anything.
     void reset_sync_state(const std::string& sync_id) {
-        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
-        db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0 WHERE sync_id = ?", {sync_id});
-        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_state, sync_set, slot cursors)",
-                 sync_id.c_str());
+        detail::with_quiescent_sync_channel(*this,sync_id,[&] {
+        const auto key=detail::sync_reset_meta_key(sync_id);
+        store_write_gate_hold gate(*this);
+        if(db_->is_in_transaction()) throw db_error("Sync retirement/rewind requires its own transaction");
+        const bool own_transaction=true;
+        if(own_transaction) db_->begin_transaction();
+        try {
+            if(!db_->query("SELECT 1 FROM main._lattice_sync_outbox WHERE sync_id=? LIMIT 1",{sync_id}).empty() ||
+               !db_->query("SELECT 1 FROM main._lattice_meta WHERE key=?",{key}).empty())
+                throw db_error("Generic sync rewind cannot reset durable filtered state; use fresh-peer snapshot reset");
+            db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id=?",{sync_id});
+            db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id=?",{sync_id});
+            db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id=0,upload_floor=0 WHERE sync_id=?",{sync_id});
+            if(own_transaction) db_->commit();
+        } catch (...) {if(own_transaction && db_->is_in_transaction()) {try {db_->rollback();} catch (...) {}} throw;}
+        });
+    }
+
+private:
+    // Expiring replication slots must never erase a reset's identity boundary. Exactly one small
+    // metadata record per historical channel is retained; no automatic space-based safety eviction.
+    int64_t record_sync_reset_cutoff_(const std::string& sync_id) {
+        const auto key=detail::sync_reset_meta_key(sync_id);
+        if(!db_->is_in_transaction()) throw db_error("sync cutoff requires owned transaction");
+        const auto old=db_->query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=19 "
+            "THEN value END AS value FROM main._lattice_meta WHERE key=?",{key});
+        int64_t prior=0;
+        if(!old.empty()) {
+            if(old.size()!=1 || !std::holds_alternative<std::string>(old[0].at("value"))) throw db_error("invalid stored sync cutoff");
+            prior=detail::parse_sync_reset_cutoff(std::get<std::string>(old[0].at("value")));
+        }
+        const auto rows=db_->query("SELECT COALESCE(MAX(id),0) AS cutoff FROM main.AuditLog");
+        const auto cutoff=std::max(prior,std::get<int64_t>(rows.at(0).at("cutoff")));
+        db_->execute("INSERT INTO main._lattice_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            {key,std::to_string(cutoff)});
+        return cutoff;
+    }
+public:
+    /// Explicit filtered fresh-peer transition. Pre-reset history cannot provide identities for
+    /// the new peer cohort. Current allowed rows are synthesized with fresh IDs by reconciliation.
+    /// The channel owner serializes this operation with selection/send/ACK processing.
+    void reset_filtered_peer_snapshot(const std::string& sync_id) {
+        store_write_gate_hold gate(*this);
+        const bool own_transaction=!db_->is_in_transaction();
+        if(own_transaction) db_->begin_transaction();
+        try {
+            record_sync_reset_cutoff_(sync_id);
+            db_->execute("INSERT INTO main._lattice_sync_state(audit_entry_id,sync_id,is_synchronized) "
+                "SELECT source_audit_id,sync_id,1 FROM main._lattice_sync_outbox WHERE sync_id=? AND legacy_receipt=0 "
+                "ON CONFLICT(audit_entry_id,sync_id) DO UPDATE SET is_synchronized=1",{sync_id});
+            db_->execute("DELETE FROM main._lattice_sync_outbox WHERE sync_id=?",{sync_id});
+            db_->execute("DELETE FROM main._lattice_sync_set WHERE sync_id=?",{sync_id});
+            db_->execute("UPDATE main._lattice_replication_slots SET confirmed_audit_id=0,upload_floor=0 WHERE sync_id=?",{sync_id});
+            if(own_transaction) db_->commit();
+        } catch (...) {if(own_transaction && db_->is_in_transaction()) {try {db_->rollback();} catch (...) {}} throw;}
     }
 
     /// A6 — permanently retire a sync channel: delete its `_lattice_sync_state`
@@ -3598,11 +3883,27 @@ public:
     /// sync_state rows inflated the eager-collapse count — an entry could
     /// collapse to isSynchronized=1 before a still-live channel relayed it.
     void remove_sync_channel_state(const std::string& sync_id) {
-        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
+        detail::with_quiescent_sync_channel(*this,sync_id,[&] {
+        store_write_gate_hold gate(*this);
+        if(db_->is_in_transaction()) throw db_error("Sync retirement/rewind requires its own transaction");
+        const bool own_transaction=true;
+        if(own_transaction) db_->begin_transaction();
+        try {
+            // Explicit retirement after transport teardown permits deterministic ID reuse.
+            // Other-process quiescence is the caller's responsibility; this guard is process-local.
+            db_->execute("DELETE FROM main._lattice_meta WHERE key=?",{detail::sync_reset_meta_key(sync_id)});
+            db_->execute("DELETE FROM _lattice_sync_outbox WHERE sync_id = ?", {sync_id});
+            db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
+            db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
+            db_->execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
+            if(own_transaction) db_->commit();
+        } catch (...) {
+            if(own_transaction && db_->is_in_transaction()) {try {db_->rollback();} catch (...) {}}
+            throw;
+        }
         LOG_INFO("lattice_db", "remove_sync_channel_state(%s): channel retired (state, set, slot removed)",
                  sync_id.c_str());
+        });
     }
 
     /// Slot-aware compaction: deletes only AuditLog entries that ALL
@@ -3810,6 +4111,20 @@ public:
 
 private:
     friend struct audit_maintenance_test_access;
+    friend struct sync_apply_transaction_access;
+    template<typename F>
+    int64_t with_sync_suppressed_transaction_(F&& body) {
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            // Capture only after ownership and BEGIN. Reading before admission
+            // can save another operation's temporary 1, or an old persistent
+            // 1 that prepare_for_audited_writes has since normalized.
+            const auto previous = sync_flag_in_owned_transaction_();
+            db_->execute("UPDATE main._SyncControl SET disabled = 1 WHERE id = 1");
+            const auto result = std::forward<F>(body)();
+            db_->execute("UPDATE main._SyncControl SET disabled = ? WHERE id = 1", {previous});
+            return result;
+        });
+    }
     friend struct background_sync_lifecycle_test_access;
     template<typename F>
     int64_t with_audit_prune_transaction_(F&& body, const std::atomic<bool>* cancelled = nullptr) {
@@ -3853,6 +4168,14 @@ private:
     // Safety bounds, cursor requirements and the saved trigger flag therefore
     // come from the same protected state as the deletion.
     int64_t delete_audit_below_in_transaction_(int64_t safe_id, bool preserve_cursor_row) {
+        // A disconnected/expired slot cannot erase a durable delivery's source. This read and
+        // deletion share the maintenance write transaction, excluding concurrent admission.
+        const auto pending = db_->query("SELECT MIN(source_audit_id) AS first FROM main._lattice_sync_outbox WHERE legacy_receipt=0");
+        if (pending.size() != 1) throw db_error("outbox retention requires an exact minimum");
+        const auto& first = pending[0].at("first");
+        if (const auto* value = std::get_if<int64_t>(&first)) safe_id = std::min(safe_id, *value - 1);
+        else if (!std::holds_alternative<std::nullptr_t>(first)) throw db_error("invalid outbox source minimum");
+        if (safe_id <= 0) return 0;
         // Do not use the legacy best-effort getter: a failed read must never
         // become a fabricated flag value that is later committed as restore.
         const auto flag_rows = db_->query("SELECT disabled FROM _SyncControl WHERE id = 1");
@@ -4102,12 +4425,12 @@ private:
         return value;
     }
 
-    int64_t history_sync_flag_in_transaction_() {
+    int64_t sync_flag_in_owned_transaction_() {
         const auto rows = db_->query("SELECT disabled FROM main._SyncControl WHERE id=1");
-        if (rows.size() != 1) throw db_error("history generation requires one sync control row");
+        if (rows.size() != 1) throw db_error("owned transaction requires one sync control row");
         const auto it = rows[0].find("disabled");
         if (it == rows[0].end() || !std::holds_alternative<int64_t>(it->second))
-            throw db_error("history generation requires an integer sync control flag");
+            throw db_error("owned transaction requires an integer sync control flag");
         return std::get<int64_t>(it->second);
     }
 
@@ -4221,7 +4544,9 @@ private:
                     plans.push_back(std::move(plan));
                 }
                 if (force) {
-                    const int64_t disabled = history_sync_flag_in_transaction_();
+                    if (!db_->query("SELECT 1 FROM main._lattice_sync_outbox LIMIT 1").empty())
+                        throw db_error("cannot replace history while sync deliveries await ACK");
+                    const int64_t disabled = sync_flag_in_owned_transaction_();
                     db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
                     db_->execute("DELETE FROM main.AuditLog");
                     db_->execute("DELETE FROM main._lattice_sync_state");
@@ -4343,7 +4668,7 @@ private:
                         }
                         where += " ORDER BY " + order_expr + " LIMIT ?";
                         params.push_back(batch_size);
-                        const auto disabled = history_sync_flag_in_transaction_();
+                        const auto disabled = sync_flag_in_owned_transaction_();
                         db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
                         db_->execute(base.str() + where, params);
                         const auto count = static_cast<int64_t>(sqlite3_changes(db_->handle()));
@@ -4548,6 +4873,17 @@ public:
         }
         return query_read(sql.str(), repeated);
     }
+
+    /// Immutable, namespaced state local to this physical database. It is
+    /// neither a model nor synchronization history. Reads never create storage;
+    /// insertion requires this thread's existing explicit write transaction.
+    /// This lets a caller atomically persist a receipt with ordinary audited
+    /// model mutations, without opening a second database or bypassing Lattice.
+    std::optional<std::string> local_metadata(const std::string& name_space,
+                                              const std::string& key);
+    bool insert_local_metadata_if_absent(const std::string& name_space,
+                                         const std::string& key,
+                                         const std::string& value);
 
     // Transaction support. On shared-cache stores the per-store write gate
     // (results spec §4.1) is held for the duration of the transaction, so
@@ -6312,6 +6648,9 @@ private:
         std::mutex mutex;
         std::condition_variable cv;
         bool transitioning = false;
+        bool setup_retry_requested = false;
+        bool policy_ready = false;
+        uint64_t filter_revision = 0;
         std::thread::id transition_thread;
         size_t borrowers = 0;
         std::map<std::thread::id, size_t> borrower_threads;
@@ -6335,6 +6674,7 @@ private:
     class sync_borrow {
     public:
         explicit sync_borrow(const lattice_db& owner, bool mutation = false);
+        sync_borrow(lattice_db& owner, const std::optional<std::vector<sync_filter_entry>>& filter);
         ~sync_borrow();
         sync_borrow(const sync_borrow&) = delete;
         sync_borrow& operator=(const sync_borrow&) = delete;
@@ -6348,28 +6688,76 @@ private:
         bool admitted_ = false;
     };
     // Transition admission never holds its mutex over SQL, callbacks or joins.
-    bool begin_sync_transition(bool wait);
+    bool begin_sync_transition(bool wait, bool retry_setup = false, bool require_empty_owner = false);
     void end_sync_transition();
     void setup_sync_owned(bool finite_cycle = false,
                           std::shared_ptr<std::atomic<bool>> cancellation = {},
                           bool allow_sibling_kick = true);
-    bool retire_wss_owned(bool drain, bool handoff);
+    bool retire_wss_owned(bool drain, bool handoff, std::optional<std::string> successor_url = std::nullopt);
     void restore_parent_after_sync_owned(uint64_t generation);
     static void replay_sync_state_subscription(const std::shared_ptr<sync_lifecycle_state>& state);
     std::atomic<bool> sync_start_requested_{true};
 
-    // IPC sync
-    struct ipc_sync_state {
-        std::unique_ptr<ipc_endpoint> endpoint;
-        std::unique_ptr<synchronizer> sync;
-        int lock_fd = -1;  // flock on <channel>.ipc.lock — mirrors sync_lock_fd_ for WSS
+    // Setup ownership is shared with the synchronizer: neither the flock nor dedup key may
+    // disappear while an admitted callback still retains its dedicated native database.
+    struct sync_key_lease {
+        std::string path,key;bool registered=false;
+        sync_key_lease(std::string path,std::string key):path(std::move(path)),key(std::move(key)) {}
+        ~sync_key_lease() {if(registered) unregister_sync_key(path,key);}
     };
-    std::vector<ipc_sync_state> ipc_synchronizers_;
+    struct sync_file_lease {
+        int fd=-1;
+        explicit sync_file_lease(int fd):fd(fd) {}
+        ~sync_file_lease() {if(fd>=0) {::flock(fd,LOCK_UN);::close(fd);}}
+    };
+    struct sync_owner_resources {
+        std::shared_ptr<sync_key_lease> key;
+        std::shared_ptr<sync_file_lease> file;
+        const std::shared_ptr<std::atomic<bool>> active=std::make_shared<std::atomic<bool>>(true);
+        std::function<void()> handoff;
+        ~sync_owner_resources() {
+            file.reset();key.reset();
+            if(handoff) {try {handoff();} catch(const std::exception& error) {LOG_ERROR("sync","Deferred handoff failed: %s",error.what());}
+                catch(...) {LOG_ERROR("sync","Deferred handoff failed with an unknown exception");}}
+        }
+    };
+    static std::shared_ptr<sync_key_lease> acquire_sync_key(const std::string& path,const std::string& key) {
+        auto lease=std::make_shared<sync_key_lease>(path,key);
+        if(!try_register_sync_key(path,key)) return {};
+        lease->registered=true;return lease;
+    }
+    static std::shared_ptr<sync_file_lease> adopt_sync_file(int fd) {
+        try {return std::make_shared<sync_file_lease>(fd);}
+        catch(...) {::flock(fd,LOCK_UN);::close(fd);throw;}
+    }
+    struct ipc_sync_state {
+        std::string channel;
+        std::shared_ptr<sync_owner_resources> resources;
+        std::shared_ptr<detail::ipc_publication_state> publication;
+        std::mutex endpoint_mutex;
+        std::unique_ptr<ipc_endpoint> endpoint;
+        void start() {
+            std::lock_guard<std::mutex> lock(endpoint_mutex);
+            if(!publication->accepting() || !endpoint) return;
+            const std::weak_ptr<detail::ipc_publication_state> weak=publication;
+            endpoint->start([weak](std::unique_ptr<ipc_socket_client> transport) {
+                if(const auto state=weak.lock()) state->accept(std::move(transport));
+            });
+        }
+        void stop() {
+            std::lock_guard<std::mutex> lock(endpoint_mutex);
+            if(endpoint) {endpoint->stop();endpoint.reset();}
+        }
+    };
+    std::vector<std::shared_ptr<ipc_sync_state>> ipc_synchronizers_;
+    std::vector<std::shared_ptr<ipc_sync_state>> ipc_states_snapshot() const {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);return ipc_synchronizers_;
+    }
 
     // Sync callbacks — stored for retroactive application to lazily-created synchronizers.
     // Protected by ipc_callbacks_mutex_ to avoid races between the accept thread
     // (which creates IPC synchronizers) and the main thread (which sets callbacks).
-    std::mutex ipc_callbacks_mutex_;
+    mutable std::mutex ipc_callbacks_mutex_;
     std::function<void(bool)> on_sync_state_change_;
     std::function<void(const std::string&)> on_sync_error_;
     synchronizer::on_progress_handler on_sync_progress_;
@@ -6423,7 +6811,7 @@ private:
 
 protected:
     // Initialize synchronizer if configured
-    void setup_sync_if_configured();
+    void setup_sync_if_configured(bool retry_setup = false);
 
     // Initialize IPC synchronizers if configured
     void setup_ipc_if_configured();
@@ -6434,13 +6822,10 @@ private:
     // a dormant sibling so cross-instance sync continuity survives the
     // closing of the current owner.
     //
-    // `fire_handoff = false` skips the hand-off block. Used by the URL-
-    // change kick path in `setup_sync_if_configured`: when a new instance
-    // with a different URL kicks an old instance to take over the flock,
-    // we MUST NOT let the kicked instance resurrect another same-URL
-    // sibling — that would re-hold the flock against our new URL and
-    // re-trigger the same bug.
-    void teardown_sync(bool fire_handoff = true);
+    // `fire_handoff = false` skips handoff. A URL-change kick instead supplies
+    // the requested successor URL, so final callback retirement cannot wake
+    // an old-URL sibling and re-hold the flock against that successor.
+    void teardown_sync(bool fire_handoff = true, std::optional<std::string> successor_url = std::nullopt);
 
     // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
     static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
@@ -6485,6 +6870,8 @@ private:
     /// Heap-allocated guard for safe cross-instance notification.
     /// Set alive=false before teardown; spin on refcount before destroying members.
     std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
+    bool strict_admission_pending_ = false;
+    bool strict_admission_complete_ = false;
 
     // Cascade walker side indexes — populated by the `ensure_*` registration
     // sites at startup, read by `remove(...)` and `delete_where(...)` to
@@ -6616,6 +7003,14 @@ private:
             ensure_unique_property_indexes(*schema);
         }
 
+        // These existing APIs previously created their tables lazily. Establish
+        // them before capability guards so a pre-cutover writer cannot create an
+        // unguarded bookkeeping table after this transaction commits.
+        db_->execute("CREATE TABLE IF NOT EXISTS main._lattice_local_metadata_v1 ("
+            "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+            "PRIMARY KEY(namespace,key)) WITHOUT ROWID");
+        db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts (globalId TEXT PRIMARY KEY)");
+        detail::ensure_sync_storage_guards(*db_);
         store_fingerprint_marker(fp_key);
         txn.commit();
     }
@@ -7375,6 +7770,8 @@ private:
                 WHERE is_synchronized = 0
         )");
 
+        detail::ensure_sync_outbox_schema(*db_);
+
         // Create _lattice_replication_slots table for slot-aware compaction.
         // Each synchronizer registers a slot; compaction only deletes entries
         // below the minimum confirmed_audit_id across all active slots.
@@ -7476,6 +7873,7 @@ private:
     /// fast path (triggers reference sync_disabled() at execution time).
     void register_sql_functions() { register_sql_functions(*db_); }
     void register_sql_functions(database& connection) {
+        detail::register_sync_storage_writer(connection);
         // sync_disabled() lets triggers check if sync is disabled
         sqlite3_create_function(
             connection.handle(),
@@ -7574,7 +7972,11 @@ protected:
     /// Epoch 7: regular link tables gained a covering (rhs, lhs) index for
     /// reverse traversal. Both Core and Swift schema fingerprints must force
     /// one guarded ensure pass on stores written before the index existed.
-    static constexpr int kLatticeSchemaFormatEpoch = 7;
+    /// Epoch 8: asset-reader filtered sends gained exact-wire delivery receipts.
+    /// Epoch 9: joins those receipts with released v7 FIFO/nullable-provenance
+    /// obligations. Canonical migration and per-table capability guards commit
+    /// together; pre-cutover writer handles cannot mutate guarded tables.
+    static constexpr int kLatticeSchemaFormatEpoch = 9;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as
@@ -7662,6 +8064,108 @@ protected:
         return -1;
     }
 
+    // Exact schema receipt format v1. These limits bound both native hydration and metadata;
+    // this is a compatibility receipt, not a cryptographic claim or a serialized data snapshot.
+    static constexpr size_t kSchemaReceiptBytes = 4 * 1024 * 1024;
+    static constexpr size_t kSchemaReceiptRows = 8192;
+    static constexpr size_t kSchemaReceiptFieldBytes = 256 * 1024;
+    static constexpr const char* kSchemaReceiptHeader = "lattice-schema-structure:1\n";
+    static constexpr const char* kSchemaReceiptCapacity = "lattice-schema-structure:capacity:1";
+    struct schema_receipt_capacity_error : db_error { using db_error::db_error; };
+
+    static std::string schema_structure_key(const std::string& fingerprint_key) {
+        return "schema_structure:" + fingerprint_key;
+    }
+
+    static bool schema_receipt_encoding_valid(const std::string& value) {
+        const std::string header(kSchemaReceiptHeader);
+        if (value.size() > kSchemaReceiptBytes || value.compare(0, header.size(), header) != 0) return false;
+        size_t offset = header.size();
+        const auto number = [&](size_t maximum, size_t& result) {
+            result = 0;
+            const size_t start = offset;
+            while (offset < value.size() && value[offset] >= '0' && value[offset] <= '9') {
+                const size_t digit = value[offset++] - '0';
+                if (result > (maximum - digit) / 10) return false;
+                result = result * 10 + digit;
+            }
+            if (offset == start || offset >= value.size() || value[offset++] != ':') return false;
+            return offset - start <= 2 || value[start] != '0';
+        };
+        size_t rows = 0;
+        if (!number(kSchemaReceiptRows, rows) || rows == 0) return false;
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t field = 0; field < 4; ++field) {
+                if (offset >= value.size()) return false;
+                const char kind = value[offset++];
+                if (kind == 'N') {
+                    if (field != 3 || offset >= value.size() || value[offset++] != ';') return false;
+                } else if (kind == 'S') {
+                    size_t length = 0;
+                    if (!number(kSchemaReceiptFieldBytes, length) || length > value.size() - offset) return false;
+                    if (field < 3 && length == 0) return false;
+                    offset += length;
+                } else return false;
+            }
+        }
+        return offset == value.size();
+    }
+
+    std::string read_schema_structure_receipt(const std::string& key, bool allow_capacity = false) const {
+        const auto rows = db_->query(
+            "SELECT CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) BETWEEN 1 AND ? "
+            "THEN value ELSE NULL END AS value FROM main._lattice_meta WHERE key = ? LIMIT 2",
+            {static_cast<int64_t>(kSchemaReceiptBytes), schema_structure_key(key)});
+        if (rows.size() != 1) throw db_error("Missing or ambiguous schema structure receipt");
+        const auto found = rows.front().find("value");
+        if (found == rows.front().end() || !std::holds_alternative<std::string>(found->second))
+            throw db_error("Invalid schema structure receipt type or size");
+        const auto& value = std::get<std::string>(found->second);
+        if (allow_capacity && value == kSchemaReceiptCapacity) return value;
+        if (!schema_receipt_encoding_valid(value)) throw db_error("Invalid schema structure receipt encoding");
+        return value;
+    }
+
+    std::string schema_structure_receipt_in_transaction() const {
+        // Only SQLite's four known statistics tables are excluded. In particular, keep autoindexes,
+        // sqlite_sequence, virtual-table shadows, views and every trigger in the comparison.
+        const std::string objects =
+            " FROM main.sqlite_schema WHERE NOT (type = 'table' AND name IN "
+            "('sqlite_stat1','sqlite_stat2','sqlite_stat3','sqlite_stat4'))";
+        const auto bounds = db_->query(
+            "SELECT count(*) AS objects, COALESCE(sum(length(CAST(type AS BLOB)) + "
+            "length(CAST(name AS BLOB)) + length(CAST(tbl_name AS BLOB)) + "
+            "COALESCE(length(CAST(sql AS BLOB)),0)),0) AS bytes FROM (SELECT type,name,tbl_name,sql" +
+            objects + " LIMIT " + std::to_string(kSchemaReceiptRows + 1) + ")");
+        if (bounds.size() != 1 || !std::holds_alternative<int64_t>(bounds.front().at("objects")) ||
+            !std::holds_alternative<int64_t>(bounds.front().at("bytes")))
+            throw db_error("Invalid schema structure bounds");
+        const auto count = std::get<int64_t>(bounds.front().at("objects"));
+        const auto bytes = std::get<int64_t>(bounds.front().at("bytes"));
+        if (count <= 0 || bytes < 0) throw db_error("Invalid schema structure bounds");
+        if (count > static_cast<int64_t>(kSchemaReceiptRows) || bytes > static_cast<int64_t>(kSchemaReceiptBytes))
+            throw schema_receipt_capacity_error("Schema structure receipt exceeds limits");
+        const auto rows = db_->query("SELECT type,name,tbl_name,sql" + objects +
+            " ORDER BY type COLLATE BINARY,name COLLATE BINARY,tbl_name COLLATE BINARY LIMIT " +
+            std::to_string(kSchemaReceiptRows + 1));
+        if (rows.size() != static_cast<size_t>(count)) throw db_error("Schema structure changed during admission");
+        std::string value = std::string(kSchemaReceiptHeader) + std::to_string(rows.size()) + ":";
+        for (const auto& row : rows) {
+            for (const char* field : {"type", "name", "tbl_name", "sql"}) {
+                const auto found = row.find(field);
+                if (found == row.end()) throw db_error("Invalid schema structure field");
+                if (std::holds_alternative<std::nullptr_t>(found->second) && std::string(field) == "sql") value += "N;";
+                else if (const auto* text = std::get_if<std::string>(&found->second)) {
+                    if (text->size() > kSchemaReceiptFieldBytes) throw schema_receipt_capacity_error("Schema structure field exceeds limit");
+                    value += "S" + std::to_string(text->size()) + ":" + *text;
+                } else throw db_error("Invalid schema structure field type");
+                if (value.size() > kSchemaReceiptBytes) throw schema_receipt_capacity_error("Schema structure receipt exceeds limits");
+            }
+        }
+        if (!schema_receipt_encoding_valid(value)) throw db_error("Invalid generated schema structure receipt");
+        return value;
+    }
+
     /// Check the fingerprint marker WITHOUT wrapping in a transaction.
     /// Call either inside an explicit read transaction (fast-path probe) or
     /// inside the slow path's IMMEDIATE transaction (double-checked locking).
@@ -7673,7 +8177,12 @@ protected:
         if (!stored) return false;
         int64_t stored_cookie = std::atoll(stored->c_str());
         int64_t current_cookie = read_schema_cookie();
-        return current_cookie >= 0 && stored_cookie == current_cookie;
+        if (current_cookie < 0 || stored_cookie != current_cookie) return false;
+        // Old stores need one normal owner activation to record their structure. Strict readers
+        // cannot synthesize that receipt. The unchanged cookie avoids rebuilding the schema receipt;
+        // metadata parsing is bounded but is still more work than the old scalar-cookie check.
+        try { read_schema_structure_receipt(key, /*allow_capacity=*/true); } catch (const db_error&) { return false; }
+        return true;
     }
 
     /// Fast-path probe: marker + cookie read under one read transaction so the
@@ -7699,12 +8208,24 @@ protected:
         int64_t cookie = read_schema_cookie();
         if (cookie < 0) return;
         const std::string cookie_str = std::to_string(cookie);
+        std::string structure;
+        try { structure = schema_structure_receipt_in_transaction(); }
+        catch (const schema_receipt_capacity_error&) {
+            // The optional strict-reader capability must not impose a new schema-size limit on
+            // normal owners. Only capacity is best effort: SQL/shape failures still abort activation.
+            // This sentinel also avoids repeating normal migration work on every unchanged open.
+            structure = kSchemaReceiptCapacity;
+        }
         db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
                      {key, cookie_str});
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {schema_structure_key(key), structure});
         db_->execute(
             "DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' "
             "AND key <> ? AND value <> ?",
             {key, cookie_str});
+        db_->execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_structure:%' "
+            "AND substr(key, 18) NOT IN (SELECT key FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%')");
     }
 
     /// Register a table as internal. Its AuditLog entries will be used for sync
@@ -8899,7 +9420,7 @@ namespace lattice {
 // (synchronizer is fully defined via sync.hpp included above)
 // ============================================================================
 
-inline void lattice_db::teardown_sync(bool fire_handoff) {
+inline void lattice_db::teardown_sync(bool fire_handoff, std::optional<std::string> successor_url) {
     {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
         if (sync_lifecycle_->generation && sync_lifecycle_->cancellation)
@@ -8914,23 +9435,27 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
     // Managed lifecycles reject IPC at admission. Ordinary close retains the
     // existing all-channel disconnect ordering before any private DB dies.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
-    for (auto& ipc : ipc_synchronizers_) if (ipc.sync) ipc.sync->drain(deadline);
-    for (auto& ipc : ipc_synchronizers_) if (ipc.sync) ipc.sync->disconnect();
-    if (synchronizer_ && !ipc_synchronizers_.empty()) synchronizer_->disconnect();
-    for (const auto& target : config_.ipc_targets)
-        unregister_sync_key(config_.path, "ipc:" + target.channel);
-    for (auto& ipc : ipc_synchronizers_) {
-        ipc.sync.reset();
-        if (ipc.endpoint) { ipc.endpoint->stop(); ipc.endpoint.reset(); }
-        if (ipc.lock_fd >= 0) { ::flock(ipc.lock_fd, LOCK_UN); ::close(ipc.lock_fd); }
+    std::vector<std::shared_ptr<ipc_sync_state>> channels;
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        channels.swap(ipc_synchronizers_);
+        for (const auto& channel : channels) channel->resources->active->store(false, std::memory_order_release);
     }
-    ipc_synchronizers_.clear();
+    std::vector<std::shared_ptr<synchronizer>> retiring;
+    for (const auto& channel : channels)
+        if (auto owner = channel->publication->revoke()) retiring.push_back(std::move(owner));
+    for (const auto& owner : retiring) owner->drain(deadline);
+    for (const auto& owner : retiring) owner->disconnect();
+    for (const auto& channel : channels) channel->stop();
+    // IPC resources follow the last admitted callback. WSS retains the released
+    // transition/borrow/cancellation retirement below, including finite cycles.
+    retiring.clear(); channels.clear();
     bool managed;
     {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
         managed = sync_lifecycle_->generation != 0;
     }
-    retire_wss_owned(!managed, fire_handoff && !managed);
+    retire_wss_owned(!managed, fire_handoff && !managed, std::move(successor_url));
 }
 
 inline void lattice_db::close() {
@@ -8988,6 +9513,13 @@ inline void lattice_db::close() {
 
 inline lattice_db::~lattice_db() {
     auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
+    if (config_.required_existing_schema_version != 0 && !strict_admission_complete_) {
+        // Swift schema admission never published this instance. Do not shut down a caller's
+        // scheduler or invoke registry/sync lifecycle that this refused handle never started.
+        abandon_existing_schema_admission();
+        guard_->alive.store(false, std::memory_order_seq_cst);
+        return;
+    }
     LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
              (void*)this, config_.path.c_str(), (long long)n);
     // close() may have already been called; each step is idempotent.
@@ -9037,7 +9569,7 @@ inline bool lattice_db::is_sync_agent() const {
     sync_borrow current(*this);
     if (!current.admitted()) return false;
     if (sync_lock_fd_ >= 0) return true;
-    for (const auto& ipc : ipc_synchronizers_) if (ipc.lock_fd >= 0) return true;
+    for (const auto& ipc : ipc_states_snapshot()) if (ipc->resources->file) return true;
     return false;
 }
 
@@ -9052,57 +9584,48 @@ inline void lattice_db::sync_now() {
 }
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
-    config_.sync_filter = filter;
+    if (is_closed()) return;
+    sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>(filter));
     if (current) current->update_sync_filter(filter);
-    for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
-        if (i < config_.ipc_targets.size()) config_.ipc_targets[i].sync_filter = filter;
-        if (ipc_synchronizers_[i].sync) ipc_synchronizers_[i].sync->update_sync_filter(filter);
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        for (auto& target : config_.ipc_targets) target.sync_filter = filter;
+        for (const auto& ipc : ipc_synchronizers_) ipc->publication->update_filter(filter);
     }
 }
 
 inline void lattice_db::update_sync_filter(const std::string& channel,
                                           std::vector<sync_filter_entry> filter) {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
+    if (is_closed()) return;
     if (channel.empty()) {
-        config_.sync_filter = filter;
+        sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>(filter));
         if (current) current->update_sync_filter(std::move(filter));
         return;
     }
-    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
-        if (config_.ipc_targets[i].channel != channel) continue;
-        config_.ipc_targets[i].sync_filter = filter;
-        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync)
-            ipc_synchronizers_[i].sync->update_sync_filter(std::move(filter));
-        return;
-    }
+    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+    for (auto& target : config_.ipc_targets) if (target.channel == channel) target.sync_filter = filter;
+    for (const auto& ipc : ipc_synchronizers_) if (ipc->channel == channel) ipc->publication->update_filter(filter);
 }
 
 inline void lattice_db::clear_sync_filter() {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
-    config_.sync_filter = std::nullopt;
+    if (is_closed()) return;
+    sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>{});
     if (current) current->clear_sync_filter();
-    for (auto& ipc : ipc_synchronizers_) if (ipc.sync) ipc.sync->clear_sync_filter();
+    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+    for (auto& target : config_.ipc_targets) target.sync_filter = std::nullopt;
+    for (const auto& ipc : ipc_synchronizers_) ipc->publication->update_filter(std::nullopt);
 }
 
 inline void lattice_db::clear_sync_filter(const std::string& channel) {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
+    if (is_closed()) return;
     if (channel.empty()) {
-        config_.sync_filter = std::nullopt;
+        sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>{});
         if (current) current->clear_sync_filter();
         return;
     }
-    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
-        if (config_.ipc_targets[i].channel != channel) continue;
-        config_.ipc_targets[i].sync_filter = std::nullopt;
-        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync)
-            ipc_synchronizers_[i].sync->clear_sync_filter();
-        return;
-    }
+    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+    for (auto& target : config_.ipc_targets) if (target.channel == channel) target.sync_filter = std::nullopt;
+    for (const auto& ipc : ipc_synchronizers_) if (ipc->channel == channel) ipc->publication->update_filter(std::nullopt);
 }
 
 inline void lattice_db::trigger_sync_upload() {
@@ -9116,17 +9639,8 @@ inline void lattice_db::trigger_sync_upload() {
             if (owner && owner->is_connected()) owner->sync_now();
         });
     }
-    for (size_t index = 0; index < ipc_synchronizers_.size(); ++index) {
-        const auto& ipc = ipc_synchronizers_[index];
-        if (ipc.sync && ipc.sync->is_connected()) {
-            scheduler_->invoke([this, index]() {
-                sync_borrow owner(*this);
-                if (!owner.admitted() || index >= ipc_synchronizers_.size()) return;
-                auto& current_ipc = ipc_synchronizers_[index];
-                if (current_ipc.sync && current_ipc.sync->is_connected()) current_ipc.sync->sync_now();
-            });
-        }
-    }
+    for (const auto& ipc : ipc_states_snapshot())
+        if (const auto owner = ipc->publication->current(); owner && owner->is_connected()) owner->sync_now();
 }
 
 inline void lattice_db::connect_sync() {
@@ -9182,6 +9696,7 @@ inline void lattice_db::set_on_sync_state_change(std::function<void(bool connect
         std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
         retired_ipc.swap(on_sync_state_change_);
         on_sync_state_change_.swap(handler);
+        for (const auto& ipc : ipc_synchronizers_) ipc->publication->set_state(on_sync_state_change_);
     }
     replay_sync_state_subscription(sync_lifecycle_);
     // Retired captures may close/reenter this store. Release both copies only
@@ -9200,6 +9715,7 @@ inline void lattice_db::set_on_sync_error(std::function<void(const std::string& 
         std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
         retired_ipc.swap(on_sync_error_);
         on_sync_error_.swap(handler);
+        for (const auto& ipc : ipc_synchronizers_) ipc->publication->set_error(on_sync_error_);
     }
 }
 
@@ -9213,7 +9729,8 @@ inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
             agg.acked += p.acked; agg.received += p.received;
         };
         if (current) add(current->get_progress());
-        for (const auto& ipc : sibling->ipc_synchronizers_) if (ipc.sync) add(ipc.sync->get_progress());
+        for (const auto& ipc : sibling->ipc_states_snapshot())
+            if (const auto owner = ipc->publication->current()) add(owner->get_progress());
     });
     return agg;
 }
@@ -9236,7 +9753,7 @@ inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler h
             retired_ipc.swap(sibling->on_sync_progress_);
             sibling->on_sync_progress_.swap(ipc_handler);
             if (current.admitted())
-                for (auto& ipc : sibling->ipc_synchronizers_) if (ipc.sync) ipc.sync->set_on_progress(handler);
+                for (const auto& ipc : sibling->ipc_synchronizers_) ipc->publication->set_progress(handler);
         }
         // Last-release destructors run after both locks AND the borrow lease.
     });

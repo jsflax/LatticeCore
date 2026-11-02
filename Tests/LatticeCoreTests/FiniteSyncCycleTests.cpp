@@ -106,6 +106,25 @@ struct finite_fixture {
         for (size_t i = 0; i < 32; ++i) if (!ack_window()) return;
         throw std::runtime_error("finite fixture ACK loop did not settle");
     }
+    // These two retained cases originate in the released six-column format.
+    // Exercise the real migration while preserving the literal nullable SQL
+    // provenance and original payload bytes; modern admission is not used.
+    void stage_legacy(const lattice::audit_log_entry& delivery,
+                      lattice::column_value_t source = nullptr,
+                      lattice::column_value_t source_uuid = nullptr) {
+        if (!db->db().query("SELECT 1 FROM _lattice_sync_outbox").empty())
+            throw std::runtime_error("legacy fixture requires an empty outbox");
+        lattice::transaction transaction(db->db());
+        db->db().execute("DROP TABLE _lattice_sync_outbox");
+        db->db().execute("CREATE TABLE _lattice_sync_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "sync_id TEXT NOT NULL,source_audit_id INTEGER,source_global_id TEXT,event_global_id TEXT NOT NULL,"
+            "payload TEXT NOT NULL,UNIQUE(sync_id,event_global_id))");
+        db->db().execute("INSERT INTO _lattice_sync_outbox(sync_id,source_audit_id,source_global_id,event_global_id,payload) VALUES(?,?,?,?,?)",
+            {config.sync_id,source,source_uuid,delivery.global_id,delivery.to_json()});
+        lattice::detail::ensure_sync_outbox_schema(db->db());
+        lattice::detail::ensure_sync_storage_guard(db->db(),"_lattice_sync_outbox");
+        transaction.commit();
+    }
     lattice::audit_log_entry remote(std::string id = "remote-event") {
         lattice::audit_log_entry entry;
         entry.global_id = std::move(id);
@@ -343,10 +362,7 @@ TEST(FiniteSyncCycle, DurableOutboxWithoutSourceHistoryMustBeAcknowledged) {
     delivery.id = 0;
     // Provenance may already be compacted; payload and stable wire UUID are
     // the durable obligation, independent of the new cycle's audit horizon.
-    fixture.db->db().execute(
-        "INSERT INTO _lattice_sync_outbox(sync_id,source_audit_id,source_global_id,event_global_id,payload) "
-        "VALUES(?,999,'compacted-source',?,?)",
-        {fixture.config.sync_id, delivery.global_id, delivery.to_json()});
+    fixture.stage_legacy(delivery, int64_t{999}, std::string("compacted-source"));
     fixture.connect(); fixture.marker(); fixture.scheduler->run();
     EXPECT_EQ(fixture.status().phase, phase::running);
     EXPECT_FALSE(fixture.status().horizon_captured);
@@ -440,9 +456,7 @@ TEST(FiniteSyncCycle, LowercaseAcknowledgmentDrainsUppercaseStoredUUIDWithoutTim
 TEST(FiniteSyncCycle, OpaqueOutboxIdentifiersKeepExactAcknowledgmentMatching) {
     finite_fixture fixture;
     auto delivery = fixture.remote("Opaque-Delivery-ID");
-    fixture.db->db().execute(
-        "INSERT INTO _lattice_sync_outbox(sync_id,event_global_id,payload) VALUES(?,?,?)",
-        {fixture.config.sync_id, delivery.global_id, delivery.to_json()});
+    fixture.stage_legacy(delivery);
     fixture.connect(); fixture.marker(); fixture.scheduler->run();
     fixture.receive(lattice::server_sent_event::make_ack({"opaque-delivery-id"}));
     fixture.scheduler->run();

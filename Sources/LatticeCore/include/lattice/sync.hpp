@@ -21,6 +21,10 @@
 #include <unordered_set>
 #include <set>
 #include <mutex>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <type_traits>
 
 namespace lattice {
 
@@ -214,7 +218,115 @@ struct sync_filter_entry {
     std::optional<std::string> where_clause;  // nullopt = all rows
 };
 
+// Audit JSON keeps the existing wire protocol. This bounds an encoded message,
+// independently of event count; the byte-accounted upload window is twice this.
+inline constexpr size_t sync_max_encoded_message_bytes = 4 * 1024 * 1024;
+
+struct encoded_audit_log_prefix {
+    std::string json;
+    size_t count = 0;
+    // Conservative per-entry reservation (each carries its own envelope charge).
+    // Sum of outstanding reservations bounds bytes even after partial ACKs.
+    std::vector<size_t> entry_charges;
+};
+
+/// Encode only a contiguous prefix. A first row that cannot fit a whole message
+/// throws length_error; it is never silently skipped. A temporarily full byte
+/// window returns count 0. No audit/floor/in-flight state is changed here.
+encoded_audit_log_prefix encode_audit_log_prefix(
+    const std::vector<audit_log_entry>& entries, size_t start, size_t max_count,
+    size_t max_bytes = sync_max_encoded_message_bytes,
+    size_t available_window_bytes = 2 * sync_max_encoded_message_bytes);
+
+namespace detail {
+// Recover the exact row bytes from a single-entry bounded encoder result.
+// This does not serialize again or cache across admission/currentness checks.
+std::string single_encoded_audit_log_json(const encoded_audit_log_prefix& encoded);
+
+// Admission is synchronized, but no gate lock is held over SQLite/transport/user work. Holding
+// such a lock in an observer called under SQLite would invert the scheduler's database locks.
+struct sync_callback_gate {
+    std::mutex mutex;
+    std::condition_variable drained;
+    bool accepting=true;
+    size_t active=0;
+    std::map<std::thread::id,size_t> threads;
+    std::shared_ptr<void> channel_lifetime;
+    const std::weak_ptr<void> owner;
+    const bool owner_required;
+    explicit sync_callback_gate(std::shared_ptr<void> lifetime,std::weak_ptr<void> owner={},bool required=false)
+        :channel_lifetime(std::move(lifetime)),owner(std::move(owner)),owner_required(required) {}
+    bool enter() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(!accepting) return false;
+        ++threads[std::this_thread::get_id()];++active;return true;
+    }
+    void leave() {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found=threads.find(std::this_thread::get_id());
+        if(--found->second==0) threads.erase(found);
+        if(--active==0) drained.notify_all();
+    }
+    bool revoke_and_wait() {
+        std::unique_lock<std::mutex> lock(mutex);accepting=false;
+        // A raw/stack owner deleting itself from its callback cannot be kept alive by a mutex.
+        // Report this unresolved ownership path to the destructor; never deadlock or abort here.
+        if(threads.count(std::this_thread::get_id())) return false;
+        drained.wait(lock,[&] {return active==0;});return true;
+    }
+};
+// Keep this non-template cleanup owner outside the generic callback lambda so
+// its destructor has an ordinary inline definition on every supported toolchain.
+struct sync_callback_ticket {
+    std::shared_ptr<sync_callback_gate> gate;
+    ~sync_callback_ticket() {gate->leave();}
+};
+template<class Function>
+auto guard_sync_callback(std::shared_ptr<sync_callback_gate> gate,Function function) {
+    return [gate=std::move(gate),function=std::move(function)](auto&&... args) mutable {
+        if(!gate) return;
+        auto owner=gate->owner.lock();
+        if(gate->owner_required && !owner) return;
+        if(!gate->enter()) return;
+        sync_callback_ticket admitted{gate};
+        function(std::forward<decltype(args)>(args)...);
+    };
+}
+std::shared_ptr<void> acquire_sync_channel_lifetime(lattice_db&,const std::string& sync_id);
+void with_quiescent_sync_channel(lattice_db&,const std::string& sync_id,const std::function<void()>& operation);
+inline std::string sync_reset_meta_key(const std::string& sync_id) {
+    if(sync_id.size()>4096 || sync_id.find('\0')!=std::string::npos)
+        throw std::invalid_argument("Sync channel identity must contain at most 4096 bytes without NUL");
+    return "sync_reset_through_v1:"+sync_id;
+}
+inline int64_t parse_sync_reset_cutoff(const std::string& text) {
+    if(text.empty() || text.size()>19 || (text.size()>1 && text[0]=='0'))
+        throw std::runtime_error("Invalid sync reset cutoff");
+    int64_t value=0;
+    for(char c:text) {
+        if(c<'0' || c>'9' || value>(std::numeric_limits<int64_t>::max()-(c-'0'))/10)
+            throw std::runtime_error("Invalid sync reset cutoff");
+        value=value*10+(c-'0');
+    }
+    return value;
+}
+struct sync_delivery {
+    int64_t receipt_id = 0; // durable storage identity, independent of optional legacy provenance
+    int64_t source_id = 0;
+    std::string source_global_id;
+    audit_log_entry wire;
+    std::string wire_json;
+    std::string routing_key; // exact bounded filter configuration last admitted for this receipt
+    int membership = 0; // -1 remove, 0 unchanged, 1 add; committed with ACK
+    size_t charge = 0;
+    bool legacy_receipt = false; // released v7 receipt may outlive its compacted source
+};
+}
+
 struct sync_config {
+    // Internal owner admission only; never part of a wire frame or persisted routing policy.
+    std::shared_ptr<std::atomic<bool>> owner_active;
+
     std::string websocket_url;
     std::string authorization_token;
     int max_reconnect_attempts = 0;  // 0 = unlimited
@@ -402,16 +514,25 @@ public:
     void clear_sync_filter();
 
     // Event handlers
-    void set_on_sync_complete(on_sync_complete_handler handler) { on_sync_complete_ = std::move(handler); }
-    void set_on_error(on_error_handler handler) { on_error_ = std::move(handler); }
+    void set_on_sync_complete(on_sync_complete_handler handler) {
+        const auto call_owner=callback_owner_.lock();
+        {std::lock_guard<std::mutex> lock(event_handler_mutex_);on_sync_complete_.swap(handler);}
+    }
+    // Replacing a handler does not cancel a callback that already copied it. Snapshots are
+    // invoked outside this mutex, so callbacks may replace handlers or close their owner.
+    void set_on_error(on_error_handler handler) {
+        const auto call_owner=callback_owner_.lock();
+        {std::lock_guard<std::mutex> lock(event_handler_mutex_);on_error_.swap(handler);}
+    }
     void set_on_state_change(on_state_change_handler handler) {
-        on_state_change_ = std::move(handler);
-        if (on_state_change_ && is_connected_) {
-            const auto generation = connection_generation_.load();
-            scheduler_->invoke([this, generation] {
-                if (!is_destroyed_ && connection_generation_ == generation &&
-                    is_connected_ && on_state_change_)
-                    on_state_change_(true);
+        const auto call_owner=callback_owner_.lock();
+        const bool present=static_cast<bool>(handler);
+        {std::lock_guard<std::mutex> lock(event_handler_mutex_);on_state_change_.swap(handler);}
+        if(present && is_connected_) {
+            const auto generation=connection_generation_.load();
+            invoke_on_scheduler([this,generation] {
+                if(!is_destroyed_ && connection_generation_==generation && is_connected_)
+                    fire_state_change(true);
             });
         }
     }
@@ -426,6 +547,10 @@ protected:
     lattice_db& db() { return *db_ptr_; }
     lattice_db* db_ptr_ = nullptr;
 
+    // Both remain alive until after the dedicated connection/scheduler teardown.
+    std::shared_ptr<void> owner_resources_;
+    std::shared_ptr<void> channel_lifetime_;
+
     /// Owned database (native only). Stored in the base class so it outlives
     /// ~synchronizer_base() — base members are destroyed after the base
     /// destructor body, avoiding use-after-free on db_ptr_.
@@ -436,6 +561,11 @@ protected:
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
                    std::unique_ptr<sync_transport> transport);
 
+    std::shared_ptr<detail::sync_callback_gate> callback_gate_;
+    std::weak_ptr<void> callback_owner_;
+    bool callback_owner_required_=false;
+    bool counted_sync_=false;
+    void invoke_on_scheduler(std::function<void()> work);
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<sync_transport> ws_client_;
@@ -455,6 +585,9 @@ protected:
     // Explicit disconnect/reconnect invalidates delayed retries before another
     // transport call can start. Recursive for transports that callback inline.
     std::recursive_mutex connection_mutex_;
+    // Short filter-request/frame-admission boundary. Never held over a transport or user call.
+    // A request revokes future admissions; an already-reserved bounded frame may finish enqueue.
+    std::mutex policy_admission_mutex_;
     std::atomic<uint64_t> connection_generation_{0};
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
@@ -514,6 +647,9 @@ protected:
     void maybe_checkpoint();
 #endif
     std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
+    bool reconciliation_pending_ = false; // bounded synthetic admission resumes after ACK/upload
+    uint64_t applied_filter_version_ = 0; // scheduler-owned; requests revoke sends before configuration applies
+    std::vector<detail::sync_delivery> delivery_outbox_; // scheduler-owned, reload after every durable change
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
 
     // In-flight tracking: entries sent but not yet ACK'd, mapping the entry's
@@ -522,7 +658,8 @@ protected:
     // Prevents upload_pending_changes from re-sending entries on each cycle.
     // Accessed from scheduler thread (upload) and WebSocket/IPC thread (ACK) — needs mutex.
     std::mutex in_flight_mutex_;
-    std::unordered_map<std::string, int64_t> in_flight_ids_;
+    struct in_flight_entry { int64_t audit_id; size_t encoded_bytes; };
+    std::unordered_map<std::string, in_flight_entry> in_flight_ids_;
 
     // Upload-floor bookkeeping (guarded by in_flight_mutex_). open_audit_ids_
     // holds every real audit id enumerated but not yet resolved (ACKed or
@@ -555,9 +692,13 @@ protected:
     /// floor for the life of the connection and vetoes all compaction.
     void reconcile_open_with_db();
 
+    mutable std::mutex event_handler_mutex_;
     on_sync_complete_handler on_sync_complete_;
     on_error_handler on_error_;
     on_state_change_handler on_state_change_;
+    void fire_sync_complete(const std::vector<std::string>& ids);
+    void fire_error(const std::string& error);
+    void fire_state_change(bool connected);
     mutable std::mutex progress_handler_mutex_;
     on_progress_handler on_progress_;
 
@@ -599,25 +740,24 @@ protected:
     struct classified_entries {
         std::vector<audit_log_entry> to_send;
         std::vector<int64_t> to_mark_synced;
+        std::unordered_map<std::string, detail::sync_delivery> to_admit;
     };
     // Continuation is a result of this specific pass, never shared state.
     std::vector<audit_log_entry> query_pending_entries(bool& enumeration_hit_limit);
     classified_entries classify_entries(std::vector<audit_log_entry>& entries);
-    void classify_delete(audit_log_entry& entry, classified_entries& result);
-    void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
-    void send_entries(std::vector<audit_log_entry>& entries);
+    void send_entries(std::vector<audit_log_entry>& entries,
+                      const std::unordered_map<std::string, detail::sync_delivery>* admissions = nullptr);
+    std::string current_routing_key() const;
+    void refresh_delivery_outbox();
+    void cancel_disallowed_deliveries();
+    void resend_delivery_outbox();
+    bool delivery_content_allowed(const detail::sync_delivery& delivery);
+    bool has_pending_delivery(const std::string& table, const std::string& row) const;
 
     // Channel-private deliveries whose classification changes membership.
     // Persist before resolving their source; only a matching ACK removes them.
-    void ensure_sync_outbox();
     void sync_outbox_transaction(const std::function<void()>& body);
-    std::optional<audit_log_entry> stage_sync_delivery(
-        const audit_log_entry& source, audit_log_entry delivery, bool member);
-    std::vector<audit_log_entry> query_sync_outbox(size_t available, bool& pending);
-    std::vector<std::string> sync_outbox_sources(const std::vector<std::string>& ids);
-    void acknowledge_sync_outbox(const std::vector<std::string>& ids);
-    bool filter_reconciliation_pending_ = false;
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
@@ -664,6 +804,30 @@ public:
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
                  std::unique_ptr<sync_transport> transport);
+
+    // Native owner slots use this factory so admitted callbacks retain both the synchronizer
+    // and its dedicated database until return. Standalone raw/stack constructors retain their
+    // caller-managed lifetime contract. The weak owner is installed BEFORE callbacks start.
+    static std::shared_ptr<synchronizer> create_owned(std::unique_ptr<lattice_db> db,const sync_config& config,
+                                                       std::shared_ptr<void> resources={});
+    static std::shared_ptr<synchronizer> create_owned(std::unique_ptr<lattice_db> db,const sync_config& config,
+                                                    std::unique_ptr<sync_transport> transport,
+                                                    std::shared_ptr<void> resources={});
+    // A derived transport's unique_ptr also converts to shared_ptr<void>. Prefer the transport
+    // path explicitly without making callers erase its type or accidentally retain it as resources.
+    template<class Transport, std::enable_if_t<std::is_convertible_v<Transport*,sync_transport*> &&
+                                               !std::is_same_v<Transport,sync_transport>,int> = 0>
+    static std::shared_ptr<synchronizer> create_owned(std::unique_ptr<lattice_db> db,const sync_config& config,
+                                                    std::unique_ptr<Transport> transport,
+                                                    std::shared_ptr<void> resources={}) {
+        return create_owned(std::move(db),config,std::unique_ptr<sync_transport>(std::move(transport)),std::move(resources));
+    }
+private:
+    struct deferred_init {};
+    synchronizer(std::unique_ptr<lattice_db> db,deferred_init);
+    static std::shared_ptr<synchronizer> create_owned_impl(std::unique_ptr<lattice_db> db,const sync_config& config,
+                                                         std::unique_ptr<sync_transport> transport,bool supplied,
+                                                         std::shared_ptr<void> resources);
 };
 
 #endif
@@ -691,7 +855,9 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     const std::optional<std::vector<sync_filter_entry>>& sync_filter = std::nullopt,
     int64_t min_id_exclusive = 0,
     size_t limit = 0,
-    std::optional<int64_t> max_id_inclusive = std::nullopt);
+    std::optional<int64_t> max_id_inclusive = std::nullopt,
+    size_t materialized_byte_limit = 0,
+    bool* hit_byte_limit = nullptr);
 
 /// Read the slot's upload_floor (0 when absent). Monotonic advance helper.
 int64_t read_upload_floor(database& db, const std::string& sync_id);

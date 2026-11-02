@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include <lattice/sync_storage.hpp>
 
 // ============================================================================
 // Schema Tests — DDL generation, migration, geo/vec0 table creation
@@ -178,6 +179,9 @@ void make_legacy_link_store(const std::string& path) {
     // Stamp after the normal close's possible PRAGMA optimize DDL, so the old
     // marker really matches the cookie at the next open.
     lattice::database raw(path);
+    // A current fixture writer stamps the old index fingerprint; it is not an
+    // old binary being granted permission to write the canonical store.
+    lattice::detail::register_sync_storage_writer(raw);
     raw.execute(std::string("DROP INDEX ") + reverse_link_index);
     raw.execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%'");
     auto cookie = raw.query("PRAGMA schema_version");

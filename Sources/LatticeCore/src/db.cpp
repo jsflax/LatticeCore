@@ -237,7 +237,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
 #else
     // Native mode: Enable WAL mode for better concurrency (only on read-write connection)
     if (mode == open_mode::read_write) {
-        execute("PRAGMA journal_mode = WAL");
+        enable_wal_mode();
     }
 
     // Performance optimizations (matching Lattice.swift)
@@ -286,6 +286,49 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         throw db_error("Failed to initialize sqlite-vec extension");
     }
     opening.release();  // Fully initialized: ~database() now owns the connection.
+}
+
+void database::enable_wal_mode() {
+    // Two fresh opens can both read the rollback-journal header before either
+    // upgrades to WAL. SQLite may return BUSY without invoking its busy handler
+    // to avoid a read-to-write lock deadlock. Retry only this idempotent bootstrap
+    // PRAGMA, releasing each failed statement/read lock before waiting again.
+    // One deadline includes time already spent inside SQLite's busy handler.
+    const auto budget = std::chrono::milliseconds(busy_timeout_ms_ > 0 ? busy_timeout_ms_ : 0);
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    constexpr const char* sql = "PRAGMA journal_mode = WAL";
+    try {
+        for (;;) {
+            if (operation_cancelled()) throw db_error("database operation cancelled");
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            configure_busy_timeout(remaining > 0 ? static_cast<int>(remaining) : 0);
+            char* raw_error = nullptr;
+            g_statement_count.fetch_add(1, std::memory_order_relaxed);
+            ++t_statement_count;
+            const int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &raw_error);
+            std::unique_ptr<char, decltype(&sqlite3_free)> error_owner(raw_error, sqlite3_free);
+            const std::string error = raw_error ? raw_error : sqlite3_errmsg(db_);
+            error_owner.reset();
+            // sqlite3_exec has finalized its statement on both success/failure.
+            // A cancelled constructor must not publish a connection even if the
+            // journal transition happened just before cancellation arrived.
+            if (operation_cancelled()) throw db_error("database operation cancelled");
+            if (rc == SQLITE_OK) break;
+            if ((rc & 0xff) != SQLITE_BUSY || std::chrono::steady_clock::now() >= deadline)
+                throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
+            sqlite3_sleep(1);
+            // Zero/expired budgets never get another attempt. Preserve the
+            // failed SQL's error rather than replacing it with a timeout label.
+            if (operation_cancelled()) throw db_error("database operation cancelled");
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
+        }
+    } catch (...) {
+        configure_busy_timeout(busy_timeout_ms_);
+        throw;
+    }
+    configure_busy_timeout(busy_timeout_ms_);
 }
 
 database::~database() {

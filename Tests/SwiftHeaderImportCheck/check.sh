@@ -17,3 +17,16 @@ swiftc -frontend -emit-pcm -module-name LatticeSwiftCppBridge \
   -I "$check_root/Sources/SqliteVec/include" \
   -o "$check_cache/LatticeSwiftCppBridge.pcm" \
   "$check_root/Sources/LatticeSwiftCppBridge/include/module.modulemap"
+
+swiftc -emit-module -parse-as-library -module-name LatticeSwiftModule \
+  -module-cache-path "$check_cache" \
+  -emit-module-path "$check_cache/LatticeSwiftModule.swiftmodule" \
+  "$check_root/Sources/LatticeSwiftModule/LatticeSwiftModule.swift"
+
+swiftc -typecheck -module-name Lattice -cxx-interoperability-mode=default -Xcc -std=c++17 \
+  -Xcc -DSQLITE_CORE -module-cache-path "$check_cache" \
+  -I "$check_cache" \
+  -I "$check_root/Sources/LatticeSwiftCppBridge/include" \
+  -I "$check_root/Sources/LatticeCore/include" \
+  -I "$check_root/Sources/SqliteVec/include" \
+  "$check_root/Tests/SwiftHeaderImportCheck/BackgroundSync.swift"

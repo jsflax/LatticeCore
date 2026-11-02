@@ -2023,8 +2023,8 @@ public:
     /// Replace the WSS connection attempt, preserving local storage and observers.
     void reconnect_sync();
 
-    // Native background lifecycle. A generation owns one private WSS session;
-    // cancellation is an atomic request, suspension is the settlement barrier.
+    // Native background lifecycle. A generation owns local producers and at
+    // most one private WSS session; suspension is their settlement barrier.
     enum class background_sync_admission { started, already_running, not_owner, cancelled, closed, unsupported };
     struct background_sync_start {
         background_sync_admission admission = background_sync_admission::unsupported;
@@ -6282,9 +6282,11 @@ private:
 
     configuration config_;
     static configuration validate_background_sync_configuration(const configuration& config) {
-        if (config.background_sync_managed &&
-            (config.read_only || config.is_in_memory() || config.is_ipc_enabled() || !config.is_sync_enabled()))
-            throw db_error("managed background sync requires a writable file-backed WSS store without IPC");
+        // The SDK's public policy validates a writable WSS owner. Its derived
+        // file handles use this same internal local-producer lifecycle without
+        // registering a task or constructing another transport.
+        if (config.background_sync_managed && (config.is_in_memory() || config.is_ipc_enabled()))
+            throw db_error("managed background lifecycle requires a file store without IPC");
         return config;
     }
     std::atomic<bool> background_sync_suspended_{false};
@@ -9130,15 +9132,22 @@ inline void lattice_db::trigger_sync_upload() {
 inline void lattice_db::connect_sync() {
     if (is_closed() || config_.read_only || !config_.is_sync_enabled()) return;
     const auto generation = current_background_sync_generation();
-    if (generation && get_background_sync_status(generation).phase != synchronizer_base::finite_cycle_phase::inactive) {
-        // Explicit foreground takeover gives a finite operation a fresh owner;
-        // an old expiration token can never cancel the successor.
+    if (generation && (!is_sync_agent() ||
+        get_background_sync_status(generation).phase != synchronizer_base::finite_cycle_phase::inactive)) {
+        // Explicit foreground takeover gives a finite/local-only operation a
+        // fresh owner. A local receipt retries WSS after another owner exits;
+        // its old expiration token can never cancel the successor.
         if (!suspend_background_sync(generation))
             throw db_error("sync lifecycle transition is in progress");
     }
-    if (config_.background_sync_managed || background_sync_suspended_.load(std::memory_order_acquire)) {
+    if (config_.background_sync_managed || generation || background_sync_suspended_.load(std::memory_order_acquire)) {
         const auto started = resume_background_sync({}, false);
         if (started.admission != background_sync_admission::already_running) return;
+        sync_borrow current(*this, true);
+        if (current) current->connect();
+        // A local-only foreground receipt must not fall through to ordinary
+        // setup, which would bypass its cancellation token and ownership rules.
+        return;
     }
     sync_start_requested_ = true;
     {
@@ -9161,25 +9170,37 @@ inline void lattice_db::reconnect_sync() {
 }
 
 inline void lattice_db::set_on_sync_state_change(std::function<void(bool connected)> handler) {
+    auto shared_handler = handler;
+    std::function<void(bool)> retired_shared, retired_ipc;
     {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
-        sync_lifecycle_->state_handler = handler;
+        retired_shared.swap(sync_lifecycle_->state_handler);
+        sync_lifecycle_->state_handler.swap(shared_handler);
         ++sync_lifecycle_->state_callback_revision;
     }
     {
         std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
-        on_sync_state_change_ = std::move(handler);
+        retired_ipc.swap(on_sync_state_change_);
+        on_sync_state_change_.swap(handler);
     }
     replay_sync_state_subscription(sync_lifecycle_);
+    // Retired captures may close/reenter this store. Release both copies only
+    // after leaving every registration lock and completing pointer access.
 }
 
 inline void lattice_db::set_on_sync_error(std::function<void(const std::string& error)> handler) {
+    auto shared_handler = handler;
+    std::function<void(const std::string&)> retired_shared, retired_ipc;
     {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
-        sync_lifecycle_->error_handler = handler;
+        retired_shared.swap(sync_lifecycle_->error_handler);
+        sync_lifecycle_->error_handler.swap(shared_handler);
     }
-    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
-    on_sync_error_ = std::move(handler);
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        retired_ipc.swap(on_sync_error_);
+        on_sync_error_.swap(handler);
+    }
 }
 
 inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
@@ -9199,17 +9220,25 @@ inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
 
 inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler handler) {
     instance_registry::instance().for_each_alive(config_.path, [&handler](lattice_db* sibling) {
+        auto shared_handler = handler;
+        auto ipc_handler = handler;
+        synchronizer::on_progress_handler retired_shared, retired_ipc;
         {
             std::lock_guard<std::mutex> lock(sibling->sync_lifecycle_->mutex);
-            sibling->sync_lifecycle_->progress_handler = handler;
+            retired_shared.swap(sibling->sync_lifecycle_->progress_handler);
+            sibling->sync_lifecycle_->progress_handler.swap(shared_handler);
         }
         // WSS wrappers read the shared registration even during transitions.
         // IPC retains its existing accept-thread publication and fanout path.
-        sync_borrow current(*sibling);
-        std::lock_guard<std::mutex> lock(sibling->ipc_callbacks_mutex_);
-        sibling->on_sync_progress_ = handler;
-        if (current.admitted())
-            for (auto& ipc : sibling->ipc_synchronizers_) if (ipc.sync) ipc.sync->set_on_progress(handler);
+        {
+            sync_borrow current(*sibling);
+            std::lock_guard<std::mutex> lock(sibling->ipc_callbacks_mutex_);
+            retired_ipc.swap(sibling->on_sync_progress_);
+            sibling->on_sync_progress_.swap(ipc_handler);
+            if (current.admitted())
+                for (auto& ipc : sibling->ipc_synchronizers_) if (ipc.sync) ipc.sync->set_on_progress(handler);
+        }
+        // Last-release destructors run after both locks AND the borrow lease.
     });
 }
 

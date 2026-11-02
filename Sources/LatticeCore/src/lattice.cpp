@@ -867,12 +867,19 @@ lattice_db::background_sync_start lattice_db::resume_background_sync(
     return {background_sync_admission::unsupported, 0};
 #else
     if (is_closed()) return {background_sync_admission::closed, 0};
-    if (config_.read_only || config_.is_in_memory() || config_.is_ipc_enabled() ||
-        !config_.is_sync_enabled()) return {background_sync_admission::unsupported, 0};
+    const bool supports_wss = !config_.read_only && config_.is_sync_enabled();
+    if (config_.is_in_memory() || config_.is_ipc_enabled() ||
+        (!supports_wss && (finite_cycle || !config_.background_sync_managed)))
+        return {background_sync_admission::unsupported, 0};
     if (!cancellation) cancellation = std::make_shared<std::atomic<bool>>(false);
     if (cancellation->load(std::memory_order_acquire)) return {background_sync_admission::cancelled, 0};
     if (!begin_sync_transition(false)) return {background_sync_admission::already_running, 0};
-    if (is_closed() || synchronizer_) {
+    bool owns_local_generation;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        owns_local_generation = sync_lifecycle_->generation != 0;
+    }
+    if (is_closed() || synchronizer_ || owns_local_generation) {
         const auto result = is_closed() ? background_sync_admission::closed : background_sync_admission::already_running;
         end_sync_transition();
         return {result, 0};
@@ -905,7 +912,7 @@ lattice_db::background_sync_start lattice_db::resume_background_sync(
         // stores stay suspended; ordinary manual calls restore their prior state.
         stop_audit_maintenance();
         setup_sync_owned(finite_cycle, cancellation, false);
-        if (!synchronizer_ || cancellation->load(std::memory_order_acquire) || is_closed()) {
+        if ((!synchronizer_ && finite_cycle) || cancellation->load(std::memory_order_acquire) || is_closed()) {
             const auto result = is_closed() ? background_sync_admission::closed :
                 (cancellation->load(std::memory_order_acquire) ? background_sync_admission::cancelled : background_sync_admission::not_owner);
             sync_start_requested_ = false;
@@ -913,6 +920,9 @@ lattice_db::background_sync_start lattice_db::resume_background_sync(
             return {result, generation};
         }
         if (!finite_cycle) {
+            // Another same-path owner can legitimately hold WSS. Foreground
+            // observation/readers/retention still belong to this local receipt;
+            // suspension must settle them without touching that other owner.
             background_sync_suspended_.store(false, std::memory_order_release);
             start_audit_maintenance();
         }

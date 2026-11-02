@@ -25,6 +25,15 @@
 - Fence queued messages across connection generations and prevent a stale
   expiration or callback from changing a successor's ownership. Keep callback
   registration safe while a session is being replaced or retired.
+- Release replaced callback captures outside registration locks, so a capture's
+  destructor can reenter registration or close its store without deadlocking.
+- Match UUID acknowledgements regardless of hexadecimal letter case, including
+  durable filtered deliveries, so mixed Swift/Core UUID formatting cannot leave
+  phantom in-flight work waiting for the acknowledgement watchdog.
+- Resume foreground readers and observation even when another handle owns WSS.
+  Managed local borrowers, including read-only file handles, join lifecycle
+  suspension without acquiring a transport; explicit connect can retry WSS
+  ownership with a fresh cancellation generation.
 - Share observer callback depth across linked modules, avoiding a destructor
   self-wait when SwiftBuild combines Core into an aggregate object.
 - Seal Swift bridge filter mutations so lifecycle contention is reported
@@ -39,8 +48,10 @@
   replay pending outbox rows; downgrading with pending rows is not supported.
 - Servers send the new initial-replay marker only when requested by the client.
   Finite completion covers an upload prefix and one replay pass, not ongoing
-  global convergence. Managed background mode requires a writable file store,
-  configured WSS, and no unmanaged IPC targets.
+  global convergence. Finite sync and the SDK's public background policy require
+  a writable file store, configured WSS, and no unmanaged IPC targets. Internal
+  managed local borrowers may be read-only and omit WSS, but remain file-only
+  and cannot perform finite sync themselves.
 
 ## [2.4.2] - 2026-10-30
 

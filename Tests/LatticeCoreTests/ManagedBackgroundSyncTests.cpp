@@ -151,17 +151,9 @@ TEST(ManagedBackgroundSync, OrdinaryManualFiniteRestoresPriorRetentionAndKeepsPa
     EXPECT_EQ(owner.current_background_sync_generation(), 0u);
 }
 
-TEST(ManagedBackgroundSync, ManagedConfigurationRejectsUnsupportedBeforeOpeningStore) {
+TEST(ManagedBackgroundSync, ManagedConfigurationRejectsMemoryAndIPCBeforeOpeningStore) {
     managed_fixture fixture;
     auto cfg = fixture.config();
-    cfg.read_only = true;
-    EXPECT_THROW((lattice::lattice_db(cfg)), lattice::db_error);
-    EXPECT_FALSE(std::filesystem::exists(fixture.file.path));
-    cfg.read_only = false;
-    cfg.authorization_token.clear();
-    EXPECT_THROW((lattice::lattice_db(cfg)), lattice::db_error);
-    EXPECT_FALSE(std::filesystem::exists(fixture.file.path));
-    cfg.authorization_token = "test";
     cfg.ipc_targets.emplace_back();
     cfg.ipc_targets.back().channel = "unsupported-managed-ipc";
     EXPECT_THROW((lattice::lattice_db(cfg)), lattice::db_error);
@@ -420,5 +412,178 @@ TEST(ManagedBackgroundSync, CallbackSubscriptionsDuringSetupKeepLatestHandlers) 
     EXPECT_EQ(old_error.load(), 0);
     EXPECT_EQ(old_progress.load(), 0);
     EXPECT_TRUE(owner.suspend_background_sync(run.generation));
+}
+
+namespace {
+enum class reentrant_subscription { state, error, progress };
+void callback_replacement_releases_outside_locks(reentrant_subscription kind) {
+    managed_fixture fixture;
+    lattice::lattice_db owner(fixture.config());
+    int destroyed = 0;
+    struct capture {
+        lattice::lattice_db& owner;
+        int& destroyed;
+        reentrant_subscription kind;
+        capture(lattice::lattice_db& db, int& count, reentrant_subscription value)
+            : owner(db), destroyed(count), kind(value) {}
+        ~capture() {
+            ++destroyed;
+            // Reenter the exact registration lock, then exercise close's
+            // lifecycle transition. Neither may run under a retired slot lock.
+            switch (kind) {
+            case reentrant_subscription::state: owner.set_on_sync_state_change({}); break;
+            case reentrant_subscription::error: owner.set_on_sync_error({}); break;
+            case reentrant_subscription::progress: owner.set_on_sync_progress({}); break;
+            }
+            owner.close();
+        }
+    };
+    auto value = std::make_shared<capture>(owner, destroyed, kind);
+    switch (kind) {
+    case reentrant_subscription::state:
+        owner.set_on_sync_state_change([value](bool) {}); value.reset();
+        owner.set_on_sync_state_change({}); break;
+    case reentrant_subscription::error:
+        owner.set_on_sync_error([value](const std::string&) {}); value.reset();
+        owner.set_on_sync_error({}); break;
+    case reentrant_subscription::progress:
+        owner.set_on_sync_progress([value](const auto&) {}); value.reset();
+        owner.set_on_sync_progress({}); break;
+    }
+    if (destroyed != 1 || !owner.is_closed()) _exit(2);
+}
+}
+
+TEST(ManagedBackgroundSync, ReplacingStateCallbackCanReenterAndCloseFromCaptureDestructor) {
+    EXPECT_EXIT({ alarm(5); callback_replacement_releases_outside_locks(reentrant_subscription::state); _exit(0); },
+                ::testing::ExitedWithCode(0), "");
+}
+TEST(ManagedBackgroundSync, ReplacingErrorCallbackCanReenterAndCloseFromCaptureDestructor) {
+    EXPECT_EXIT({ alarm(5); callback_replacement_releases_outside_locks(reentrant_subscription::error); _exit(0); },
+                ::testing::ExitedWithCode(0), "");
+}
+TEST(ManagedBackgroundSync, ReplacingProgressCallbackCanReenterAndCloseFromCaptureDestructor) {
+    EXPECT_EXIT({ alarm(5); callback_replacement_releases_outside_locks(reentrant_subscription::progress); _exit(0); },
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST(ManagedBackgroundSync, ForegroundLocalReceiptWorksWhileAnotherStoreOwnsWSS) {
+    managed_fixture fixture;
+    lattice::lattice_db sync_owner(fixture.config(false));
+    ASSERT_TRUE(sync_owner.is_sync_agent());
+    ASSERT_TRUE(sync_owner.is_sync_connected());
+    auto cfg = fixture.config();
+    cfg.audit_retention_seconds = 3600;
+    lattice::lattice_db local(cfg);
+    auto connection = lattice::background_sync_lifecycle_test_access::xproc_connection(local);
+    std::atomic<int> statements{0};
+    sqlite3_trace_v2(connection->handle(), SQLITE_TRACE_STMT,
+        [](unsigned, void* raw, void*, void*) -> int {
+            ++*static_cast<std::atomic<int>*>(raw); return 0;
+        }, &statements);
+    const auto run = local.resume_background_sync({}, false);
+    ASSERT_EQ(run.admission, admission::started);
+    ASSERT_NE(run.generation, 0u);
+    EXPECT_FALSE(local.is_sync_agent());
+    EXPECT_EQ(local.current_background_sync_generation(), run.generation);
+    EXPECT_TRUE(lattice::background_sync_lifecycle_test_access::retention_running(local));
+    EXPECT_FALSE(lattice::background_sync_lifecycle_test_access::parent_suspended(local));
+    const auto keeper = local.acquire_read_generation();
+    ASSERT_NE(keeper, 0u);
+    lattice::background_sync_lifecycle_test_access::notify(local);
+    EXPECT_GT(statements.load(), 0);
+    EXPECT_EQ(local.resume_background_sync({}, false).admission, admission::already_running);
+    EXPECT_EQ(local.current_background_sync_generation(), run.generation);
+    EXPECT_FALSE(local.is_sync_agent());
+    EXPECT_TRUE(local.suspend_background_sync(run.generation));
+    EXPECT_FALSE(local.query_at_generation(keeper, "SELECT 1 AS n").has_value());
+    EXPECT_EQ(local.acquire_read_generation(), 0u);
+    EXPECT_FALSE(lattice::background_sync_lifecycle_test_access::retention_running(local));
+    statements = 0;
+    lattice::background_sync_lifecycle_test_access::notify(local);
+    EXPECT_EQ(statements.load(), 0);
+    sqlite3_trace_v2(connection->handle(), 0, nullptr, nullptr);
+    EXPECT_TRUE(sync_owner.is_sync_agent());
+    EXPECT_TRUE(sync_owner.is_sync_connected());
+    EXPECT_FALSE(fixture.lock_available());
+}
+
+TEST(ManagedBackgroundSync, FiniteAttemptStillRejectsForeignWSSOwnership) {
+    managed_fixture fixture;
+    lattice::lattice_db sync_owner(fixture.config(false));
+    lattice::lattice_db local(fixture.config());
+    const auto run = local.resume_background_sync({}, true);
+    EXPECT_EQ(run.admission, admission::not_owner);
+    EXPECT_EQ(local.current_background_sync_generation(), 0u);
+    EXPECT_EQ(local.acquire_read_generation(), 0u);
+    EXPECT_TRUE(lattice::background_sync_lifecycle_test_access::parent_suspended(local));
+    EXPECT_TRUE(sync_owner.is_sync_connected());
+    EXPECT_FALSE(fixture.lock_available());
+}
+
+TEST(ManagedBackgroundSync, ExplicitConnectRetriesWSSFromLocalReceiptWithFreshGeneration) {
+    managed_fixture fixture;
+    lattice::lattice_db sync_owner(fixture.config(false));
+    lattice::lattice_db local(fixture.config());
+    auto old_token = std::make_shared<std::atomic<bool>>(false);
+    const auto run = local.resume_background_sync(old_token, false);
+    ASSERT_EQ(run.admission, admission::started);
+    ASSERT_FALSE(local.is_sync_agent());
+    sync_owner.close();
+    ASSERT_TRUE(fixture.lock_available());
+    EXPECT_NO_THROW(local.connect_sync());
+    const auto next = local.current_background_sync_generation();
+    EXPECT_GT(next, run.generation);
+    EXPECT_TRUE(local.is_sync_agent());
+    EXPECT_TRUE(local.is_sync_connected());
+    old_token->store(true);
+    EXPECT_FALSE(local.cancel_background_sync(run.generation));
+    EXPECT_FALSE(local.suspend_background_sync(run.generation));
+    EXPECT_TRUE(local.is_sync_connected());
+    EXPECT_TRUE(local.suspend_background_sync(next));
+    EXPECT_TRUE(fixture.lock_available());
+}
+
+namespace {
+void managed_local_file_lifecycle(bool read_only) {
+    managed_fixture fixture;
+    {
+        lattice::lattice_db seed(fixture.file.str());
+        seed.add(TestPerson{"local borrowed row", 21, std::nullopt});
+    }
+    lattice::configuration cfg(fixture.file.str());
+    cfg.background_sync_managed = true;
+    cfg.read_only = read_only;
+    cfg.audit_retention_seconds = 3600;
+    lattice::lattice_db local(cfg);
+    EXPECT_EQ(local.acquire_read_generation(), 0u);
+    EXPECT_EQ(local.resume_background_sync({}, true).admission, admission::unsupported);
+    const auto run = local.resume_background_sync({}, false);
+    ASSERT_EQ(run.admission, admission::started);
+    EXPECT_NE(run.generation, 0u);
+    EXPECT_FALSE(local.is_sync_agent());
+    EXPECT_EQ(fixture.network->last_websocket(), nullptr);
+    EXPECT_EQ(lattice::background_sync_lifecycle_test_access::retention_running(local), !read_only);
+    const auto keeper = local.acquire_read_generation();
+    ASSERT_NE(keeper, 0u);
+    const auto rows = local.query_at_generation(keeper, "SELECT name FROM TestPerson");
+    ASSERT_TRUE(rows.has_value());
+    ASSERT_EQ(rows->size(), 1u);
+    EXPECT_EQ(std::get<std::string>(rows->front().at("name")), "local borrowed row");
+    EXPECT_EQ(local.resume_background_sync({}, true).admission, admission::unsupported);
+    EXPECT_EQ(local.current_background_sync_generation(), run.generation);
+    EXPECT_TRUE(local.suspend_background_sync(run.generation));
+    EXPECT_FALSE(lattice::background_sync_lifecycle_test_access::retention_running(local));
+    EXPECT_FALSE(local.query_at_generation(keeper, "SELECT 1 AS n").has_value());
+    EXPECT_EQ(local.acquire_read_generation(), 0u);
+    EXPECT_EQ(local.current_background_sync_generation(), 0u);
+    EXPECT_EQ(fixture.network->last_websocket(), nullptr);
+}
+}
+TEST(ManagedBackgroundSync, WritableLocalBorrowerHasManagedLifecycleWithoutWSS) {
+    managed_local_file_lifecycle(false);
+}
+TEST(ManagedBackgroundSync, ReadOnlyLocalBorrowerHasManagedLifecycleWithoutWSS) {
+    managed_local_file_lifecycle(true);
 }
 #endif

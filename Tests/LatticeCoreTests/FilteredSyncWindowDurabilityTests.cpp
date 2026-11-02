@@ -504,3 +504,35 @@ TEST(FilteredSyncWindowDurability, InvalidStoredPayloadDoesNotDiscardDelivery) {
     EXPECT_TRUE(fixture.peer_has_target());
     EXPECT_TRUE(fixture.wire->get_sent_messages().empty());
 }
+
+TEST(FilteredSyncWindowDurability, UppercaseSyntheticAcknowledgmentResolvesSourceAndOnlyItsChannelOutbox) {
+    filtered_window_fixture fixture;
+    fixture.set_target_age(0);
+    ASSERT_EQ(fixture.outbox_count(), 1);
+    const auto rows = fixture.source->db().query(
+        "SELECT source_audit_id,event_global_id,payload FROM _lattice_sync_outbox WHERE sync_id=?",
+        {fixture.config.sync_id});
+    ASSERT_EQ(rows.size(), 1u);
+    const auto source_id = std::get<int64_t>(rows[0].at("source_audit_id"));
+    const auto wire_id = std::get<std::string>(rows[0].at("event_global_id"));
+    std::string upper = wire_id;
+    for (auto& c : upper) if (c >= 'a' && c <= 'f') c -= 'a' - 'A';
+    const auto delivery = lattice::audit_log_entry::from_json(std::get<std::string>(rows[0].at("payload")));
+    ASSERT_TRUE(delivery);
+    ASSERT_EQ(lattice::apply_remote_changes_for(fixture.peer, {*delivery}, "fixture-source").size(), 1u);
+    fixture.source->db().execute(
+        "INSERT INTO _lattice_sync_outbox(sync_id,source_audit_id,source_global_id,event_global_id,payload) "
+        "SELECT 'other-channel',source_audit_id,source_global_id,event_global_id,payload "
+        "FROM _lattice_sync_outbox WHERE sync_id=?", {fixture.config.sync_id});
+    fixture.wire->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_ack({upper}).to_json()));
+    EXPECT_EQ(fixture.outbox_count(), 0);
+    EXPECT_EQ(fixture.outbox_count("other-channel"), 1);
+    EXPECT_EQ(fixture.sync->get_progress().pending_upload, 0);
+    EXPECT_FALSE(fixture.peer_has_target());
+    // The synthetic wire UUID differs from the source UUID. Its ACK must
+    // still resolve source bookkeeping through the outbox provenance lookup.
+    const auto source = fixture.source->db().query("SELECT isSynchronized FROM AuditLog WHERE id=?", {source_id});
+    ASSERT_EQ(source.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(source[0].at("isSynchronized")), 1);
+}

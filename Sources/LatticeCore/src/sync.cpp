@@ -17,6 +17,51 @@ std::function<void()> sync_outbox_after_insert;
 using json = nlohmann::json;
 
 namespace {
+// Core emits lowercase UUIDs; Foundation's UUID encoder emits uppercase.
+// Compare canonical UUID keys without changing wire bytes or opaque IDs.
+bool is_sync_uuid(const std::string& value) {
+    if (value.size() != 36) return false;
+    for (size_t index = 0; index < value.size(); ++index) {
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (value[index] != '-') return false;
+        } else {
+            const char c = value[index];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                return false;
+        }
+    }
+    return true;
+}
+
+std::string sync_event_key(const std::string& value) {
+    std::string key = value;
+    if (is_sync_uuid(key))
+        for (auto& c : key) if (c >= 'A' && c <= 'F') c += 'a' - 'A';
+    return key;
+}
+
+// Outbox payloads keep their stable wire spelling, including existing rows.
+// Only UUID parameters use case-insensitive comparison; sync_id and opaque
+// event IDs retain exact comparison. Each caller bounds the parameter batch.
+std::string sync_outbox_ack_clause(const std::vector<std::string>& ids, size_t start, size_t end,
+                                  std::vector<column_value_t>& parameters) {
+    std::string clause;
+    for (bool uuid : {true, false}) {
+        std::string placeholders;
+        for (size_t index = start; index < end; ++index) {
+            if (is_sync_uuid(ids[index]) != uuid) continue;
+            if (!placeholders.empty()) placeholders += ',';
+            placeholders += '?';
+            parameters.push_back(ids[index]);
+        }
+        if (placeholders.empty()) continue;
+        if (!clause.empty()) clause += " OR ";
+        clause += std::string(uuid ? "event_global_id COLLATE NOCASE" : "event_global_id") +
+            " IN (" + placeholders + ")";
+    }
+    return "(" + clause + ")";
+}
+
 std::vector<std::string> no_history_columns(database& db, const std::string& table_name);
 void mark_no_history_nulls(audit_log_entry& entry, const std::vector<std::string>& columns);
 }
@@ -2117,7 +2162,7 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enum
             entries.erase(
                 std::remove_if(entries.begin(), entries.end(),
                     [this](const audit_log_entry& e) {
-                        return in_flight_ids_.count(e.global_id) > 0;
+                        return in_flight_ids_.count(sync_event_key(e.global_id)) > 0;
                     }),
                 entries.end());
             if (entries.size() < original_size) {
@@ -2242,7 +2287,7 @@ std::vector<audit_log_entry> synchronizer_base::query_sync_outbox(size_t availab
     std::vector<audit_log_entry> entries;
     for (const auto& row : rows) {
         const auto& id = std::get<std::string>(row.at("event_global_id"));
-        if (in_flight.count(id)) continue;
+        if (in_flight.count(sync_event_key(id))) continue;
         auto entry = audit_log_entry::from_json(std::get<std::string>(row.at("payload")));
         if (!entry || entry->global_id != id)
             throw std::runtime_error("invalid stored sync delivery");
@@ -2258,15 +2303,11 @@ std::vector<std::string> synchronizer_base::sync_outbox_sources(const std::vecto
     constexpr size_t chunk = 400;
     for (size_t start = 0; start < ids.size(); start += chunk) {
         const size_t end = std::min(start + chunk, ids.size());
-        std::string placeholders;
         std::vector<column_value_t> parameters{config_.sync_id};
-        for (size_t index = start; index < end; ++index) {
-            placeholders += index == start ? "?" : ",?";
-            parameters.push_back(ids[index]);
-        }
+        const auto matches = sync_outbox_ack_clause(ids, start, end, parameters);
         const auto rows = db().db().query(
             "SELECT source_global_id FROM _lattice_sync_outbox "
-            "WHERE sync_id=? AND event_global_id IN (" + placeholders + ")", parameters);
+            "WHERE sync_id=? AND " + matches, parameters);
         for (const auto& row : rows) {
             const auto& value = row.at("source_global_id");
             if (std::holds_alternative<std::string>(value))
@@ -2282,15 +2323,10 @@ void synchronizer_base::acknowledge_sync_outbox(const std::vector<std::string>& 
         constexpr size_t chunk = 400;
         for (size_t start = 0; start < ids.size(); start += chunk) {
             const size_t end = std::min(start + chunk, ids.size());
-            std::string placeholders;
             std::vector<column_value_t> parameters{config_.sync_id};
-            for (size_t index = start; index < end; ++index) {
-                placeholders += index == start ? "?" : ",?";
-                parameters.push_back(ids[index]);
-            }
+            const auto matches = sync_outbox_ack_clause(ids, start, end, parameters);
             db().db().execute(
-                "DELETE FROM _lattice_sync_outbox WHERE sync_id=? "
-                "AND event_global_id IN (" + placeholders + ")", parameters);
+                "DELETE FROM _lattice_sync_outbox WHERE sync_id=? AND " + matches, parameters);
         }
     });
 }
@@ -2737,7 +2773,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         for (size_t i = 0; i < window_end; ++i) {
             // Map to the AuditLog id so an ACK can resolve the upload floor;
             // synthetic entries carry id 0 and never gate the floor.
-            in_flight_ids_[entries[i].global_id] = entries[i].id;
+            in_flight_ids_[sync_event_key(entries[i].global_id)] = entries[i].id;
         }
         progress_pending_upload_.store(
             static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
@@ -2794,7 +2830,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
 #ifndef __EMSCRIPTEN__
     std::vector<std::string> sent_ids;
     sent_ids.reserve(entries.size());
-    for (const auto& e : entries) sent_ids.push_back(e.global_id);
+    for (const auto& e : entries) sent_ids.push_back(sync_event_key(e.global_id));
     // Read immutable timeout inputs while this operation still owns the
     // synchronizer. A detached worker may first run after teardown finishes.
     const auto ack_timeout_base_ms = config_.ack_timeout_base_ms;
@@ -3034,7 +3070,7 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (const auto& id : global_ids) {
-            auto it = in_flight_ids_.find(id);
+            auto it = in_flight_ids_.find(sync_event_key(id));
             if (it != in_flight_ids_.end()) {
                 if (it->second > 0) resolved_audit_ids.push_back(it->second);
                 in_flight_ids_.erase(it);

@@ -404,3 +404,54 @@ TEST(FiniteSyncCycle, DisablingUploadFloorStillBoundsFiniteWindowsAndExcludesLat
     EXPECT_EQ(fixture.uploads().size(), 5u);
     EXPECT_EQ(lattice::query_audit_log_for_sync(fixture.db->db(), fixture.config.sync_id).size(), 1u);
 }
+
+TEST(FiniteSyncCycle, FoundationUppercaseAcknowledgmentDrainsLowercaseUUIDWithoutTimeout) {
+    finite_fixture fixture(1);
+    const std::string lower = "01234567-89ab-cdef-0123-456789abcdef";
+    const std::string upper = "01234567-89AB-CDEF-0123-456789ABCDEF";
+    fixture.db->db().execute("UPDATE AuditLog SET globalId=?", {lower});
+    fixture.connect(); fixture.marker(); fixture.scheduler->run();
+    ASSERT_EQ(fixture.uploads().size(), 1u);
+    ASSERT_EQ(fixture.uploads()[0].global_id, lower);
+    fixture.receive(lattice::server_sent_event::make_ack({upper}));
+    fixture.scheduler->run();
+    EXPECT_EQ(fixture.sync->get_progress().pending_upload, 0);
+    EXPECT_EQ(fixture.status().phase, phase::work_complete);
+    EXPECT_EQ(fixture.uploads().size(), 1u);
+}
+
+TEST(FiniteSyncCycle, LowercaseAcknowledgmentDrainsUppercaseStoredUUIDWithoutTimeout) {
+    finite_fixture fixture(1);
+    const std::string lower = "01234567-89ab-cdef-0123-456789abcdef";
+    const std::string upper = "01234567-89AB-CDEF-0123-456789ABCDEF";
+    fixture.db->db().execute("UPDATE AuditLog SET globalId=?", {upper});
+    fixture.connect(); fixture.marker(); fixture.scheduler->run();
+    ASSERT_EQ(fixture.uploads().size(), 1u);
+    ASSERT_EQ(fixture.uploads()[0].global_id, upper);
+    // Repeated upload requests must also use canonical in-flight keys.
+    fixture.sync->sync_now(); fixture.scheduler->run();
+    EXPECT_EQ(fixture.uploads().size(), 1u);
+    fixture.receive(lattice::server_sent_event::make_ack({lower}));
+    fixture.scheduler->run();
+    EXPECT_EQ(fixture.sync->get_progress().pending_upload, 0);
+    EXPECT_EQ(fixture.status().phase, phase::work_complete);
+}
+
+TEST(FiniteSyncCycle, OpaqueOutboxIdentifiersKeepExactAcknowledgmentMatching) {
+    finite_fixture fixture;
+    auto delivery = fixture.remote("Opaque-Delivery-ID");
+    fixture.db->db().execute(
+        "INSERT INTO _lattice_sync_outbox(sync_id,event_global_id,payload) VALUES(?,?,?)",
+        {fixture.config.sync_id, delivery.global_id, delivery.to_json()});
+    fixture.connect(); fixture.marker(); fixture.scheduler->run();
+    fixture.receive(lattice::server_sent_event::make_ack({"opaque-delivery-id"}));
+    fixture.scheduler->run();
+    EXPECT_EQ(fixture.status().phase, phase::running);
+    EXPECT_EQ(fixture.sync->get_progress().pending_upload, 1);
+    EXPECT_EQ(fixture.db->db().query("SELECT 1 FROM _lattice_sync_outbox").size(), 1u);
+    fixture.receive(lattice::server_sent_event::make_ack({delivery.global_id}));
+    fixture.scheduler->run();
+    EXPECT_EQ(fixture.status().phase, phase::work_complete);
+    EXPECT_EQ(fixture.sync->get_progress().pending_upload, 0);
+    EXPECT_TRUE(fixture.db->db().query("SELECT 1 FROM _lattice_sync_outbox").empty());
+}

@@ -3178,6 +3178,7 @@ namespace detail {
         std::string fp = config.read_only ? "R" : "W";
         fp += config.sync_is_observer ? 'O' : 'P';
         fp += config.sync_autostart ? 'A' : 'D';
+        fp += config.background_sync_managed ? 'M' : 'U';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         append_cache_string(fp, config.authorization_token);
@@ -3499,6 +3500,30 @@ inline void swift_lattice::close() {
     detail::LatticeCache::instance().evict(this);
     lattice_db::close();
 }
+
+/// Copyable across the Swift/C++ boundary, including the iOS 15 value path.
+/// Cancellation is nonblocking and can precede native connection setup.
+class swift_sync_cancellation {
+public:
+    swift_sync_cancellation() : token_(std::make_shared<std::atomic<bool>>(false)) {}
+    void cancel() const { token_->store(true, std::memory_order_release); }
+    bool is_cancelled() const { return token_->load(std::memory_order_acquire); }
+private:
+    friend class swift_lattice_ref;
+    std::shared_ptr<std::atomic<bool>> token_;
+};
+
+// Swift cannot import types nested in lattice_db (the enclosing native owner
+// is deliberately unavailable). Keep these bridge receipts plain values.
+enum class swift_background_sync_admission { started, already_running, not_owner, cancelled, closed, unsupported };
+struct swift_background_sync_start {
+    swift_background_sync_admission admission = swift_background_sync_admission::unsupported;
+    uint64_t generation = 0;
+};
+enum class swift_finite_sync_phase { inactive, running, work_complete, failed, cancelled };
+struct swift_background_sync_status {
+    swift_finite_sync_phase phase = swift_finite_sync_phase::inactive;
+};
 
 class swift_lattice_ref {
 public:
@@ -3872,10 +3897,53 @@ public:
     void disconnect_sync() const { sealed([&] { impl().disconnect_sync(); }); }
     void reconnect_sync() const { sealed([&] { impl().reconnect_sync(); }); }
 
+    bool is_background_sync_managed() const { return impl().config().background_sync_managed; }
+
+    swift_background_sync_start resume_background_sync(const swift_sync_cancellation& cancellation,
+                                                 bool finite_cycle) const {
+        return sealed([&] {
+            const auto native = impl().resume_background_sync(cancellation.token_, finite_cycle);
+            swift_background_sync_start result;
+            result.generation = native.generation;
+            switch (native.admission) {
+                case lattice_db::background_sync_admission::started: result.admission = swift_background_sync_admission::started; break;
+                case lattice_db::background_sync_admission::already_running: result.admission = swift_background_sync_admission::already_running; break;
+                case lattice_db::background_sync_admission::not_owner: result.admission = swift_background_sync_admission::not_owner; break;
+                case lattice_db::background_sync_admission::cancelled: result.admission = swift_background_sync_admission::cancelled; break;
+                case lattice_db::background_sync_admission::closed: result.admission = swift_background_sync_admission::closed; break;
+                case lattice_db::background_sync_admission::unsupported: break;
+            }
+            return result;
+        });
+    }
+    uint64_t current_background_sync_generation() const {
+        return sealed([&] { return impl().current_background_sync_generation(); });
+    }
+    swift_background_sync_status get_background_sync_status(uint64_t generation) const {
+        return sealed([&] {
+            const auto native = impl().get_background_sync_status(generation);
+            swift_background_sync_status result;
+            switch (native.phase) {
+                case synchronizer_base::finite_cycle_phase::inactive: break;
+                case synchronizer_base::finite_cycle_phase::running: result.phase = swift_finite_sync_phase::running; break;
+                case synchronizer_base::finite_cycle_phase::work_complete: result.phase = swift_finite_sync_phase::work_complete; break;
+                case synchronizer_base::finite_cycle_phase::failed: result.phase = swift_finite_sync_phase::failed; break;
+                case synchronizer_base::finite_cycle_phase::cancelled: result.phase = swift_finite_sync_phase::cancelled; break;
+            }
+            return result;
+        });
+    }
+    bool cancel_background_sync(uint64_t generation) const {
+        return sealed([&] { return impl().cancel_background_sync(generation); });
+    }
+    bool suspend_background_sync(uint64_t generation) const {
+        return sealed([&] { return impl().suspend_background_sync(generation); });
+    }
+
     // Sync status
     bool is_sync_agent() const { return impl().is_sync_agent(); }
     bool is_sync_connected() const { return impl().is_sync_connected(); }
-    void clear_sync_filter() const { impl().clear_sync_filter(); }
+    void clear_sync_filter() const { sealed([&] { impl().clear_sync_filter(); }); }
 
     // Spatial (R*Tree)
     std::vector<managed<swift_dynamic_object>> objects_within_bbox(
@@ -3962,15 +4030,15 @@ public:
     }
 
     // Sync filter
-    void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
+    void update_sync_filter(const SyncFilterVector& filter) const { sealed([&] { impl().update_sync_filter(filter); }); }
     void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const {
-        impl().update_sync_filter_for_channel(channel, filter);
+        sealed([&] { impl().update_sync_filter_for_channel(channel, filter); });
     }
     void clear_sync_filter_for_channel(const std::string& channel) const {
-        impl().clear_sync_filter_for_channel(channel);
+        sealed([&] { impl().clear_sync_filter_for_channel(channel); });
     }
     void remove_sync_channel_state(const std::string& sync_id) const {
-        impl().remove_sync_channel_state(sync_id);
+        sealed([&] { impl().remove_sync_channel_state(sync_id); });
     }
     /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
     /// see lattice_db::delete_rows_no_relay for why a normal delete is

@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <functional>
+#include <chrono>
 
 namespace lattice {
 
@@ -23,6 +24,7 @@ public:
 
 class database {
     friend class lattice_db;
+    friend class synchronizer_base;
     // Test-only friend seam: install on the query's calling thread and clear
     // before that thread exits. No public setter, bridge API or instance field.
     friend struct database_query_test_access;
@@ -97,6 +99,41 @@ class database {
     };
 
 public:
+    /// Internal ownership for a cancellable sequence of SQL busy waits.
+    /// Take any store write gate BEFORE this scope. Admission never waits for
+    /// another SQLite owner and rejects an existing transaction or statement.
+    /// Only the creating thread may use/destroy the non-nestable scope; another
+    /// thread may set `cancelled`, which must outlive it. No sqlite3_interrupt
+    /// is sent to the connection, and ordinary callers retain SQLite's handler.
+    /// This cancels lock waits, not arbitrary long-running SQL. The caller still
+    /// owns its transaction's commit/rollback and post-commit notification drain.
+    class cancellable_operation {
+        friend class database;
+        database& owner_;
+        sqlite3_mutex* mutex_;
+        const std::atomic<bool>& cancelled_;
+        int wait_budget_ms_ = 0;
+        std::chrono::steady_clock::time_point wait_deadline_{};
+        static inline thread_local cancellable_operation* current_ = nullptr;
+        static int busy(void* context, int previous_calls) noexcept;
+        void set_wait_budget(int timeout_ms) noexcept;
+    public:
+        cancellable_operation(database& owner, const std::atomic<bool>& cancelled);
+        ~cancellable_operation() noexcept;
+        cancellable_operation(const cancellable_operation&) = delete;
+        cancellable_operation& operator=(const cancellable_operation&) = delete;
+        cancellable_operation(cancellable_operation&&) = delete;
+        cancellable_operation& operator=(cancellable_operation&&) = delete;
+    };
+
+    /// Bind cancellation to an exclusively owned internal connection before
+    /// workers start. Binding is one-time, requires an idle serialized
+    /// connection, and retains the token through connection destruction.
+    /// Application-shared writers must use cancellable_operation instead.
+    /// Cancellation ends busy waits; it does not disable rollback or interrupt
+    /// another connection that happens to use the same database file.
+    void bind_cancellation_token(std::shared_ptr<const std::atomic<bool>> cancelled);
+
     /// Open mode for database connections
     enum class open_mode {
         read_write,  ///< Full read/write access (default)
@@ -104,10 +141,12 @@ public:
     };
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
-                      int busy_timeout_ms = kDefaultBusyTimeoutMs);
+                      int busy_timeout_ms = kDefaultBusyTimeoutMs,
+                      std::shared_ptr<const std::atomic<bool>> cancellation = {});
     // Private construction capability; callers cannot manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
-             initialization_key key);
+             initialization_key key,
+             std::shared_ptr<const std::atomic<bool>> cancellation = {});
     ~database();
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.
@@ -252,6 +291,11 @@ private:
     // so this is a logical-close flag, not a lifetime guard.
     std::atomic<bool> closed_{false};
     int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
+    struct bound_cancellation;
+    // Heap-stable callback context also survives moving an idle database wrapper.
+    std::unique_ptr<bound_cancellation> bound_cancellation_;
+    void configure_busy_timeout(int timeout_ms) noexcept;
+    bool operation_cancelled() const noexcept;
     // Current transaction and committed-but-undelivered work are distinct.
     // The connection mutex protects sealing; rollback never clears pending.
     std::atomic<bool> txn_dirty_{false};

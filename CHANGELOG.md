@@ -1,5 +1,58 @@
 # Changelog
 
+## [2.5.0] - 2026-11-01
+
+### Added
+- Add generation-scoped native background sync control: cancellable setup,
+  finite work receipts, settled WSS suspension, and same-store foreground
+  resumption. Managed stores start suspended and preserve the primary handle,
+  local data, observers, and Results identity.
+- Bound a finite connection to its starting upload horizon and a negotiated
+  initial-replay completion marker. Older servers remain usable, but cannot
+  certify completion. Keep application progress, error, and state subscriptions
+  independent from the finite operation's receipt.
+
+### Fixed
+- Persist filtered membership transitions in a channel-private outbox before
+  resolving their source history. Preserve immutable deliveries and UUIDs
+  through full send windows, lost acknowledgements, restart, filter changes,
+  and source-history compaction.
+- Cancel owned SQLite busy waits during setup and cleanup without interrupting
+  unrelated application transactions. Stop managed retention and autonomous
+  readers, reject new keeper acquisition while suspended, and release sync
+  ownership only after private work settles. Ordinary finite calls restore
+  their prior parent-maintenance state.
+- Fence queued messages across connection generations and prevent a stale
+  expiration or callback from changing a successor's ownership. Keep callback
+  registration safe while a session is being replaced or retired.
+- Release replaced callback captures outside registration locks, so a capture's
+  destructor can reenter registration or close its store without deadlocking.
+- Match UUID acknowledgements regardless of hexadecimal letter case, including
+  durable filtered deliveries, so mixed Swift/Core UUID formatting cannot leave
+  phantom in-flight work waiting for the acknowledgement watchdog.
+- Resume foreground readers and observation even when another handle owns WSS.
+  Managed local borrowers, including read-only file handles, join lifecycle
+  suspension without acquiring a transport; explicit connect can retry WSS
+  ownership with a fresh cancellation generation.
+- Share observer callback depth across linked modules, avoiding a destructor
+  self-wait when SwiftBuild combines Core into an aggregate object.
+- Seal Swift bridge filter mutations so lifecycle contention is reported
+  through the bridge error slot instead of escaping as a native exception.
+
+### Compatibility
+- Additive C++ and Swift bridge APIs; no public C ABI change. Rebuild Core and
+  native bridge consumers together. The iOS scheduler adapter requires the
+  matching Lattice SDK; Core alone does not register Apple tasks.
+- The new `_lattice_sync_outbox` is durable sync state. Upgrade and restart all
+  processes that own a store's sync channels together. Older owners do not
+  replay pending outbox rows; downgrading with pending rows is not supported.
+- Servers send the new initial-replay marker only when requested by the client.
+  Finite completion covers an upload prefix and one replay pass, not ongoing
+  global convergence. Finite sync and the SDK's public background policy require
+  a writable file store, configured WSS, and no unmanaged IPC targets. Internal
+  managed local borrowers may be read-only and omit WSS, but remain file-only
+  and cannot perform finite sync themselves.
+
 ## [2.4.2] - 2026-10-30
 
 ### Fixed

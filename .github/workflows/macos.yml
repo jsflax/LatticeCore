@@ -43,6 +43,10 @@ jobs:
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: bash Tests/SwiftHeaderImportCheck/check.sh "$CORE_JOB_ROOT/swift-import-module-cache"
 
+      - name: Check stable iOS handle layout across explicit modules
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: bash Tests/SwiftHeaderImportCheck/check-ios-layout.sh "$CORE_JOB_ROOT/ios-layout-check"
+
       - name: Build and run C++ tests
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |

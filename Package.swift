@@ -126,15 +126,10 @@ let package = Package(
                 .headerSearchPath("include"),
                 .headerSearchPath("../LatticeSwiftCppBridge/include"),
                 .headerSearchPath("../LatticeCore/include"),
-                // The C API is plain C++ (never crosses Swift interop) and is
-                // built around the heap-ref/retain-release model, so it always
-                // uses the FRT layout regardless of the deployment floor.
-                // CONSTRAINT: LatticeCAPI must never be linked into the same
-                // image as a below-the-floor (LATTICE_HAS_FRT=0) build of the
-                // bridge — the *_ref class layouts differ between the two
-                // modes. Nothing does today (the Lattice Swift package links
-                // only the bridge), and the Swift package needs no C API.
-                .define("LATTICE_HAS_FRT", to: "1"),
+                // Use the SAME bridge ABI as the dependency on every platform.
+                // The C API wraps iOS value refs in private retained heap
+                // handles; macOS/Linux keep their existing FRT handles.
+                // A target-only layout override would mismatch factory ABIs.
                 .unsafeFlags(["-std=c++20"]),
                 .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS]))
             ],

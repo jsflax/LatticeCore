@@ -3501,7 +3501,7 @@ inline void swift_lattice::close() {
     lattice_db::close();
 }
 
-/// Copyable across the Swift/C++ boundary, including the iOS 15 value path.
+/// Copyable across the Swift/C++ boundary, including the iOS value path.
 /// Cancellation is nonblocking and can precede native connection setup.
 class swift_sync_cancellation {
 public:
@@ -3528,7 +3528,7 @@ struct swift_background_sync_status {
 class swift_lattice_ref {
 public:
     // FRT path: the factories return a heap `swift_lattice_ref*` foreign
-    // reference. Value path (iOS 15): they return a `swift_lattice_ref` by value
+    // reference. Value path (iOS): they return a `swift_lattice_ref` by value
     // whose inner shared_ptr<swift_lattice> keeps the db alive. RefRet + _make +
     // the UNRETAINED macro let every factory body stay single-source.
 #if LATTICE_HAS_FRT
@@ -3695,7 +3695,7 @@ public:
     // value path returns an empty ref instead of nullptr).
     bool valid() const SWIFT_NAME(isValid()) { return impl_ != nullptr; }
 
-    // const so it's callable on a `let` value-type ref below the FRT floor.
+    // const so it's callable on a `let` value-type ref on the iOS path.
     int64_t hash_value() const {
         return reinterpret_cast<intptr_t>(impl_.get());
     }
@@ -3716,8 +3716,8 @@ private:
 
 public:
     // ---- Thin const forwarders to the underlying swift_lattice, so the db ops
-    //      are callable on this handle on both paths: on iOS 16.4+ it is a
-    //      foreign-reference class; below the floor it is a copyable value type
+    //      are callable on this handle on both paths: macOS/Linux use a
+    //      foreign-reference class; iOS uses a copyable value type
     //      whose inner shared_ptr aliases the same db. `const` is load-bearing:
     //      const member functions import into Swift as non-mutating, so the
     //      Swift side can hold the handle in a `let` (shallow const — calling

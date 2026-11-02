@@ -11,8 +11,8 @@
 
 namespace {
 // Deliberately queued: receiving a frame and executing its apply are separate
-// deterministic steps. This characterizes the existing disconnect/destruction
-// boundary before the background-suspension API is added.
+// deterministic steps. Disconnect fences the old connection generation;
+// destruction additionally retires the scheduler and its queued work.
 class suspension_queue final : public lattice::scheduler {
     std::mutex mutex_;
     std::deque<std::function<void()>> jobs_;
@@ -142,14 +142,46 @@ int child_lock_result(const std::string& path) {
 }
 } // namespace
 
-TEST(BackgroundSyncCharacterization, DisconnectDoesNotCancelAlreadyQueuedRemoteApply) {
+TEST(BackgroundSyncCharacterization, DisconnectFencesQueuedRemoteApplyWithoutReleasingOwnership) {
     suspension_fixture fixture;
     fixture.enqueue_remote();
     ASSERT_FALSE(fixture.has_remote());
     fixture.sync->disconnect();
     ASSERT_FALSE(fixture.sync->is_connected());
     fixture.queue->drain();
+
+    // A queued frame from the retired connection cannot mutate data, ACK it,
+    // or move the durable resume cursor. Ownership is tested separately below.
+    EXPECT_FALSE(fixture.has_remote());
+    EXPECT_TRUE(fixture.transport->get_sent_messages().empty());
+    EXPECT_TRUE(fixture.reader.db().query(
+        "SELECT id FROM AuditLog WHERE globalId='background-probe-audit'").empty());
+    EXPECT_TRUE(fixture.reader.db().query(
+        "SELECT sync_id FROM _lattice_replication_slots "
+        "WHERE last_received_event_id='background-probe-audit'").empty());
+
+    // Reconnecting the same synchronizer admits a new generation. The peer
+    // can redeliver the unacknowledged frame and obtain a durable receipt.
+    fixture.sync->connect();
+    fixture.queue->drain();
+    ASSERT_TRUE(fixture.sync->is_connected());
+    ASSERT_FALSE(fixture.has_remote());
+    ASSERT_TRUE(fixture.transport->get_sent_messages().empty());
+    fixture.enqueue_remote();
+    fixture.queue->drain();
     EXPECT_TRUE(fixture.has_remote());
+    EXPECT_EQ(fixture.reader.db().query(
+        "SELECT id FROM AuditLog WHERE globalId='background-probe-audit'").size(), 1u);
+    EXPECT_EQ(fixture.reader.db().query(
+        "SELECT sync_id FROM _lattice_replication_slots "
+        "WHERE sync_id='background-characterization' "
+        "AND last_received_event_id='background-probe-audit'").size(), 1u);
+    const auto messages = fixture.transport->get_sent_messages();
+    ASSERT_EQ(messages.size(), 1u);
+    const auto receipt = lattice::server_sent_event::from_json(messages[0].as_string());
+    ASSERT_TRUE(receipt);
+    EXPECT_EQ(receipt->event_type, lattice::server_sent_event::type::ack);
+    EXPECT_EQ(receipt->acked_ids, (std::vector<std::string>{"background-probe-audit"}));
 }
 
 TEST(BackgroundSyncCharacterization, DestructionCancelsQueuedApplyAndPreservesLocalStore) {

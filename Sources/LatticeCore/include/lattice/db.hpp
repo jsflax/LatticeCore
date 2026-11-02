@@ -141,10 +141,12 @@ public:
     };
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
-                      int busy_timeout_ms = kDefaultBusyTimeoutMs);
+                      int busy_timeout_ms = kDefaultBusyTimeoutMs,
+                      std::shared_ptr<const std::atomic<bool>> cancellation = {});
     // Private construction capability; callers cannot manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
-             initialization_key key);
+             initialization_key key,
+             std::shared_ptr<const std::atomic<bool>> cancellation = {});
     ~database();
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.

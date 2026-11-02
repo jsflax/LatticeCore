@@ -286,4 +286,26 @@ TEST(DatabaseCancellation, BoundTokenOutlivesCallerAndSurvivesMovingIdleDatabase
     }
     EXPECT_TRUE(weak.expired());
 }
+TEST(DatabaseCancellation, ConstructorCancellationRejectsBeforeCreatingFile) {
+    TempDB file{"cancel_before_open"};
+    auto cancelled = std::make_shared<std::atomic<bool>>(true);
+    EXPECT_THROW((lattice::database(file.str(), lattice::database::open_mode::read_write,
+                                  3000, cancelled)), lattice::db_error);
+    EXPECT_FALSE(std::filesystem::exists(file.path));
+}
+
+TEST(DatabaseCancellation, ConstructorOwnsTokenBeforeInitializationAndPreservesAppTimeout) {
+    TempDB file{"cancel_constructor_token"};
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    std::weak_ptr<std::atomic<bool>> retained = cancelled;
+    lattice::database owned(file.str(), lattice::database::open_mode::read_write, 1500, cancelled);
+    lattice::database app(file.str(), lattice::database::open_mode::read_write, 1500);
+    cancelled.reset();
+    ASSERT_FALSE(retained.expired());
+    retained.lock()->store(true);
+    EXPECT_THROW(owned.begin_transaction(), lattice::db_error);
+    EXPECT_NO_THROW(app.begin_transaction());
+    app.rollback();
+    EXPECT_EQ(busy_timeout(app), 1500);
+}
 #endif

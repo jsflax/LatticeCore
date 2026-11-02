@@ -225,6 +225,10 @@ void lattice_db::setup_cross_process_notifier() {
 }
 
 void lattice_db::handle_cross_process_notification() {
+    // Automatic notifications may arrive while the primary app store remains
+    // open after a finite cycle. They must not start new background SQL.
+    sync_borrow lifecycle(*this);
+    if (!lifecycle.admitted() || background_sync_suspended_.load(std::memory_order_acquire)) return;
     // KILL-SWITCH: set LATTICE_DISABLE_XPROC=1 to suppress cross-process observer dispatch.
     // Used to diagnose whether xproc notifications cause main-thread stalls.
     static bool disabled = (std::getenv("LATTICE_DISABLE_XPROC") != nullptr);
@@ -237,11 +241,19 @@ void lattice_db::handle_cross_process_notification() {
     // this callback is still queued on the dispatch queue. Catch db_error to
     // prevent an uncaught exception from aborting the process.
     try {
+        auto query_notification = [this](const std::string& sql,
+                const std::vector<column_value_t>& params = {}) {
+            auto connection = borrow_xproc_read_connection();
+            std::optional<database::cancellable_operation> cancellation;
+            if (audit_maintenance_cancellable_.load(std::memory_order_acquire))
+                cancellation.emplace(*connection, background_sync_suspended_);
+            return connection->query(sql, params);
+        };
         // Query AuditLog for entries newer than our cursor.
         // Uses the dedicated xproc read connection to avoid SQLite lock contention
         // with observer callbacks running on the scheduler (MainActor), which use
         // read_db() for existence checks.
-        auto rows = query_xproc(
+        auto rows = query_notification(
             "SELECT id, tableName, operation, rowId, globalRowId, changedFieldsNames FROM AuditLog WHERE id > ? ORDER BY id ASC",
             {cursor}
         );
@@ -327,7 +339,7 @@ void lattice_db::handle_cross_process_notification() {
             changes.emplace_back(table, op, row_id, global_row_id, changed_fields_names);
 
             // Collect AuditLog change
-            auto audit_gid_rows = query_xproc(
+            auto audit_gid_rows = query_notification(
                 "SELECT globalId FROM AuditLog WHERE id = ?", {audit_id}
             );
             std::string audit_global_id;
@@ -349,7 +361,7 @@ void lattice_db::handle_cross_process_notification() {
         std::unordered_map<std::string, std::string> internal_table_parents;
         for (const auto& [table, op, row_id, global_id, cfn] : changes) {
             if (table == "AuditLog" || internal_table_parents.count(table)) continue;
-            auto meta = query_xproc(
+            auto meta = query_notification(
                 "SELECT value FROM _lattice_meta WHERE key = ?",
                 {"internal_table:" + table}
             );
@@ -385,7 +397,7 @@ void lattice_db::handle_cross_process_notification() {
                     std::string parent_global_id;
                     auto& link_global_id = std::get<3>(change);
                     if (!link_global_id.empty()) {
-                        auto cf_rows = query_xproc(
+                        auto cf_rows = query_notification(
                             "SELECT json_extract(changedFields, '$.lhs') AS lhs FROM AuditLog "
                             "WHERE globalRowId = ? AND tableName = ?",
                             {link_global_id, table}
@@ -394,7 +406,7 @@ void lattice_db::handle_cross_process_notification() {
                             auto lhs_it = cf_rows[0].find("lhs");
                             if (lhs_it != cf_rows[0].end() && std::holds_alternative<std::string>(lhs_it->second)) {
                                 parent_global_id = std::get<std::string>(lhs_it->second);
-                                auto pid_rows = query_xproc(
+                                auto pid_rows = query_notification(
                                     "SELECT id FROM \"" + parent_table + "\" WHERE globalId = ?",
                                     {parent_global_id}
                                 );
@@ -522,7 +534,93 @@ static std::vector<std::string> collect_all_sync_ids(const configuration& config
     return ids;
 }
 
+lattice_db::sync_borrow::sync_borrow(const lattice_db& owner, bool mutation)
+    : state_(owner.sync_lifecycle_) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->transitioning || owner.is_closed()) {
+        if (mutation && state_->transitioning)
+            throw db_error("sync lifecycle transition is in progress");
+        return;
+    }
+    admitted_ = true;
+    pointer_ = owner.synchronizer_.get();
+    ++state_->borrowers;
+    ++state_->borrower_threads[std::this_thread::get_id()];
+}
+
+lattice_db::sync_borrow::~sync_borrow() {
+    if (!admitted_) return;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    --state_->borrowers;
+    auto it = state_->borrower_threads.find(std::this_thread::get_id());
+    if (--it->second == 0) state_->borrower_threads.erase(it);
+    state_->cv.notify_all();
+}
+
+bool lattice_db::begin_sync_transition(bool wait) {
+    const auto state = sync_lifecycle_;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (state->transitioning) {
+        if (!wait || state->transition_thread == std::this_thread::get_id() ||
+            state->borrower_threads.count(std::this_thread::get_id()) ||
+            (state->worker && state->worker->is_on_thread())) return false;
+        state->cv.wait(lock, [&] { return !state->transitioning; });
+    }
+    if (!wait && state->borrower_threads.count(std::this_thread::get_id())) return false;
+    state->transitioning = true;
+    state->transition_thread = std::this_thread::get_id();
+    // Teardown can retire its owner off-thread if reached inside a borrow.
+    // Setup never runs reentrantly and must settle existing borrowers first.
+    if (!state->borrower_threads.count(std::this_thread::get_id()))
+        state->cv.wait(lock, [&] { return state->borrowers == 0; });
+    return true;
+}
+
+void lattice_db::end_sync_transition() {
+    const auto state = sync_lifecycle_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->transitioning = false;
+    state->transition_thread = {};
+    state->cv.notify_all();
+}
+
+void lattice_db::replay_sync_state_subscription(const std::shared_ptr<sync_lifecycle_state>& state) {
+    std::shared_ptr<scheduler> worker;
+    uint64_t epoch, revision;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->connected || !state->state_handler || !state->worker) return;
+        worker = state->worker;
+        epoch = state->callback_epoch;
+        revision = state->state_callback_revision;
+    }
+    worker->invoke([state, epoch, revision] {
+        std::function<void(bool)> handler;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->callback_epoch != epoch || !state->connected ||
+                state->state_callback_revision != revision ||
+                state->state_delivered_revision >= revision) return;
+            state->state_delivered_revision = revision;
+            handler = state->state_handler;
+        }
+        if (handler) handler(true);
+    });
+}
+
 void lattice_db::setup_sync_if_configured() {
+    if (!begin_sync_transition(false)) return;
+    try {
+        setup_sync_owned();
+        if (is_closed()) {
+            stop_audit_maintenance();
+            retire_wss_owned(false, false);
+        } else end_sync_transition();
+    } catch (...) { end_sync_transition(); throw; }
+}
+
+void lattice_db::setup_sync_owned(bool finite_cycle,
+        std::shared_ptr<std::atomic<bool>> cancellation, bool allow_sibling_kick) {
     if (is_closed() || config_.read_only || !sync_start_requested_ ||
         !config_.is_sync_enabled() || synchronizer_) {
         return;
@@ -564,11 +662,16 @@ void lattice_db::setup_sync_if_configured() {
             // own teardown from waking another same-URL sibling, which
             // would re-hold the flock against our new URL.
             bool kicked = false;
-            instance_registry::instance().for_each_alive(config_.path,
+            if (allow_sibling_kick) instance_registry::instance().for_each_alive(config_.path,
                 [&](lattice_db* sibling) {
                     if (kicked) return;
                     if (sibling == this) return;
-                    if (sibling->synchronizer_ == nullptr) return;
+                    {
+                        sync_borrow current(*sibling);
+                        if (!current) return;
+                        // Managed lifecycles are never evicted by ordinary URL handoff.
+                        if (sibling->current_background_sync_generation() != 0) return;
+                    }
                     if (sibling->config_.websocket_url == config_.websocket_url) return;
                     LOG_INFO("lattice_db",
                              "kicking sibling=%p (URL=%s) for URL change to %s",
@@ -597,11 +700,18 @@ void lattice_db::setup_sync_if_configured() {
     }
 
     try {
+    uint64_t callback_epoch;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        callback_epoch = ++sync_lifecycle_->callback_epoch;
+        sync_lifecycle_->connected = false;
+    }
     // Create sync config from our configuration
     sync_config sync_cfg;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
     sync_cfg.sync_filter = config_.sync_filter;
+    sync_cfg.finite_cycle = finite_cycle;
 
     // Always use per-synchronizer sync state
     auto all_ids = collect_all_sync_ids(config_);
@@ -636,7 +746,12 @@ void lattice_db::setup_sync_if_configured() {
     sync_db_config.busy_timeout_ms = config_.busy_timeout_ms;
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
+    sync_db_config.private_sync_cancellation = cancellation;
     auto sync_db = std::make_unique<lattice_db>(sync_db_config);
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        sync_lifecycle_->worker = sync_db_config.sched;
+    }
 
     // Debug: verify sync db can see model tables
     LOG_INFO("lattice_db", "sync_db created for path=%s", sync_db_config.path.c_str());
@@ -663,17 +778,51 @@ void lattice_db::setup_sync_if_configured() {
     synchronizer_ = std::make_unique<synchronizer>(std::move(sync_db), sync_cfg);
 #endif
 
-    // Wire up callbacks if set
-    if (on_sync_state_change_) {
-        synchronizer_->set_on_state_change(on_sync_state_change_);
+    // One forwarding wrapper per owner. Subscription changes are metadata-only
+    // even while setup/retirement closes ordinary pointer admission. Captures
+    // own shared state, never the primary store that a callback may close.
+    const auto callback_state = sync_lifecycle_;
+#ifdef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(callback_state->mutex);
+        callback_state->worker = scheduler_;
     }
-    if (on_sync_error_) {
-        synchronizer_->set_on_error(on_sync_error_);
-    }
-    if (on_sync_progress_) synchronizer_->set_on_progress(on_sync_progress_);
+#endif
+    synchronizer_->set_on_state_change([callback_state, callback_epoch](bool connected) {
+        std::function<void(bool)> handler;
+        {
+            std::lock_guard<std::mutex> lock(callback_state->mutex);
+            if (callback_state->callback_epoch != callback_epoch) return;
+            callback_state->connected = connected;
+            callback_state->state_delivered_revision = callback_state->state_callback_revision;
+            handler = callback_state->state_handler;
+        }
+        if (handler) handler(connected);
+    });
+    synchronizer_->set_on_error([callback_state, callback_epoch](const std::string& error) {
+        std::function<void(const std::string&)> handler;
+        {
+            std::lock_guard<std::mutex> lock(callback_state->mutex);
+            if (callback_state->callback_epoch != callback_epoch) return;
+            handler = callback_state->error_handler;
+        }
+        if (handler) handler(error);
+    });
+    synchronizer_->set_on_progress([callback_state, callback_epoch](const synchronizer::sync_progress& progress) {
+        synchronizer::on_progress_handler handler;
+        {
+            std::lock_guard<std::mutex> lock(callback_state->mutex);
+            if (callback_state->callback_epoch != callback_epoch) return;
+            handler = callback_state->progress_handler;
+        }
+        if (handler) handler(progress);
+    });
+    if (cancellation && cancellation->load(std::memory_order_acquire))
+        throw db_error("background sync was cancelled during setup");
 
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
+    replay_sync_state_subscription(callback_state);
     } catch (...) {
         // Manual start is retryable on the same local handle after setup fails.
         // Do not strand an ownership key/flock or tear down unrelated IPC.
@@ -686,6 +835,226 @@ void lattice_db::setup_sync_if_configured() {
 #endif
         throw;
     }
+}
+
+uint64_t lattice_db::current_background_sync_generation() const {
+    // Logical close can precede callback-reentrant retirement. Keep its owner
+    // receipt available until private cleanup has actually settled.
+    std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+    return sync_lifecycle_->generation;
+}
+
+synchronizer_base::finite_cycle_status lattice_db::get_background_sync_status(uint64_t generation) const {
+    std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+    if (!generation || sync_lifecycle_->generation != generation ||
+        sync_lifecycle_->transitioning || !synchronizer_) return {};
+    return synchronizer_->get_finite_cycle_status();
+}
+
+bool lattice_db::cancel_background_sync(uint64_t generation) {
+    std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+    if (!generation || sync_lifecycle_->generation != generation) return false;
+    if (sync_lifecycle_->cancellation)
+        sync_lifecycle_->cancellation->store(true, std::memory_order_release);
+    // Metadata only; transitions keep private construction/destruction off this path.
+    if (!sync_lifecycle_->transitioning && synchronizer_) synchronizer_->cancel_finite_cycle();
+    return true;
+}
+
+lattice_db::background_sync_start lattice_db::resume_background_sync(
+        std::shared_ptr<std::atomic<bool>> cancellation, bool finite_cycle) {
+#ifdef __EMSCRIPTEN__
+    return {background_sync_admission::unsupported, 0};
+#else
+    if (is_closed()) return {background_sync_admission::closed, 0};
+    if (config_.read_only || config_.is_in_memory() || config_.is_ipc_enabled() ||
+        !config_.is_sync_enabled()) return {background_sync_admission::unsupported, 0};
+    if (!cancellation) cancellation = std::make_shared<std::atomic<bool>>(false);
+    if (cancellation->load(std::memory_order_acquire)) return {background_sync_admission::cancelled, 0};
+    if (!begin_sync_transition(false)) return {background_sync_admission::already_running, 0};
+    if (is_closed() || synchronizer_) {
+        const auto result = is_closed() ? background_sync_admission::closed : background_sync_admission::already_running;
+        end_sync_transition();
+        return {result, 0};
+    }
+    // A callback may have retired the previous owner off-thread. Apply its
+    // pending parent restoration under this transition before taking a new one.
+    uint64_t previously_settled;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        previously_settled = sync_lifecycle_->settled_generation;
+    }
+    restore_parent_after_sync_owned(previously_settled);
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        generation = ++sync_lifecycle_->sequence;
+        sync_lifecycle_->generation = generation;
+        sync_lifecycle_->cancellation = cancellation;
+        if (finite_cycle && !config_.background_sync_managed) {
+            sync_lifecycle_->restore_parent_generation = generation;
+            sync_lifecycle_->prior_parent_suspended = background_sync_suspended_.load(std::memory_order_acquire);
+            sync_lifecycle_->prior_retention_running = audit_maint_thread_.joinable();
+        }
+    }
+    background_sync_suspended_.store(true, std::memory_order_release);
+    audit_maintenance_cancellable_.store(true, std::memory_order_release);
+    sync_start_requested_ = true;
+    try {
+        // Admission settles retention while private WSS work runs. Managed
+        // stores stay suspended; ordinary manual calls restore their prior state.
+        stop_audit_maintenance();
+        setup_sync_owned(finite_cycle, cancellation, false);
+        if (!synchronizer_ || cancellation->load(std::memory_order_acquire) || is_closed()) {
+            const auto result = is_closed() ? background_sync_admission::closed :
+                (cancellation->load(std::memory_order_acquire) ? background_sync_admission::cancelled : background_sync_admission::not_owner);
+            sync_start_requested_ = false;
+            retire_wss_owned(false, false);
+            return {result, generation};
+        }
+        if (!finite_cycle) {
+            background_sync_suspended_.store(false, std::memory_order_release);
+            start_audit_maintenance();
+        }
+        end_sync_transition();
+        return {background_sync_admission::started, generation};
+    } catch (...) {
+        const bool was_cancelled = cancellation->load(std::memory_order_acquire);
+        sync_start_requested_ = false;
+        background_sync_suspended_.store(true, std::memory_order_release);
+        stop_audit_maintenance();
+        retire_wss_owned(false, false);
+        if (was_cancelled)
+            return {background_sync_admission::cancelled, generation};
+        throw;
+    }
+#endif
+}
+
+bool lattice_db::suspend_background_sync(uint64_t generation) {
+    if (!generation) return false;
+    const auto state = sync_lifecycle_;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->generation != generation &&
+            (state->generation || state->settled_generation != generation)) return false;
+        if (state->generation == generation) {
+            if (state->cancellation) state->cancellation->store(true, std::memory_order_release);
+            // Before waiting for admitted xproc reads: their scoped busy handler
+            // observes this flag and returns without waiting the ordinary budget.
+            background_sync_suspended_.store(true, std::memory_order_release);
+        }
+    }
+    if (!begin_sync_transition(true)) return false;
+    bool already_settled;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        already_settled = !state->generation && state->settled_generation == generation;
+        if (state->generation != generation && !already_settled) {
+            state->transitioning = false;
+            state->transition_thread = {};
+            state->cv.notify_all();
+            return false;
+        }
+    }
+    if (already_settled) {
+        restore_parent_after_sync_owned(generation);
+        end_sync_transition();
+        return true;
+    }
+    sync_start_requested_ = false;
+    stop_audit_maintenance();
+    if (config_.background_sync_managed) retire_all_read_generations();
+    return retire_wss_owned(false, false);
+}
+
+void lattice_db::restore_parent_after_sync_owned(uint64_t generation) {
+    bool restore = false, prior_suspended = true, prior_retention = false;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        if (generation && sync_lifecycle_->restore_parent_generation == generation &&
+            !sync_lifecycle_->generation && sync_lifecycle_->settled_generation == generation) {
+            restore = true;
+            prior_suspended = sync_lifecycle_->prior_parent_suspended;
+            prior_retention = sync_lifecycle_->prior_retention_running;
+            sync_lifecycle_->restore_parent_generation = 0;
+        }
+    }
+    if (!restore || is_closed()) return;
+    background_sync_suspended_.store(prior_suspended, std::memory_order_release);
+    if (prior_retention) start_audit_maintenance();
+}
+
+bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
+    const auto state = sync_lifecycle_;
+    bool defer;
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        generation = state->generation;
+        state->connected = false;
+        if (generation && state->cancellation)
+            state->cancellation->store(true, std::memory_order_release);
+        defer = state->borrower_threads.count(std::this_thread::get_id()) ||
+                (state->worker && state->worker->is_on_thread());
+    }
+    // Admission is already closed. Moving the owner does not invalidate an
+    // existing lease; cleanup waits for every such borrow before destruction.
+    auto retired = std::move(synchronizer_);
+    const int lock_fd = std::exchange(sync_lock_fd_, -1);
+    const auto path = config_.path;
+    const auto url = config_.websocket_url;
+    auto cleanup = [state, owner = std::move(retired), lock_fd, path, url, generation, drain](bool finish_transition) mutable {
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock, [&] { return state->borrowers == 0; });
+        }
+        if (owner) {
+            if (drain) owner->drain(std::chrono::steady_clock::now() + std::chrono::milliseconds(2000));
+            if (generation) owner->cancel_finite_cycle();
+            owner.reset(); // Fences transport, pacer and queued SQL before releasing ownership.
+            unregister_sync_key(path, url);
+        }
+        if (lock_fd >= 0) { ::flock(lock_fd, LOCK_UN); ::close(lock_fd); }
+        std::shared_ptr<scheduler> settled_worker;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            settled_worker = std::move(state->worker);
+            ++state->callback_epoch;
+            state->connected = false;
+            state->cancellation.reset();
+            state->settled_generation = generation;
+            state->generation = 0;
+            if (finish_transition) {
+                state->transitioning = false;
+                state->transition_thread = {};
+                state->cv.notify_all();
+            }
+        }
+    };
+#ifndef __EMSCRIPTEN__
+    if (defer) {
+        // A user callback may close its store. Joining that callback's worker
+        // here would self-deadlock; the retirement bundle owns all its resources.
+        std::thread([cleanup = std::move(cleanup)]() mutable { cleanup(true); }).detach();
+        return false;
+    }
+#endif
+    cleanup(false);
+    restore_parent_after_sync_owned(generation);
+    end_sync_transition();
+    if (handoff && !generation) {
+        bool handed_off = false;
+        instance_registry::instance().for_each_alive(path, [&](lattice_db* sibling) {
+            if (handed_off || sibling == this || sibling->is_closed() ||
+                !sibling->sync_start_requested_ || sibling->config_.background_sync_managed ||
+                !sibling->config_.is_sync_enabled() || sibling->config_.websocket_url != url) return;
+            sibling->setup_sync_if_configured();
+            sync_borrow current(*sibling);
+            handed_off = bool(current);
+        });
+    }
+    return true;
 }
 
 void lattice_db::setup_ipc_if_configured() {
@@ -979,7 +1348,7 @@ void lattice_db::reopen_write_db() {
     // Declared before the attach guard: error cleanup and retired-owner
     // destruction must run after that guard is released.
     auto staged = std::make_shared<database>(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms);
+        database::open_mode::read_write, config_.busy_timeout_ms, config_.private_sync_cancellation);
     register_sql_functions(*staged);
     // A maintenance caller can already own the writer SQLite mutex. Never
     // wait behind attach while it may be waiting for that writer. A busy
@@ -1009,9 +1378,9 @@ void lattice_db::reopen_read_db() {
     }
     // No half-pair publication if either open or topology restoration fails.
     auto reader = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
+        database::open_mode::read_only, config_.busy_timeout_ms, config_.private_sync_cancellation);
     auto xproc = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
+        database::open_mode::read_only, config_.busy_timeout_ms, config_.private_sync_cancellation);
     // A maintenance caller can already own the writer SQLite mutex. Never
     // wait behind attach while it may be waiting for that writer. A busy
     // topology is an explicit failed reopen, with prior publication intact.

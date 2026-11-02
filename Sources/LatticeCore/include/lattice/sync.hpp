@@ -157,7 +157,7 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack, replay_request, nack };
+    enum class type { audit_log, ack, replay_request, nack, catch_up_complete };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
@@ -175,6 +175,11 @@ struct server_sent_event {
     /// parser exception text. Cleared on a successful parse.
     static std::optional<server_sent_event> from_json(
         const std::string& json, std::string* error_out);
+
+    // Only emitted by a server after the negotiated initial replay.
+    static server_sent_event make_catch_up_complete() {
+        return {type::catch_up_complete, {}, {}, {}, {}};
+    }
 
     // Factory methods
     static server_sent_event make_audit_log(std::vector<audit_log_entry> logs) {
@@ -264,6 +269,10 @@ struct sync_config {
     /// evicted on a clean disconnect. See configuration::sync_is_observer.
     bool is_observer = false;
 
+    /// One fresh WSS connection, fixed upload prefix, negotiated initial replay.
+    /// No automatic reconnect. The owner supplies deadline and cleanup.
+    bool finite_cycle = false;
+
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
     std::optional<std::vector<sync_filter_entry>> sync_filter;
@@ -341,6 +350,23 @@ public:
     synchronizer_base& operator=(const synchronizer_base&) = delete;
     synchronizer_base(synchronizer_base&&) = delete;
     synchronizer_base& operator=(synchronizer_base&&) = delete;
+
+    // Internal work receipt; work_complete is not a transport/SQLite cleanup receipt.
+    enum class finite_cycle_phase { inactive, running, work_complete, failed, cancelled };
+    enum class finite_cycle_failure {
+        none, transport, invalid_frame, partial_apply, storage, configuration_changed
+    };
+    struct finite_cycle_status {
+        finite_cycle_phase phase = finite_cycle_phase::inactive;
+        finite_cycle_failure failure = finite_cycle_failure::none;
+        uint64_t connection_generation = 0;
+        bool horizon_captured = false;
+        int64_t upload_horizon = 0;
+        bool catch_up_received = false;
+    };
+    // Metadata-only: safe under the native store's short ownership lock.
+    finite_cycle_status get_finite_cycle_status() const;
+    void cancel_finite_cycle();
 
     // Connection management
     void connect();
@@ -556,8 +582,16 @@ protected:
     void on_websocket_error(const std::string& error);
     void on_websocket_close(int code, const std::string& reason);
 
+    mutable std::mutex finite_cycle_mutex_;
+    finite_cycle_status finite_cycle_status_;
+    bool finite_cycle_ready_ = false; // guarded by finite_cycle_mutex_
+    void fail_finite_cycle(finite_cycle_failure reason, uint64_t generation);
+    bool finite_cycle_accepts_work(uint64_t generation, bool download = false) const;
+    void complete_finite_cycle_if_drained();
+
     // Sync operations
     void upload_pending_changes();
+    void upload_pending_changes_impl();
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
 
@@ -649,13 +683,15 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 /// min_id_exclusive bounds the no-sync-state branch (`a.id > ?`) — pass the
 /// slot's upload_floor. limit (0 = unbounded) caps the result to one send
 /// window; entries are ordered by id ASC so the window is always the oldest
-/// pending work.
+/// pending work. max_id_inclusive bounds BOTH branches for a finite cycle;
+/// zero is a real empty prefix, while nullopt preserves the unbounded query.
 std::vector<audit_log_entry> query_audit_log_for_sync(
     database& db,
     const std::string& sync_id,
     const std::optional<std::vector<sync_filter_entry>>& sync_filter = std::nullopt,
     int64_t min_id_exclusive = 0,
-    size_t limit = 0);
+    size_t limit = 0,
+    std::optional<int64_t> max_id_inclusive = std::nullopt);
 
 /// Read the slot's upload_floor (0 when absent). Monotonic advance helper.
 int64_t read_upload_floor(database& db, const std::string& sync_id);

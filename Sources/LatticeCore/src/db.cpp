@@ -162,8 +162,9 @@ uint64_t database::thread_statement_count() {
 }
 
 
-database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
-    : database(path, mode, busy_timeout_ms, initialization_key(false)) {}
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
+                   std::shared_ptr<const std::atomic<bool>> cancellation)
+    : database(path, mode, busy_timeout_ms, initialization_key(false), std::move(cancellation)) {}
 
 std::shared_ptr<database> database::make_read_keeper(const std::string& path,
                                                    int busy_timeout_ms) {
@@ -172,8 +173,11 @@ std::shared_ptr<database> database::make_read_keeper(const std::string& path,
 }
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   initialization_key key)
+                   initialization_key key,
+                   std::shared_ptr<const std::atomic<bool>> cancellation)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
+    if (cancellation && cancellation->load(std::memory_order_acquire))
+        throw db_error("database operation cancelled");
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
     int rc;
@@ -215,7 +219,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     // "database is locked" instantly instead of waiting. Instances now
     // genuinely close and reopen (weak instance cache), so open-time races
     // are common rather than exceptional.
-    configure_busy_timeout(busy_timeout_ms_);
+    if (cancellation) bind_cancellation_token(std::move(cancellation));
+    else configure_busy_timeout(busy_timeout_ms_);
 
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");

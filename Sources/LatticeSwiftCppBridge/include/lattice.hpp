@@ -3178,6 +3178,7 @@ namespace detail {
         std::string fp = config.read_only ? "R" : "W";
         fp += config.sync_is_observer ? 'O' : 'P';
         fp += config.sync_autostart ? 'A' : 'D';
+        fp += config.background_sync_managed ? 'M' : 'U';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         append_cache_string(fp, config.authorization_token);
@@ -3499,6 +3500,18 @@ inline void swift_lattice::close() {
     detail::LatticeCache::instance().evict(this);
     lattice_db::close();
 }
+
+/// Copyable across the Swift/C++ boundary, including the iOS 15 value path.
+/// Cancellation is nonblocking and can precede native connection setup.
+class swift_sync_cancellation {
+public:
+    swift_sync_cancellation() : token_(std::make_shared<std::atomic<bool>>(false)) {}
+    void cancel() const { token_->store(true, std::memory_order_release); }
+    bool is_cancelled() const { return token_->load(std::memory_order_acquire); }
+private:
+    friend class swift_lattice_ref;
+    std::shared_ptr<std::atomic<bool>> token_;
+};
 
 class swift_lattice_ref {
 public:
@@ -3872,10 +3885,29 @@ public:
     void disconnect_sync() const { sealed([&] { impl().disconnect_sync(); }); }
     void reconnect_sync() const { sealed([&] { impl().reconnect_sync(); }); }
 
+    bool is_background_sync_managed() const { return impl().config().background_sync_managed; }
+
+    lattice_db::background_sync_start resume_background_sync(const swift_sync_cancellation& cancellation,
+                                                 bool finite_cycle) const {
+        return sealed([&] { return impl().resume_background_sync(cancellation.token_, finite_cycle); });
+    }
+    uint64_t current_background_sync_generation() const {
+        return sealed([&] { return impl().current_background_sync_generation(); });
+    }
+    synchronizer_base::finite_cycle_status get_background_sync_status(uint64_t generation) const {
+        return sealed([&] { return impl().get_background_sync_status(generation); });
+    }
+    bool cancel_background_sync(uint64_t generation) const {
+        return sealed([&] { return impl().cancel_background_sync(generation); });
+    }
+    bool suspend_background_sync(uint64_t generation) const {
+        return sealed([&] { return impl().suspend_background_sync(generation); });
+    }
+
     // Sync status
     bool is_sync_agent() const { return impl().is_sync_agent(); }
     bool is_sync_connected() const { return impl().is_sync_connected(); }
-    void clear_sync_filter() const { impl().clear_sync_filter(); }
+    void clear_sync_filter() const { sealed([&] { impl().clear_sync_filter(); }); }
 
     // Spatial (R*Tree)
     std::vector<managed<swift_dynamic_object>> objects_within_bbox(
@@ -3962,15 +3994,15 @@ public:
     }
 
     // Sync filter
-    void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
+    void update_sync_filter(const SyncFilterVector& filter) const { sealed([&] { impl().update_sync_filter(filter); }); }
     void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const {
-        impl().update_sync_filter_for_channel(channel, filter);
+        sealed([&] { impl().update_sync_filter_for_channel(channel, filter); });
     }
     void clear_sync_filter_for_channel(const std::string& channel) const {
-        impl().clear_sync_filter_for_channel(channel);
+        sealed([&] { impl().clear_sync_filter_for_channel(channel); });
     }
     void remove_sync_channel_state(const std::string& sync_id) const {
-        impl().remove_sync_channel_state(sync_id);
+        sealed([&] { impl().remove_sync_channel_state(sync_id); });
     }
     /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
     /// see lattice_db::delete_rows_no_relay for why a normal delete is

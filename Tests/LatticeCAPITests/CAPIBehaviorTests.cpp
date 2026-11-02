@@ -1020,6 +1020,98 @@ TEST(CAPIToJson, LinkDepthAndStubs) {
     lattice_db_release(db);
 }
 
+TEST(CAPIHandleLifetime, RetainedHandlesAndQueryObjectsSurviveOwnerHandleRelease) {
+    TempPath path("capi_handle_lifetime");
+    PersonSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), &schema.schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    lattice_db_retain(db);
+    lattice_db_release(db);
+
+    auto* original = add_person(db, "retained", 41);
+    ASSERT_NE(original, nullptr);
+    lattice_object_retain(original);
+    lattice_object_release(original);
+    const auto id = lattice_object_get_id(original);
+    auto* found = lattice_db_find(db, "Person", id);
+    ASSERT_NE(found, nullptr) << lattice_last_error();
+    auto* results = lattice_db_query(db, "Person", nullptr, nullptr, 0, 0);
+    ASSERT_NE(results, nullptr) << lattice_last_error();
+    ASSERT_EQ(lattice_results_count(results), 1u);
+    auto* queried = lattice_results_get(results, 0);
+    ASSERT_NE(queried, nullptr);
+    lattice_results_free(results);
+    lattice_object_release(original);
+    // Release the database wrapper, without closing its underlying store.
+    // Both returned managed objects must independently keep that store alive.
+    lattice_db_release(db);
+
+    EXPECT_EQ(lattice_object_get_int(found, "age"), 41);
+    lattice_object_set_int(found, "age", 42);
+    EXPECT_EQ(lattice_object_get_int(queried, "age"), 42);
+    lattice_object_release(found);
+    EXPECT_STREQ(lattice_object_get_string(queried, "name"), "retained");
+    lattice_object_release(queried);
+}
+
+TEST(CAPIHandleLifetime, LinkedObjectGetterReturnsOneOwnedReference) {
+    TempPath path("capi_link_handle_lifetime");
+    GraphSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), schema.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    auto* author = lattice_db_create_object(db, "Author");
+    auto* pet = lattice_db_create_object(db, "Pet");
+    ASSERT_NE(author, nullptr);
+    ASSERT_NE(pet, nullptr);
+    lattice_object_set_string(pet, "name", "owned link");
+    ASSERT_EQ(lattice_db_add(db, author), author);
+    ASSERT_EQ(lattice_db_add(db, pet), pet);
+    lattice_object_release(author);  // Release add's extra reference.
+    lattice_object_release(pet);
+    lattice_object_set_object(author, "pet", pet);
+
+    auto* linked = lattice_object_get_object(author, "pet");
+    ASSERT_NE(linked, nullptr) << lattice_last_error();
+    // A getter-owned reference plus this explicit retain must survive ONE
+    // release. A fresh zero-count FRT getter would delete it here instead.
+    lattice_object_retain(linked);
+    lattice_object_release(linked);
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_db_release(db);
+    EXPECT_STREQ(lattice_object_get_string(linked, "name"), "owned link");
+    lattice_object_release(linked);
+}
+
+TEST(CAPIHandleLifetime, ListElementsOwnTheirHandleAfterListAndParentRelease) {
+    TempPath path("capi_list_handle_lifetime");
+    GraphSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), schema.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    auto* author = lattice_db_create_object(db, "Author");
+    auto* friend_object = lattice_db_create_object(db, "Author");
+    ASSERT_NE(author, nullptr);
+    ASSERT_NE(friend_object, nullptr);
+    lattice_object_set_string(friend_object, "name", "list member");
+    ASSERT_EQ(lattice_db_add(db, author), author);
+    ASSERT_EQ(lattice_db_add(db, friend_object), friend_object);
+    lattice_object_release(author);
+    lattice_object_release(friend_object);
+    auto* friends = lattice_object_get_link_list(author, "friends");
+    ASSERT_NE(friends, nullptr);
+    lattice_link_list_push_back(friends, friend_object);
+    ASSERT_EQ(lattice_link_list_size(friends), 1u);
+    auto* member = lattice_link_list_get(friends, 0);
+    ASSERT_NE(member, nullptr);
+    EXPECT_EQ(lattice_link_list_get(friends, 1), nullptr);
+    lattice_link_list_release(friends);
+    lattice_object_release(author);
+    lattice_object_release(friend_object);
+    lattice_db_release(db);
+    EXPECT_STREQ(lattice_object_get_string(member, "name"), "list member");
+    lattice_object_release(member);
+}
+
 TEST(CAPIToJson, CycleCollapsesToStubAndTerminates) {
     TempPath path("capi_tojson_cycle");
     GraphSchema gs;

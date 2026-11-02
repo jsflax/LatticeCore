@@ -13,6 +13,9 @@
   independent from the finite operation's receipt.
 
 ### Fixed
+- Keep one shared-pointer-backed Swift handle layout across iOS deployment
+  targets and Swift explicit modules. This fixes iOS 15 imports when Xcode
+  builds the Clang module for a newer SDK and avoids mismatched native layouts.
 - Persist filtered membership transitions in a channel-private outbox before
   resolving their source history. Preserve immutable deliveries and UUIDs
   through full send windows, lost acknowledgements, restart, filter changes,
@@ -40,6 +43,15 @@
   through the bridge error slot instead of escaping as a native exception.
 
 ### Compatibility
+- iOS bridge handles now consistently use the existing value representation,
+  including builds targeting iOS 16.4 or newer, simulators, and Mac Catalyst.
+  Rebuild all native bridge and Swift consumers together; do not mix previously
+  compiled iOS FRT objects with this bridge. macOS/Linux FRT behavior is unchanged.
+- LatticeCAPI now uses its dependency's selected bridge ABI. On iOS, private
+  retained heap handles own the bridge values; its public opaque C handles and
+  retain/release contract remain unchanged. macOS/Linux retain their existing
+  FRT handles. Linked-object getters now return one owned reference consistently
+  with the other C handle factories.
 - Additive C++ and Swift bridge APIs; no public C ABI change. Rebuild Core and
   native bridge consumers together. The iOS scheduler adapter requires the
   matching Lattice SDK; Core alone does not register Apple tasks.

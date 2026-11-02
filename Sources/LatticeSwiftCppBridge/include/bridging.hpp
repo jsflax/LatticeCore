@@ -9,15 +9,17 @@
 
 #ifdef __cplusplus
 
-// LATTICE_HAS_FRT: whether SWIFT_SHARED_REFERENCE foreign-reference types are
-// available. They require iOS 16.4 / macOS 13.3 / tvOS 16.4 / watchOS 9.4. Below
-// that floor (iOS 15) the *_ref handle types are compiled as plain Swift value
-// types whose inner std::shared_ptr provides the same shared ownership — so the
-// existing C++-interop Swift code can drive them without a separate C backend.
+// LATTICE_HAS_FRT selects the *_ref ABI, not runtime feature availability.
+// Foreign-reference types require iOS 16.4 / macOS 13.3 / tvOS 16.4 / watchOS
+// 9.4. Our iOS floor is 15.0, so ALL iOS builds use plain Swift value handles
+// whose inner std::shared_ptr provides the same shared ownership. Selecting
+// their layout from the deployment version is unsafe: Swift explicit modules
+// compile for the SDK version while native objects use the deployment version.
+// This includes iOS simulators and Mac Catalyst. macOS 14 and Linux retain FRT.
 //
-// Overridable (#ifndef): targets that never cross Swift interop and depend on
-// the heap-ref model (e.g. LatticeCAPI) force the FRT layout with
-// -DLATTICE_HAS_FRT=1.
+// Overridable (#ifndef) for custom native builds. Any override must apply to
+// every bridge consumer and implementation in the image. LatticeCAPI adapts to
+// this default rather than selecting a different ABI in its own target.
 //
 // Order matters: tvOS/watchOS define __IPHONE_OS_VERSION_MIN_REQUIRED too (as
 // their base 9.0 alias), so their checks must come before the iOS check or
@@ -25,8 +27,11 @@
 #ifndef LATTICE_HAS_FRT
 #if defined(__APPLE__)
 #  include <Availability.h>
+#  include <TargetConditionals.h>
 #endif
-#if defined(__TV_OS_VERSION_MIN_REQUIRED) && __TV_OS_VERSION_MIN_REQUIRED < 160400
+#if defined(__APPLE__) && TARGET_OS_IOS
+#  define LATTICE_HAS_FRT 0
+#elif defined(__TV_OS_VERSION_MIN_REQUIRED) && __TV_OS_VERSION_MIN_REQUIRED < 160400
 #  define LATTICE_HAS_FRT 0
 #elif defined(__WATCH_OS_VERSION_MIN_REQUIRED) && __WATCH_OS_VERSION_MIN_REQUIRED < 90400
 #  define LATTICE_HAS_FRT 0

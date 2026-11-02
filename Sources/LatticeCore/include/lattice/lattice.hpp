@@ -838,6 +838,18 @@ private:
 // Main database interface
 // ============================================================================
 
+struct audit_cursor {
+    int64_t head = 0;
+    std::string head_global_id;
+    int64_t floor = 0;
+};
+
+struct audit_read_fence {
+    audit_cursor cursor;
+    bool has_history_generation = false;
+    std::string history_generation;
+};
+
 class lattice_db {
 public:
     // Construct with path (uses default scheduler, no sync)
@@ -3249,6 +3261,59 @@ public:
         if (is_closed() || connection->is_closed())
             throw db_error("Grouped count connection is closed");
         return rows;
+    }
+
+    audit_read_fence read_audit_read_fence() {
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed()) throw db_error("Audit read fence connection is closed");
+        const auto rows = connection->query(
+            "SELECT COALESCE((SELECT id FROM main.AuditLog ORDER BY id DESC LIMIT 1),0) AS head, "
+            "(SELECT CASE WHEN typeof(globalId)='text' AND length(CAST(globalId AS BLOB))=36 "
+            "THEN globalId END FROM main.AuditLog ORDER BY id DESC LIMIT 1) AS head_global_id, "
+            "COALESCE((SELECT id FROM main.AuditLog ORDER BY id ASC LIMIT 1),0) AS floor, "
+            "(SELECT COUNT(*) FROM main._lattice_meta WHERE key='history_generation_revision_v1') AS generation_count, "
+            "(SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))=36 THEN value END "
+            "FROM main._lattice_meta WHERE key='history_generation_revision_v1' LIMIT 1) AS generation");
+        if (is_closed() || connection->is_closed()) throw db_error("Audit read fence connection is closed");
+        if (rows.size()!=1) throw db_error("Invalid audit read fence result");
+        const auto& row=rows.front();
+        const auto integer=[&](const char* key) {
+            const auto found=row.find(key);
+            if(found==row.end() || !std::holds_alternative<int64_t>(found->second))
+                throw db_error("Invalid audit read fence integer");
+            return std::get<int64_t>(found->second);
+        };
+        const auto uuid=[&](const char* key) {
+            const auto found=row.find(key);
+            if(found==row.end() || !std::holds_alternative<std::string>(found->second))
+                throw db_error("Invalid audit read fence identity");
+            const auto value=std::get<std::string>(found->second);
+            if(value.size()!=36) throw db_error("Invalid audit read fence identity");
+            for(size_t i=0;i<value.size();++i) {
+                const char c=value[i]; const bool dash=i==8 || i==13 || i==18 || i==23;
+                if(dash ? c!='-' : !((c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F')))
+                    throw db_error("Invalid audit read fence identity");
+            }
+            return value;
+        };
+        audit_read_fence result;
+        result.cursor.head=integer("head"); result.cursor.floor=integer("floor");
+        if(result.cursor.head==0 && result.cursor.floor==0) {
+            if(!std::holds_alternative<std::nullptr_t>(row.at("head_global_id")))
+                throw db_error("Invalid empty audit read fence");
+        } else {
+            if(result.cursor.head<=0 || result.cursor.floor<=0 || result.cursor.floor>result.cursor.head)
+                throw db_error("Invalid audit read fence bounds");
+            result.cursor.head_global_id=uuid("head_global_id");
+        }
+        const auto count=integer("generation_count");
+        if(count==0) {
+            if(!std::holds_alternative<std::nullptr_t>(row.at("generation")))
+                throw db_error("Invalid absent audit history generation");
+        } else if(count==1) {
+            result.history_generation=uuid("generation"); result.has_history_generation=true;
+        } else throw db_error("Ambiguous audit history generation");
+        return result;
     }
 
     size_t count(const std::string& table_name,

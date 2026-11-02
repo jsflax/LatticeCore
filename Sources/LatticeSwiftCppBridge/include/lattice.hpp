@@ -874,6 +874,15 @@ public:
         }
     }
 
+    audit_read_fence read_audit_read_fence() SWIFT_NAME(auditReadFence()) {
+        last_bridge_error().clear();
+        try { return lattice_db::read_audit_read_fence(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
     // count overloads: never throw into Swift — 0 on failure.
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
@@ -3718,6 +3727,10 @@ public:
         OptionalString distinct_by = std::nullopt,
         const ColumnValueVector& params = {}) const {
         return impl().grouped_counts(table_name, group_by, where_clause, distinct_by, params);
+    }
+
+    audit_read_fence read_audit_read_fence() const SWIFT_NAME(auditReadFence()) {
+        return impl().read_audit_read_fence();
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema

@@ -16,8 +16,8 @@ SchemaVector schemas() {
     } return {row};
 }
 swift_configuration config(const std::string& path,bool readOnly=false) {swift_configuration c(path);c.target_schema_version=6;c.read_only=readOnly;if(readOnly)c.required_existing_schema_version=6;return c;}
-std::shared_ptr<swift_lattice> opened(const std::string& path,bool readOnly=false) {return std::make_shared<swift_lattice>(config(path,readOnly),schemas());}
-void insert(swift_lattice& db,int n,size_t size=3,std::string label="saved",int owner=100) {
+std::shared_ptr<lattice::swift_lattice> opened(const std::string& path,bool readOnly=false) {return std::make_shared<lattice::swift_lattice>(config(path,readOnly),schemas());}
+void insert(lattice::swift_lattice& db,int n,size_t size=3,std::string label="saved",int owner=100) {
     db.db().execute("INSERT INTO ScopedAsset(globalId,ownerID,label,ordinal,payload,embedding) VALUES(?,?,?,?,?,?)",
         {identity(n),identity(owner),label,static_cast<int64_t>(n),std::vector<uint8_t>(size,static_cast<uint8_t>(n)),std::vector<uint8_t>(1048576,99)});
 }
@@ -30,7 +30,7 @@ detached_read::indexed_request page(size_t limit=2) {
 struct Authorizer {
     std::shared_ptr<database> connection;
     int forbidden=0;
-    explicit Authorizer(const std::shared_ptr<swift_lattice>& owner) : connection(owner->borrow_read_connection()) {
+    explicit Authorizer(const std::shared_ptr<lattice::swift_lattice>& owner) : connection(owner->borrow_read_connection()) {
         sqlite3_set_authorizer(connection->handle(),[](void* context,int action,const char* table,const char* column,const char*,const char*) -> int {
             const bool badRead=action==SQLITE_READ&&table&&column&&
                 ((std::string(table)=="ScopedAsset"&&std::string(column)=="embedding") ||

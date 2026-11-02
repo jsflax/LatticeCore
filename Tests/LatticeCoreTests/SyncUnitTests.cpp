@@ -3350,6 +3350,10 @@ TEST(SyncDelivery, FilteredByteDeferralPreservesEverySourceUntilItsOwnAck) {
         EXPECT_EQ(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).size(),10u);
         trace("initial-checks-complete");
         std::set<std::string> acked;
+        // Reuse the same validated-wire cache as the production owner. Every read
+        // still checks current SQL budgets/identities and exact wire bytes; unchanged
+        // retained payloads need not be JSON-decoded again for this byte sum.
+        std::vector<lattice::detail::sync_delivery> retained;
         for(int pass=0;pass<20 && acked.size()<10;++pass) {
             trace("read-sent",pass);
             const auto& sent=observe(); std::vector<std::string> ids;
@@ -3360,7 +3364,7 @@ TEST(SyncDelivery, FilteredByteDeferralPreservesEverySourceUntilItsOwnAck) {
             ASSERT_FALSE(ids.empty()); acked.insert(ids[0]); outbox_ack(*transport,ids); sync.sync_now();
             trace("ack-sync-complete",pass);
             EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),static_cast<int64_t>(acked.size()));
-            const auto retained=lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id);
+            retained=lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id,retained);
             size_t bytes=0;for(const auto& receipt:retained) bytes+=lattice::detail::sync_delivery_retained_bytes(receipt,receipt.wire_json);
             EXPECT_LE(bytes,lattice::detail::sync_outbox_bytes);
         }

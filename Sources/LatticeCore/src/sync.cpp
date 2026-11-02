@@ -2117,8 +2117,13 @@ void synchronizer_base::reconcile_sync_filter() {
         // the existing implicit parent-table routing policy and rebuild their current state too.
         std::vector<std::pair<sync_filter_entry,bool>> targets={{parent_filter,false}};
         const auto prefix="_"+parent_filter.table_name+"_";
-        const auto links=db().db().query("SELECT CASE WHEN length(CAST(name AS BLOB))<=4096 THEN name END AS name "
-            "FROM main.sqlite_schema WHERE type='table' AND substr(name,1,?)=? ORDER BY name LIMIT 129",
+        // Only registered internal data tables participate. Vector/FTS/RTree index artifacts
+        // share the parent prefix but have no sync globalId. Registration is also ensured for
+        // existing link/virtual-link/geo-list tables; its value may be empty or multi-parent.
+        const auto links=db().db().query("SELECT CASE WHEN length(CAST(s.name AS BLOB))<=4096 THEN s.name END AS name "
+            "FROM main.sqlite_schema s WHERE s.type='table' AND substr(s.name,1,?)=? "
+            "AND EXISTS(SELECT 1 FROM main._lattice_meta m WHERE m.key='internal_table:'||s.name) "
+            "ORDER BY s.name LIMIT 129",
             {static_cast<int64_t>(prefix.size()),prefix});
         if(links.size()>128) throw std::length_error("Sync parent exceeds 128 relationship-table limit");
         for(const auto& link:links) {

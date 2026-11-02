@@ -17,6 +17,14 @@
 // Sync Unit Tests — AuditLog, sync protocol, synchronizer
 // ============================================================================
 
+// The native equivalent of a Swift FloatVector property: packed float BLOB plus is_vector schema.
+struct FilterVectorRow {
+    std::string name;
+    int age;
+    std::vector<uint8_t> embedding;
+};
+LATTICE_SCHEMA(FilterVectorRow, name, age, embedding);
+
 
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 namespace {
@@ -3461,6 +3469,84 @@ TEST(SyncDelivery, CurrentSnapshotProjectionRefusesBeforeHydrationAndSupportsLin
         auto link=sync.build_insert_entry_from_current_row("_TestPerson_links","link-id");
         ASSERT_TRUE(link);EXPECT_EQ(link->row_id,0);EXPECT_EQ(link->global_row_id,"link-id");
         EXPECT_EQ(std::get<std::string>(link->changed_fields.at("lhs").value),"left");
+    });
+}
+
+TEST(SyncDelivery, VectorFilterEnableAndReenableDrainPastSnapshotWindowWithRegisteredLinks) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>();lattice::set_network_factory(factory);
+        auto scheduler=std::make_shared<outbox_queue>();TempDB tmp{"vectorfilterreconcile"};
+        lattice::configuration config(tmp.str());config.sched=scheduler;
+        auto db=std::make_unique<lattice::lattice_db>(config);auto* owned=db.get();
+        auto schema=lattice::managed<FilterVectorRow>::schema();
+        schema.properties.back().is_vector=true;
+        const auto embedding=pack_floats({1.0f,2.0f});
+        std::vector<FilterVectorRow> rows;
+        for(int i=0;i<257;++i) rows.push_back({"selected-"+std::to_string(i),1,embedding});
+        rows.push_back({"excluded",2,embedding});
+        db->add_bulk_with_schema(std::move(rows),schema);
+        ASSERT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _FilterVectorRow_embedding_vec"),258);
+        ASSERT_GT(outbox_number(*owned,"SELECT COUNT(*) AS n FROM pragma_table_list "
+            "WHERE schema='main' AND type='shadow' AND name LIKE '_FilterVectorRow_embedding_vec%'"),0);
+        const auto parent=std::get<std::string>(owned->db().query(
+            "SELECT globalId FROM FilterVectorRow WHERE name='selected-0'")[0].at("globalId"));
+        // Use the real registration APIs, including an empty-parent legacy-compatible registration.
+        owned->ensure_link_table("_FilterVectorRow_links");
+        owned->ensure_virtual_link_table("_FilterVectorRow_polymorphic","FilterVectorRow");
+        owned->ensure_geo_bounds_list_table("FilterVectorRow","zones");
+        owned->db().execute("INSERT INTO _FilterVectorRow_links(lhs,rhs) VALUES(?,?)",{parent,parent});
+        owned->db().execute("INSERT INTO _FilterVectorRow_polymorphic(lhs,rhs,rhs_type) VALUES(?,?,'FilterVectorRow')",{parent,parent});
+        owned->db().execute("INSERT INTO _FilterVectorRow_zones(parent_id,minLat,maxLat,minLon,maxLon) VALUES(?,0,1,0,1)",{parent});
+        auto cfg=outbox_config("ipc:vector-filter");cfg.chunk_size=64;
+        cfg.sync_filter=std::vector<lattice::sync_filter_entry>{};
+        std::vector<std::string> errors;
+        outbox_probe sync(std::move(db),cfg);
+        sync.set_on_error([&](const std::string& error){errors.push_back(error);});
+        sync.connect();scheduler->drain();
+        auto* transport=factory->last_websocket();
+        ASSERT_TRUE(outbox_sent(*transport).empty());
+        transport->clear_sent_messages();
+        std::vector<lattice::audit_log_entry> received;
+        auto drain=[&](const std::string& operation) {
+            received.clear();std::set<std::string> seen;
+            for(int pass=0;pass<16;++pass) {
+                scheduler->drain();
+                const auto batch=outbox_sent(*transport);transport->clear_sent_messages();
+                if(batch.empty()) break;
+                std::vector<std::string> acks;
+                for(const auto& entry:batch) {
+                    ASSERT_TRUE(seen.insert(entry.global_id).second);
+                    EXPECT_EQ(entry.operation,operation);
+                    EXPECT_TRUE(entry.table_name=="FilterVectorRow" || entry.table_name=="_FilterVectorRow_links" ||
+                        entry.table_name=="_FilterVectorRow_polymorphic" || entry.table_name=="_FilterVectorRow_zones");
+                    if(operation=="INSERT" && entry.table_name=="FilterVectorRow") {
+                        EXPECT_EQ(std::get<int64_t>(entry.changed_fields.at("age").value),1);
+                        EXPECT_EQ(entry.changed_fields.count("embedding"),1u);
+                    }
+                    received.push_back(entry);acks.push_back(entry.global_id);
+                }
+                outbox_ack(*transport,acks);
+            }
+            EXPECT_TRUE(errors.empty())<<(errors.empty()?"":errors.front());
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
+            EXPECT_EQ(sync.get_progress().pending_upload,0);
+        };
+        const std::vector<lattice::sync_filter_entry> enabled={{"FilterVectorRow",std::string("age=1")}};
+        sync.update_sync_filter(enabled);drain("INSERT");
+        ASSERT_EQ(received.size(),260u); // 257 vector rows plus all three registered internal rows.
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),260);
+        // Exercise the same OFF->ON state transition, with new rows admitted while OFF.
+        sync.update_sync_filter({});drain("DELETE");
+        ASSERT_EQ(received.size(),260u);
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+        std::vector<FilterVectorRow> later;
+        for(int i=0;i<20;++i) later.push_back({"while-off-"+std::to_string(i),1,embedding});
+        owned->add_bulk_with_schema(std::move(later),schema);sync.sync_now();scheduler->drain();
+        ASSERT_TRUE(outbox_sent(*transport).empty());
+        sync.update_sync_filter(enabled);drain("INSERT");
+        ASSERT_EQ(received.size(),280u);
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),280);
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _FilterVectorRow_embedding_vec"),278);
     });
 }
 

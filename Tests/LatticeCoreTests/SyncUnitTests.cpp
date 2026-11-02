@@ -20,7 +20,7 @@
 
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 namespace {
-void bounded_mock_case(const std::function<void()>& body) {
+void bounded_mock_case(const std::function<void()>& body, unsigned watchdog_seconds = 10) {
     struct Style {
         std::string old = GTEST_FLAG_GET(death_test_style);
         ~Style() { GTEST_FLAG_SET(death_test_style, old); }
@@ -32,7 +32,7 @@ void bounded_mock_case(const std::function<void()>& body) {
         sigaddset(&unblocked, SIGALRM);
         if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR ||
             sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
-        alarm(10);
+        alarm(watchdog_seconds);
         try {
             body();
             if (::testing::Test::HasFailure()) {
@@ -3389,7 +3389,7 @@ TEST(SyncDelivery, FilteredByteDeferralPreservesEverySourceUntilItsOwnAck) {
         trace("loop-complete");
         EXPECT_EQ(acked.size(),10u); EXPECT_TRUE(lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id).empty());
         EXPECT_TRUE(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).empty());
-    });
+    }, 30); // Hang guard for the 10 MiB Debug correctness fixture, not a latency SLA.
 }
 #endif
 

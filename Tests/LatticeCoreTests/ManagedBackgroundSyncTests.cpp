@@ -417,6 +417,11 @@ TEST(ManagedBackgroundSync, CallbackSubscriptionsDuringSetupKeepLatestHandlers) 
 
 namespace {
 enum class reentrant_subscription { state, error, progress };
+struct scoped_callback_death_test_style {
+    std::string old = GTEST_FLAG_GET(death_test_style);
+    scoped_callback_death_test_style() { GTEST_FLAG_SET(death_test_style, "threadsafe"); }
+    ~scoped_callback_death_test_style() { GTEST_FLAG_SET(death_test_style, old); }
+};
 void callback_replacement_releases_outside_locks(reentrant_subscription kind) {
     managed_fixture fixture;
     lattice::lattice_db owner(fixture.config());
@@ -456,14 +461,17 @@ void callback_replacement_releases_outside_locks(reentrant_subscription kind) {
 }
 
 TEST(ManagedBackgroundSync, ReplacingStateCallbackCanReenterAndCloseFromCaptureDestructor) {
+    scoped_callback_death_test_style style;
     EXPECT_EXIT({ alarm(5); callback_replacement_releases_outside_locks(reentrant_subscription::state); _exit(0); },
                 ::testing::ExitedWithCode(0), "");
 }
 TEST(ManagedBackgroundSync, ReplacingErrorCallbackCanReenterAndCloseFromCaptureDestructor) {
+    scoped_callback_death_test_style style;
     EXPECT_EXIT({ alarm(5); callback_replacement_releases_outside_locks(reentrant_subscription::error); _exit(0); },
                 ::testing::ExitedWithCode(0), "");
 }
 TEST(ManagedBackgroundSync, ReplacingProgressCallbackCanReenterAndCloseFromCaptureDestructor) {
+    scoped_callback_death_test_style style;
     EXPECT_EXIT({ alarm(5); callback_replacement_releases_outside_locks(reentrant_subscription::progress); _exit(0); },
                 ::testing::ExitedWithCode(0), "");
 }

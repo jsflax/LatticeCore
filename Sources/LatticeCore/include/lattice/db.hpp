@@ -54,6 +54,10 @@ class database {
     };
     static std::shared_ptr<database> make_read_keeper(const std::string& path,
                                                     int busy_timeout_ms);
+    // Tests exercise the bootstrap helper with an actual SQLite trace receipt;
+    // no public hook or per-connection test state is installed.
+    friend struct database_wal_test_access;
+    void enable_wal_mode();
     // The update hook may query globalId through database::query(). That
     // nested query must not drain a prior row's dirty state while the outer
     // SQLite statement still owns its connection mutex. Track the actual

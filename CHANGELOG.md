@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.5.1] - 2026-11-02
+
+### Fixed
+- Let concurrent first opens of a file finish enabling WAL within the configured
+  busy timeout. SQLite can decline to call its busy handler during this lock
+  upgrade; retry only that idempotent initialization statement after releasing
+  the failed attempt, with one deadline and cancellation checks.
+- Preserve immediate failure for zero wait budgets and non-contention errors.
+  Read-only and in-memory behavior, ordinary SQL execution, and the public ABI
+  remain unchanged.
+
 ## [2.5.0] - 2026-11-01
 
 ### Added

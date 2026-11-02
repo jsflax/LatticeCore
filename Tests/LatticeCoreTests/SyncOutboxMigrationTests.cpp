@@ -33,7 +33,7 @@ struct predecessor_store {
             no_history.properties["value"]=value;
             lattice::swift_lattice seed{lattice::swift_configuration(path.str()), {no_history}};
             seed.db().execute("INSERT INTO OldNoHistory(globalId,value) VALUES('old-row','initial')");
-            seed.add(TestPerson{"source", 1, std::nullopt});
+            static_cast<lattice::lattice_db&>(seed).add(TestPerson{"source", 1, std::nullopt});
             source = lattice::query_audit_log_for_sync(seed.db(), "migration").back();
         }
         raw = std::make_unique<lattice::database>(path.str());

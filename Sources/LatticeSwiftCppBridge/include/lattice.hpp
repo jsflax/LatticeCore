@@ -874,6 +874,15 @@ public:
         }
     }
 
+    audit_read_fence read_audit_read_fence() SWIFT_NAME(auditReadFence()) {
+        last_bridge_error().clear();
+        try { return lattice_db::read_audit_read_fence(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
     // Strict metadata query: zero is only a sealed failure sentinel.
     int32_t stored_schema_version() SWIFT_NAME(storedSchemaVersion()) {
         last_bridge_error().clear();
@@ -3771,6 +3780,10 @@ public:
         return impl().grouped_counts(table_name, group_by, where_clause, distinct_by, params);
     }
 
+    audit_read_fence read_audit_read_fence() const SWIFT_NAME(auditReadFence()) {
+        return impl().read_audit_read_fence();
+    }
+
     int32_t stored_schema_version() const SWIFT_NAME(storedSchemaVersion()) {
         return impl().stored_schema_version();
     }
@@ -3828,6 +3841,11 @@ public:
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
         return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
     }
+    /// Explicit audited-writer admission. false also represents a sealed
+    /// failure; callers must check last_bridge_error() before using the result.
+    bool prepare_for_audited_writes() const {
+        return sealed([&] { return impl().prepare_for_audited_writes(); });
+    }
     /// Age-based, cursor-safe history prune (see lattice_db::prune_audit_log).
     int64_t prune_audit_log(int64_t retention_seconds) const
         SWIFT_NAME(pruneAuditLog(retentionSeconds:)) {
@@ -3878,6 +3896,14 @@ public:
         return last_bridge_error().empty() ? frames : -2;
     }
     void optimize() const { impl().optimize(); }
+
+    OptionalString local_metadata(const std::string& name_space, const std::string& key) const {
+        return sealed([&] { return impl().local_metadata(name_space, key); });
+    }
+    bool insert_local_metadata_if_absent(const std::string& name_space, const std::string& key,
+                                          const std::string& value) const {
+        return sealed([&] { return impl().insert_local_metadata_if_absent(name_space, key, value); });
+    }
 
     // Transactions — begin_transaction throws db_error when the busy
     // timeout lapses or an allocation fails under memory pressure; that

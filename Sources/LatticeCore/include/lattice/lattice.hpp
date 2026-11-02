@@ -851,6 +851,18 @@ private:
 // Main database interface
 // ============================================================================
 
+struct audit_cursor {
+    int64_t head = 0;
+    std::string head_global_id;
+    int64_t floor = 0;
+};
+
+struct audit_read_fence {
+    audit_cursor cursor;
+    bool has_history_generation = false;
+    std::string history_generation;
+};
+
 class lattice_db {
 public:
     // Construct with path (uses default scheduler, no sync)
@@ -3314,6 +3326,59 @@ public:
         return rows;
     }
 
+    audit_read_fence read_audit_read_fence() {
+        auto connection = borrow_read_connection();
+        if (is_closed() || connection->is_closed()) throw db_error("Audit read fence connection is closed");
+        const auto rows = connection->query(
+            "SELECT COALESCE((SELECT id FROM main.AuditLog ORDER BY id DESC LIMIT 1),0) AS head, "
+            "(SELECT CASE WHEN typeof(globalId)='text' AND length(CAST(globalId AS BLOB))=36 "
+            "THEN globalId END FROM main.AuditLog ORDER BY id DESC LIMIT 1) AS head_global_id, "
+            "COALESCE((SELECT id FROM main.AuditLog ORDER BY id ASC LIMIT 1),0) AS floor, "
+            "(SELECT COUNT(*) FROM main._lattice_meta WHERE key='history_generation_revision_v1') AS generation_count, "
+            "(SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))=36 THEN value END "
+            "FROM main._lattice_meta WHERE key='history_generation_revision_v1' LIMIT 1) AS generation");
+        if (is_closed() || connection->is_closed()) throw db_error("Audit read fence connection is closed");
+        if (rows.size()!=1) throw db_error("Invalid audit read fence result");
+        const auto& row=rows.front();
+        const auto integer=[&](const char* key) {
+            const auto found=row.find(key);
+            if(found==row.end() || !std::holds_alternative<int64_t>(found->second))
+                throw db_error("Invalid audit read fence integer");
+            return std::get<int64_t>(found->second);
+        };
+        const auto uuid=[&](const char* key) {
+            const auto found=row.find(key);
+            if(found==row.end() || !std::holds_alternative<std::string>(found->second))
+                throw db_error("Invalid audit read fence identity");
+            const auto value=std::get<std::string>(found->second);
+            if(value.size()!=36) throw db_error("Invalid audit read fence identity");
+            for(size_t i=0;i<value.size();++i) {
+                const char c=value[i]; const bool dash=i==8 || i==13 || i==18 || i==23;
+                if(dash ? c!='-' : !((c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F')))
+                    throw db_error("Invalid audit read fence identity");
+            }
+            return value;
+        };
+        audit_read_fence result;
+        result.cursor.head=integer("head"); result.cursor.floor=integer("floor");
+        if(result.cursor.head==0 && result.cursor.floor==0) {
+            if(!std::holds_alternative<std::nullptr_t>(row.at("head_global_id")))
+                throw db_error("Invalid empty audit read fence");
+        } else {
+            if(result.cursor.head<=0 || result.cursor.floor<=0 || result.cursor.floor>result.cursor.head)
+                throw db_error("Invalid audit read fence bounds");
+            result.cursor.head_global_id=uuid("head_global_id");
+        }
+        const auto count=integer("generation_count");
+        if(count==0) {
+            if(!std::holds_alternative<std::nullptr_t>(row.at("generation")))
+                throw db_error("Invalid absent audit history generation");
+        } else if(count==1) {
+            result.history_generation=uuid("generation"); result.has_history_generation=true;
+        } else throw db_error("Ambiguous audit history generation");
+        return result;
+    }
+
     /// The persisted store version on the current read/transaction route.
     /// Unlike migration bootstrap, a missing or invalid value is an error:
     /// read-only consumers must never infer compatibility from a fallback.
@@ -3496,6 +3561,13 @@ public:
         return 0;
     }
 
+    /// Explicitly prepare a store whose owner requires ordinary writes to be
+    /// audited. Validate the canonical control table and its single 0/1 flag,
+    /// then normalize a legacy disabled flag in an exclusively owned write
+    /// transaction. Returns true only when 1 changed to 0. Ordinary opens and
+    /// generic maintenance preserve deliberately disabled auditing.
+    bool prepare_for_audited_writes();
+
     /// Hard-delete rows WITHOUT relaying the deletes: each row's DELETE
     /// audit entry carries the `__lattice_filter_removal` marker, which WSS
     /// receivers skip-and-ack (they never apply it) and IPC receivers record
@@ -3518,11 +3590,8 @@ public:
     int64_t delete_rows_no_relay(const std::string& table,
                                  const std::vector<std::string>& global_row_ids) {
         if (global_row_ids.empty()) return 0;
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        int64_t deleted = 0;
-        db_->begin_transaction();
-        try {
-            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        return with_sync_suppressed_transaction_([&]() -> int64_t {
+            int64_t deleted = 0;
             for (const auto& gid : global_row_ids) {
                 db_->execute("DELETE FROM \"" + table + "\" WHERE globalId = ? COLLATE NOCASE",
                              {gid});
@@ -3537,17 +3606,8 @@ public:
                     "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
                     {generate_global_id(), table, gid});
             }
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->commit();
-        } catch (...) {
-            db_->rollback();
-            // The flag write above rolled back with everything else, but
-            // restore defensively in case the txn died after a partial step.
-            try { db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1",
-                               {prev_disabled}); } catch (...) {}
-            throw;
-        }
-        return deleted;
+            return deleted;
+        });
     }
 
     /// Repair audit rows whose timestamp landed in the REAL column as TEXT.
@@ -3810,6 +3870,20 @@ public:
 
 private:
     friend struct audit_maintenance_test_access;
+    friend struct sync_apply_transaction_access;
+    template<typename F>
+    int64_t with_sync_suppressed_transaction_(F&& body) {
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            // Capture only after ownership and BEGIN. Reading before admission
+            // can save another operation's temporary 1, or an old persistent
+            // 1 that prepare_for_audited_writes has since normalized.
+            const auto previous = sync_flag_in_owned_transaction_();
+            db_->execute("UPDATE main._SyncControl SET disabled = 1 WHERE id = 1");
+            const auto result = std::forward<F>(body)();
+            db_->execute("UPDATE main._SyncControl SET disabled = ? WHERE id = 1", {previous});
+            return result;
+        });
+    }
     friend struct background_sync_lifecycle_test_access;
     template<typename F>
     int64_t with_audit_prune_transaction_(F&& body, const std::atomic<bool>* cancelled = nullptr) {
@@ -4102,12 +4176,12 @@ private:
         return value;
     }
 
-    int64_t history_sync_flag_in_transaction_() {
+    int64_t sync_flag_in_owned_transaction_() {
         const auto rows = db_->query("SELECT disabled FROM main._SyncControl WHERE id=1");
-        if (rows.size() != 1) throw db_error("history generation requires one sync control row");
+        if (rows.size() != 1) throw db_error("owned transaction requires one sync control row");
         const auto it = rows[0].find("disabled");
         if (it == rows[0].end() || !std::holds_alternative<int64_t>(it->second))
-            throw db_error("history generation requires an integer sync control flag");
+            throw db_error("owned transaction requires an integer sync control flag");
         return std::get<int64_t>(it->second);
     }
 
@@ -4221,7 +4295,7 @@ private:
                     plans.push_back(std::move(plan));
                 }
                 if (force) {
-                    const int64_t disabled = history_sync_flag_in_transaction_();
+                    const int64_t disabled = sync_flag_in_owned_transaction_();
                     db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
                     db_->execute("DELETE FROM main.AuditLog");
                     db_->execute("DELETE FROM main._lattice_sync_state");
@@ -4343,7 +4417,7 @@ private:
                         }
                         where += " ORDER BY " + order_expr + " LIMIT ?";
                         params.push_back(batch_size);
-                        const auto disabled = history_sync_flag_in_transaction_();
+                        const auto disabled = sync_flag_in_owned_transaction_();
                         db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
                         db_->execute(base.str() + where, params);
                         const auto count = static_cast<int64_t>(sqlite3_changes(db_->handle()));
@@ -4548,6 +4622,17 @@ public:
         }
         return query_read(sql.str(), repeated);
     }
+
+    /// Immutable, namespaced state local to this physical database. It is
+    /// neither a model nor synchronization history. Reads never create storage;
+    /// insertion requires this thread's existing explicit write transaction.
+    /// This lets a caller atomically persist a receipt with ordinary audited
+    /// model mutations, without opening a second database or bypassing Lattice.
+    std::optional<std::string> local_metadata(const std::string& name_space,
+                                              const std::string& key);
+    bool insert_local_metadata_if_absent(const std::string& name_space,
+                                         const std::string& key,
+                                         const std::string& value);
 
     // Transaction support. On shared-cache stores the per-store write gate
     // (results spec §4.1) is held for the duration of the transaction, so

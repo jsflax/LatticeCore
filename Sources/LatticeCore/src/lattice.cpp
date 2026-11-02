@@ -12,6 +12,150 @@
 
 namespace lattice {
 
+namespace {
+bool valid_local_metadata_utf8(const std::string& text) {
+    size_t index = 0;
+    while (index < text.size()) {
+        const auto first = static_cast<unsigned char>(text[index++]);
+        if (first <= 0x7f) continue;
+        size_t trailing = 0;
+        unsigned char second_min = 0x80, second_max = 0xbf;
+        if (first >= 0xc2 && first <= 0xdf) trailing = 1;
+        else if (first >= 0xe0 && first <= 0xef) {
+            trailing = 2;
+            if (first == 0xe0) second_min = 0xa0;  // no overlong forms
+            if (first == 0xed) second_max = 0x9f;  // no UTF-16 surrogates
+        } else if (first >= 0xf0 && first <= 0xf4) {
+            trailing = 3;
+            if (first == 0xf0) second_min = 0x90;
+            if (first == 0xf4) second_max = 0x8f;  // at most U+10FFFF
+        } else return false;
+        if (text.size() - index < trailing) return false;
+        const auto second = static_cast<unsigned char>(text[index]);
+        if (second < second_min || second > second_max) return false;
+        for (size_t offset = 1; offset < trailing; ++offset) {
+            const auto next = static_cast<unsigned char>(text[index + offset]);
+            if (next < 0x80 || next > 0xbf) return false;
+        }
+        index += trailing;
+    }
+    return true;
+}
+
+void validate_local_metadata_key(const std::string& name_space, const std::string& key) {
+    // Fixed SQL identifiers; both inputs are bound values, never SQL syntax.
+    // Namespaces deliberately exclude Lattice's own reserved prefix.
+    if (name_space.empty() || name_space.size() > 64 ||
+        name_space.front() < 'a' || name_space.front() > 'z' ||
+        name_space.rfind("lattice.", 0) == 0 ||
+        !std::all_of(name_space.begin(), name_space.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-';
+        }) || key.empty() || key.size() > 512 || key.find('\0') != std::string::npos ||
+        !valid_local_metadata_utf8(key)) {
+        throw db_error("Invalid local metadata namespace or key");
+    }
+}
+}
+
+std::optional<std::string> lattice_db::local_metadata(const std::string& name_space,
+                                                      const std::string& key) {
+    validate_local_metadata_key(name_space, key);
+    const auto tables = query_read(
+        "SELECT type FROM main.sqlite_master WHERE name = '_lattice_local_metadata_v1' COLLATE NOCASE");
+    if (tables.empty()) return std::nullopt;
+    if (tables.size() != 1 || std::get<std::string>(tables.front().at("type")) != "table")
+        throw db_error("Invalid local metadata storage");
+    const auto rows = query_read(
+        "SELECT CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= 65536 "
+        "THEN value ELSE NULL END AS value FROM main._lattice_local_metadata_v1 "
+        "WHERE namespace = ? AND key = ? LIMIT 2",
+        {name_space, key});
+    if (rows.empty()) return std::nullopt;
+    if (rows.size() != 1 || !std::holds_alternative<std::string>(rows.front().at("value")))
+        throw db_error("Invalid local metadata value");
+    const auto& value = std::get<std::string>(rows.front().at("value"));
+    if (!valid_local_metadata_utf8(value)) throw db_error("Invalid local metadata text");
+    return value;
+}
+
+bool lattice_db::insert_local_metadata_if_absent(const std::string& name_space,
+                                                 const std::string& key,
+                                                 const std::string& value) {
+    validate_local_metadata_key(name_space, key);
+    if (value.size() > 65'536) throw db_error("Local metadata value exceeds its size limit");
+    if (!valid_local_metadata_utf8(value)) throw db_error("Invalid local metadata text");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction()) {
+        throw db_error("Local metadata insertion requires the owning write transaction");
+    }
+    // No globalId, model registration, audit triggers or synchronization state.
+    // Creation is part of the caller's transaction and rolls back with it.
+    db_->execute("CREATE TABLE IF NOT EXISTS main._lattice_local_metadata_v1 ("
+                 "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                 "PRIMARY KEY(namespace, key)) WITHOUT ROWID");
+    db_->execute("INSERT INTO main._lattice_local_metadata_v1(namespace, key, value) VALUES (?, ?, ?) "
+                 "ON CONFLICT(namespace, key) DO NOTHING", {name_space, key, value});
+    return sqlite3_changes(db_->handle()) == 1;
+}
+
+bool lattice_db::prepare_for_audited_writes() {
+    if (config_.read_only) throw db_error("audited writes require a writable connection");
+    return with_audit_prune_transaction_([&]() -> int64_t {
+        // sync_disabled() resolves this name on the connection. A TEMP shadow
+        // would make normalizing main's flag insufficient to enable auditing.
+        if (!db_->query("SELECT 1 FROM temp.sqlite_schema WHERE name = '_SyncControl' COLLATE NOCASE").empty())
+            throw db_error("audited writes reject a temporary sync control shadow");
+        const auto tables = db_->query(
+            "SELECT type, name, sql FROM main.sqlite_schema WHERE name = '_SyncControl' COLLATE NOCASE");
+        if (tables.size() != 1 ||
+            !std::holds_alternative<std::string>(tables[0].at("type")) ||
+            std::get<std::string>(tables[0].at("type")) != "table" ||
+            !std::holds_alternative<std::string>(tables[0].at("name")) ||
+            std::get<std::string>(tables[0].at("name")) != "_SyncControl" ||
+            !std::holds_alternative<std::string>(tables[0].at("sql")))
+            throw db_error("audited writes require the canonical sync control table");
+        // Accept formatting/case differences, but no alternate constraints,
+        // extra columns, generated columns, views or virtual tables.
+        std::string shape;
+        for (unsigned char c : std::get<std::string>(tables[0].at("sql"))) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') continue;
+            shape += c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+        }
+        if (shape != "createtable_synccontrol(idintegerprimarykeycheck(id=1),disabledintegernotnulldefault0)" ||
+            !db_->query("SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger' "
+                        "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty() ||
+            !db_->query("SELECT 1 FROM temp.sqlite_schema WHERE type = 'trigger' "
+                        "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty())
+            throw db_error("audited writes require the canonical sync control shape without triggers");
+
+        // SQL whitespace normalization alone cannot distinguish keywords from
+        // a custom declared type such as INTEGERPRIMARYKEY. Check SQLite's
+        // parsed column metadata too, including generated/hidden columns.
+        const std::vector<database::row_t> expected_columns = {
+            {{"cid", int64_t{0}}, {"name", std::string("id")}, {"type", std::string("INTEGER")},
+             {"notnull", int64_t{0}}, {"dflt_value", nullptr}, {"pk", int64_t{1}}, {"hidden", int64_t{0}}},
+            {{"cid", int64_t{1}}, {"name", std::string("disabled")}, {"type", std::string("INTEGER")},
+             {"notnull", int64_t{1}}, {"dflt_value", std::string("0")}, {"pk", int64_t{0}}, {"hidden", int64_t{0}}}
+        };
+        if (db_->query("PRAGMA main.table_xinfo('_SyncControl')") != expected_columns)
+            throw db_error("audited writes require the canonical sync control column metadata");
+
+        const auto rows = db_->query("SELECT id, disabled FROM main._SyncControl");
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("id")) ||
+            std::get<int64_t>(rows[0].at("id")) != 1 ||
+            !std::holds_alternative<int64_t>(rows[0].at("disabled")))
+            throw db_error("audited writes require one integer sync control row with id 1");
+        const auto disabled = std::get<int64_t>(rows[0].at("disabled"));
+        if (disabled != 0 && disabled != 1)
+            throw db_error("audited writes require a zero or one sync control flag");
+        if (disabled == 0) return 0;
+        db_->execute("UPDATE main._SyncControl SET disabled = 0 WHERE id = 1");
+        if (sqlite3_changes64(db_->handle()) != 1 || sync_flag_in_owned_transaction_() != 0)
+            throw db_error("audited writes did not normalize exactly one sync control row");
+        return 1;
+    }) != 0;
+}
+
 // Single definition of the global log level (declared extern in log.hpp).
 // Seed from the LATTICE_LOG_LEVEL env var (0=off..4=debug) so logging can be
 // enabled for a test/run without code changes, e.g. `LATTICE_LOG_LEVEL=4 swift test`.
@@ -106,7 +250,8 @@ void lattice_db::setup_change_hook(database& connection) {
 
             // Handle internal tables specially
             std::string table(table_name);
-            if (table == "_SyncControl" || table == "_lattice_sync_set" || table == "_lattice_sync_state") {
+            if (table == "_SyncControl" || table == "_lattice_sync_set" || table == "_lattice_sync_state" ||
+                table == "_lattice_local_metadata_v1") {
                 LOG_DEBUG("update_hook", "Skipping internal table %s", table_name);
                 return;
             }

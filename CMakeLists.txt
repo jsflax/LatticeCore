@@ -200,6 +200,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
     Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp
+    Tests/LatticeCoreTests/LocalMetadataTests.cpp
     Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
@@ -218,7 +219,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
     Tests/LatticeCoreTests/AuditRetentionTests.cpp
     Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditedWritesPreparationTests.cpp
     Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditReadFenceTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
     Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
@@ -233,6 +236,18 @@ target_include_directories(LatticeCoreTests PRIVATE
 # fixed-path logging environment. TMPDIR selects all fixture output locations.
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
+
+# Focused transaction/receipt qualification without compiling every bridge test.
+add_executable(LatticeLocalMetadataTests Tests/LatticeCoreTests/LocalMetadataTests.cpp)
+target_link_libraries(LatticeLocalMetadataTests PRIVATE LatticeCore gtest_main)
+
+# Audited-writer admission and the suppression/ownership paths it shares.
+add_executable(LatticeAuditedWritesPreparationTests
+    Tests/LatticeCoreTests/AuditedWritesPreparationTests.cpp
+    Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditHygieneTests.cpp)
+target_link_libraries(LatticeAuditedWritesPreparationTests PRIVATE LatticeCore gtest_main)
 
 # Focused no-history transport tests, using synthetic real-Core stores only.
 add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)

@@ -300,3 +300,43 @@ TEST(NoHistoryNull, ChunkRetryRefreshesPhysicalNullabilityAfterSchemaChange) {
     EXPECT_EQ(db.db().query("SELECT id FROM AuditLog WHERE globalId='schema-retry'").size(), 1u);
 }
 } // namespace
+
+TEST(NoHistoryNull, OwnedApplyPreservesLocalReceiptsAndBothEnvelopeGuards) {
+    for (bool disabled : {false, true}) {
+        SCOPED_TRACE(disabled);
+        File file;
+        lattice::swift_lattice target(config(file), schema());
+        seed(target);
+        target.begin_transaction();
+        ASSERT_TRUE(target.insert_local_metadata_if_absent("connector", "request", "accepted"));
+        target.commit();
+        target.db().execute("UPDATE _SyncControl SET disabled=? WHERE id=1", {int64_t(disabled)});
+
+        auto accepted = clear("31f70c28-35b9-4e9b-9508-77b2f3311ecd");
+        auto malformed = clear("combined-invalid-null");
+        malformed.no_history_nulls = {"body", "body"};
+        auto forged = clear("combined-forged-receipt");
+        forged.table_name = "_lattice_local_metadata_v1";
+        EXPECT_EQ(apply_remote_changes(target, {malformed, forged, accepted}),
+                  std::vector<std::string>{accepted.global_id});
+        expect_body(target, nullptr);
+        EXPECT_EQ(target.local_metadata("connector", "request"), "accepted");
+        const auto flag = target.db().query("SELECT disabled FROM _SyncControl WHERE id=1");
+        ASSERT_EQ(flag.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(flag[0].at("disabled")), int64_t(disabled));
+        EXPECT_TRUE(target.db().query("SELECT 1 FROM AuditLog WHERE tableName='_lattice_local_metadata_v1'").empty());
+
+        const auto after = static_cast<lattice::lattice_db&>(target).read_audit_read_fence();
+        ASSERT_GT(after.cursor.head, 0);
+        EXPECT_EQ(after.cursor.head_global_id, accepted.global_id);
+        EXPECT_EQ(apply_remote_changes(target, {accepted}), std::vector<std::string>{accepted.global_id});
+        const auto replay = static_cast<lattice::lattice_db&>(target).read_audit_read_fence();
+        EXPECT_EQ(replay.cursor.head, after.cursor.head);
+        EXPECT_EQ(replay.cursor.head_global_id, after.cursor.head_global_id);
+        EXPECT_EQ(target.local_metadata("connector", "request"), "accepted");
+        EXPECT_EQ(target.prepare_for_audited_writes(), disabled);
+        EXPECT_FALSE(target.prepare_for_audited_writes());
+        target.db().execute("UPDATE NhNull SET title='local after apply' WHERE globalId='row'");
+        EXPECT_GT(static_cast<lattice::lattice_db&>(target).read_audit_read_fence().cursor.head, after.cursor.head);
+    }
+}

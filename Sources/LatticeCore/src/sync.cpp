@@ -14,6 +14,18 @@ std::function<void(size_t chunk_start)> apply_chunk_begin;
 std::function<void()> sync_outbox_after_insert;
 }  // namespace test_hooks
 
+// Keep the complete chunk's SQLite ownership private to Core. Notifications
+// drain only after its mutex/store gate are released by the common helper.
+struct sync_apply_transaction_access {
+    template<typename F>
+    static void run(lattice_db& db, F&& body) {
+        db.with_sync_suppressed_transaction_([&]() -> int64_t {
+            std::forward<F>(body)();
+            return 0;
+        });
+    }
+};
+
 using json = nlohmann::json;
 
 namespace {
@@ -466,6 +478,12 @@ static bool no_history_null_metadata_valid(const audit_log_entry& entry) {
 }
 
 static bool remote_entry_envelope_valid(const audit_log_entry& entry) {
+    // This namespace belongs to the local receipt primitive, never a peer.
+    // Check before link-table creation and schema-skew/dedup ACK shortcuts.
+    // Match case-insensitively even inside a quoted or qualified identifier.
+    std::string table = entry.table_name;
+    for (auto& c : table) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (table.find("_lattice_local_metadata") != std::string::npos) return false;
     return no_history_null_metadata_valid(entry) &&
            !entry.global_id.empty() && !entry.table_name.empty() &&
            !entry.global_row_id.empty() &&
@@ -4087,10 +4105,6 @@ static std::vector<std::string> apply_remote_changes_impl(
     // Process in chunks to avoid holding the write lock for too long.
     const size_t chunk_size = 50;
 
-    // Restore the user's persistent disabled flag after each chunk rather
-    // than hardcoding 0 — deliberately disabled auditing must stay disabled.
-    const int64_t prev_disabled = db.read_sync_disabled_flag();
-
     // Durable idempotency receipts for suppressed no-op applies: suppression
     // (below) mints no AuditLog row, which is what the globalId dedup keys
     // on — without a receipt, a suppressed entry re-delivered AFTER an
@@ -4146,20 +4160,9 @@ static std::vector<std::string> apply_remote_changes_impl(
         const auto cursor_candidate_before_chunk = cursor_candidate;
         const bool cursor_halted_before_chunk = cursor_halted;
 
-        // Per-store write gate (results spec §4.1): a chunked sync apply on
-        // a shared-cache store is THE canonical writer that generation
-        // captures must never interleave (a capture's statement-scope table
-        // read locks fail the writer's in-transaction statements with
-        // SQLITE_LOCKED mid-chunk, and the capture fails immediately in the
-        // reverse direction). Held per chunk, matching the transaction.
-        lattice_db::store_write_gate_hold write_gate(db);
-
         try {
             if (test_hooks::apply_chunk_begin) test_hooks::apply_chunk_begin(chunk_start);
-            db.db().begin_transaction();
-
-            // Disable sync triggers for this chunk
-            db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+            sync_apply_transaction_access::run(db, [&] {
 
             for (size_t i = chunk_start; i < chunk_end; ++i) {
                 const auto& entry = entries[i];
@@ -4558,10 +4561,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                 }
             }
 
-            // Re-enable sync triggers (restore the pre-existing flag value)
-            db.db().execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-
-            db.db().commit();
+            });
         } catch (const std::exception& e) {
             // A CHUNK-level failure (BEGIN lock timeout, COMMIT busy, the
             // trigger-gate UPDATEs) rolls back this chunk only. It must
@@ -4573,7 +4573,8 @@ static std::vector<std::string> apply_remote_changes_impl(
             // their 300s backoff caps while committed work went unacked).
             // Policy: retry the chunk once, then stop the DELIVERY and
             // return what committed; the sender re-sends only the rest.
-            try { db.db().rollback(); } catch (...) {}
+            // The owned helper rolls back only a transaction it admitted.
+            // A failed BEGIN must never roll back another caller's work.
             applied_ids.resize(applied_before_chunk);
             cursor_candidate = cursor_candidate_before_chunk;
             cursor_halted = cursor_halted_before_chunk;
@@ -4596,7 +4597,6 @@ static std::vector<std::string> apply_remote_changes_impl(
             break;
         } catch (...) {
             // Non-std throw: same containment policy, no retry (unknown cause).
-            try { db.db().rollback(); } catch (...) {}
             applied_ids.resize(applied_before_chunk);
             cursor_candidate = cursor_candidate_before_chunk;
             cursor_halted = cursor_halted_before_chunk;

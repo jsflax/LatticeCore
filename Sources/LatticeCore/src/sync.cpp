@@ -2474,11 +2474,27 @@ void synchronizer_base::reconcile_open_with_db() {
     }
 }
 
+namespace {
+constexpr std::string_view audit_log_frame_prefix = R"({"kind":"auditLog","auditLog":[)";
+constexpr std::string_view audit_log_frame_suffix = "]}";
+}
+
+std::string detail::single_encoded_audit_log_json(const encoded_audit_log_prefix& encoded) {
+    constexpr size_t envelope = audit_log_frame_prefix.size() + audit_log_frame_suffix.size();
+    if (encoded.count != 1 || encoded.entry_charges.size() != 1 || encoded.json.size() <= envelope ||
+        encoded.entry_charges[0] != encoded.json.size() ||
+        encoded.json.compare(0, audit_log_frame_prefix.size(), audit_log_frame_prefix) != 0 ||
+        encoded.json.compare(encoded.json.size() - audit_log_frame_suffix.size(),
+                             audit_log_frame_suffix.size(), audit_log_frame_suffix) != 0)
+        throw std::invalid_argument("Expected one bounded audit entry");
+    return encoded.json.substr(audit_log_frame_prefix.size(), encoded.json.size() - envelope);
+}
+
 encoded_audit_log_prefix encode_audit_log_prefix(
         const std::vector<audit_log_entry>& entries, size_t start, size_t max_count,
         size_t max_bytes, size_t available_window_bytes) {
-    constexpr std::string_view prefix = R"({"kind":"auditLog","auditLog":[)";
-    constexpr std::string_view suffix = "]}";
+    constexpr std::string_view prefix = audit_log_frame_prefix;
+    constexpr std::string_view suffix = audit_log_frame_suffix;
     constexpr size_t envelope = prefix.size() + suffix.size();
     if (max_bytes <= envelope) throw std::invalid_argument("Sync message byte limit is too small");
     encoded_audit_log_prefix result;
@@ -2731,7 +2747,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries,
                     wire = receipt->wire_json; charge = receipt->charge;
                 } else {
                     const auto encoded = encode_audit_log_prefix({entry},0,1);
-                    wire = entry.to_json(); charge = encoded.entry_charges.at(0);
+                    wire = detail::single_encoded_audit_log_json(encoded); charge = encoded.entry_charges.at(0);
                 }
                 const auto appended = wire.size() + (frame.count ? 1 : 0) + 2;
                 if (appended > sync_max_encoded_message_bytes - frame.json.size() || charge > available_bytes-charged) break;

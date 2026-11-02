@@ -2824,6 +2824,24 @@ TEST(Sync, EncodedByteBoundaryIncludesEnvelopeAndBinaryExpansion) {
               rows.front().changed_fields.at("payload").to_column_value());
 }
 
+TEST(Sync, SingleEntryFrameRetainsExactEscapedAndBinaryWire) {
+    auto entry = byte_budget_entry(0, 256);
+    entry.changed_fields["text"] = lattice::any_property(std::string("quoted \"value\"\\path\n]}/"));
+    entry.changed_fields_names.push_back("text");
+    const auto encoded = lattice::encode_audit_log_prefix({entry}, 0, 1);
+    EXPECT_EQ(lattice::detail::single_encoded_audit_log_json(encoded), entry.to_json());
+    ASSERT_EQ(encoded.entry_charges.size(), 1u);
+    EXPECT_EQ(encoded.entry_charges[0], encoded.json.size());
+    const auto empty = lattice::encode_audit_log_prefix({entry}, 0, 1, 4096, 0);
+    EXPECT_THROW(lattice::detail::single_encoded_audit_log_json(empty), std::invalid_argument);
+    const auto multiple = lattice::encode_audit_log_prefix({entry, byte_budget_entry(1, 16)}, 0, 2);
+    ASSERT_EQ(multiple.count, 2u);
+    EXPECT_THROW(lattice::detail::single_encoded_audit_log_json(multiple), std::invalid_argument);
+    auto inconsistent = encoded;
+    --inconsistent.entry_charges[0];
+    EXPECT_THROW(lattice::detail::single_encoded_audit_log_json(inconsistent), std::invalid_argument);
+}
+
 TEST(Sync, ByteLimitedPrefixesPreserveEveryOrdinalExactlyOnce) {
     std::vector<lattice::audit_log_entry> rows;
     for (int i = 0; i < 19; ++i) rows.push_back(byte_budget_entry(i, 256 * 1024));

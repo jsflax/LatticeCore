@@ -239,6 +239,10 @@ encoded_audit_log_prefix encode_audit_log_prefix(
     size_t available_window_bytes = 2 * sync_max_encoded_message_bytes);
 
 namespace detail {
+// Recover the exact row bytes from a single-entry bounded encoder result.
+// This does not serialize again or cache across admission/currentness checks.
+std::string single_encoded_audit_log_json(const encoded_audit_log_prefix& encoded);
+
 // Admission is synchronized, but no gate lock is held over SQLite/transport/user work. Holding
 // such a lock in an observer called under SQLite would invert the scheduler's database locks.
 struct sync_callback_gate {

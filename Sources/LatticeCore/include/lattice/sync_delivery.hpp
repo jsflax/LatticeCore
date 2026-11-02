@@ -159,7 +159,7 @@ inline bool admit_sync_delivery_in_transaction(lattice_db& lattice, const std::s
     auto& db = lattice.db();
     if (db.is_closed()) throw db_error("cannot admit delivery on closed database");
     auto frame = encode_audit_log_prefix({delivery.wire}, 0, 1);
-    const auto wire_json = delivery.wire.to_json();
+    const auto wire_json = single_encoded_audit_log_json(frame);
     if (delivery.legacy_receipt || delivery.source_id <= 0 || delivery.source_global_id.empty() || delivery.routing_key.empty() || delivery.routing_key.size()>65536 ||
         delivery.wire.id != delivery.source_id || delivery.membership < -1 || delivery.membership > 1 || frame.count != 1)
         throw db_error("invalid delivery admission");

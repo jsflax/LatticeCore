@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include <lattice/network.hpp>
+#include <lattice/sync_storage.hpp>
 #include <chrono>
 #include <future>
 #include <sys/file.h>
@@ -596,6 +597,8 @@ TEST(ManagedBackgroundSync, SuspensionCancelsActualRetentionTickWithoutTouchingF
     cfg.audit_retention_seconds = 1;
     lattice::lattice_db local(cfg);
     lattice::database foreign(fixture.file.str());
+    // This is a competing current writer, not the pre-cutover rejection fixture.
+    lattice::detail::register_sync_storage_writer(foreign);
     const auto run = local.resume_background_sync({}, false);
     ASSERT_EQ(run.admission, admission::started);
     foreign.begin_transaction();

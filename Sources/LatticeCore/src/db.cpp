@@ -223,6 +223,17 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     if (cancellation) bind_cancellation_token(std::move(cancellation));
     else configure_busy_timeout(busy_timeout_ms_);
 
+    // Register virtual-table modules before any statement can load sqlite_schema.
+    // SQLite classifies their shadow tables while loading the schema; registering
+    // vec0 afterward can leave them classified as ordinary tables on this handle.
+    // Storage writer guards must never be installed on virtual-table shadows.
+    int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
+    if (vec_rc != SQLITE_OK) {
+        db_ = nullptr;
+        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
+        throw db_error("Failed to initialize sqlite-vec extension");
+    }
+
     // Even without an explicit checkpoint, SQLite can checkpoint the last WAL writer on close.
     // Strict existing opens must remain byte-preserving when later admission rejects the handle.
     if (mode == open_mode::read_write_existing) {
@@ -286,13 +297,6 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     sqlite3_db_config(db_, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, nullptr);
 #endif
 
-    // Initialize sqlite-vec extension for vector search
-    int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
-    if (vec_rc != SQLITE_OK) {
-        db_ = nullptr;
-        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
-        throw db_error("Failed to initialize sqlite-vec extension");
-    }
     opening.release();  // Fully initialized: ~database() now owns the connection.
 }
 

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <LatticeCore.hpp>
+#include <lattice/sync_storage.hpp>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -88,8 +89,12 @@ struct Trace {
     int begins = 0, commits = 0, rollbacks = 0;
     std::function<void(const std::string&)> observe;
     std::exception_ptr failure;
-    static int callback(unsigned event, void* context, void* statement, void*) noexcept {
+    static int callback(unsigned event, void* context, void* statement, void* trace_sql) noexcept {
         if (event != SQLITE_TRACE_STMT) return 0;
+        // SQLite reports trigger subprograms with an X argument beginning "--".
+        // sqlite3_sql(P) still names the outer statement for those callbacks.
+        const auto* detail = static_cast<const char*>(trace_sql);
+        if (detail && std::strncmp(detail, "--", 2) == 0) return 0;
         auto& self = *static_cast<Trace*>(context);
         try {
             const char* raw = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
@@ -292,6 +297,7 @@ TEST(StartupSyncRepair, SlotAddedBeforeBeginPreventsStaleCountCollapse) {
     Fixture f;
     f.slot("live-a"); f.audit(1); f.state(1, "live-a");
     database peer(f.file.path.string(), database::open_mode::read_write, 100);
+    detail::register_sync_storage_writer(peer); // Independent current writer.
     Trace trace;
     trace.observe = [&](const std::string& sql) {
         if (sql == "BEGIN IMMEDIATE") {
@@ -315,6 +321,7 @@ TEST(StartupSyncRepair, SlotRemovedBeforeBeginRechecksPreviouslyPartialRow) {
     // Row 1 admits repair; row 2 becomes eligible only after removal.
     f.state(1, "live-a"); f.state(1, "live-b"); f.state(2, "live-a");
     database peer(f.file.path.string(), database::open_mode::read_write, 100);
+    detail::register_sync_storage_writer(peer); // Independent current writer.
     Trace trace;
     trace.observe = [&](const std::string& sql) {
         if (sql == "BEGIN IMMEDIATE") peer.execute("DELETE FROM _lattice_replication_slots WHERE sync_id='live-b'");
@@ -331,6 +338,7 @@ TEST(StartupSyncRepair, RemovingLastSlotBeforeBeginDoesNotCollapse) {
     Fixture f;
     f.slot("live-a"); f.audit(1); f.state(1, "live-a");
     database peer(f.file.path.string(), database::open_mode::read_write, 100);
+    detail::register_sync_storage_writer(peer); // Independent current writer.
     Trace trace;
     trace.observe = [&](const std::string& sql) {
         if (sql == "BEGIN IMMEDIATE") peer.execute("DELETE FROM _lattice_replication_slots");

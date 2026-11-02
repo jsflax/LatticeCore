@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <LatticeCore.hpp>
 #include <lattice/sync.hpp>
+#include <lattice/sync_storage.hpp>
 #include <atomic>
 #include <filesystem>
 #include <future>
@@ -58,21 +59,30 @@ bool commit_once(lattice_db& db, const std::string& operation, const std::string
 }
 
 TEST(LocalMetadata, ReadDoesNotCreateAndInsertNeedsOwnedTransaction) {
-    MetadataFile file;
-    lattice_db db(file.config());
-    EXPECT_FALSE(db.local_metadata(ns, "op"));
-    EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), 0);
-    EXPECT_THROW(db.insert_local_metadata_if_absent(ns, "op", "result"), db_error);
-    EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), 0);
-    db.begin_transaction();
-    std::atomic<bool> rejected{false};
-    std::thread other([&] {
-        try { db.insert_local_metadata_if_absent(ns, "op", "foreign-thread"); }
-        catch (const db_error&) { rejected = true; }
-    });
-    other.join();
-    EXPECT_TRUE(rejected);
-    db.rollback();
+    for (const bool cold : {false, true}) {
+        SCOPED_TRACE(cold ? "explicit missing-table fixture" : "canonical precreated table");
+        MetadataFile file;
+        lattice_db db(file.config());
+        ASSERT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), 1);
+        if (cold) db.db().execute("DROP TABLE _lattice_local_metadata_v1");
+        const auto schema_before = db.query_read("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name");
+        const auto changes_before = sqlite3_total_changes(db.db().handle());
+        EXPECT_FALSE(db.local_metadata(ns, "op"));
+        EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), cold ? 0 : 1);
+        EXPECT_THROW(db.insert_local_metadata_if_absent(ns, "op", "result"), db_error);
+        EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), cold ? 0 : 1);
+        db.begin_transaction();
+        std::atomic<bool> rejected{false};
+        std::thread other([&] {
+            try { db.insert_local_metadata_if_absent(ns, "op", "foreign-thread"); }
+            catch (const db_error&) { rejected = true; }
+        });
+        other.join();
+        EXPECT_TRUE(rejected);
+        db.rollback();
+        EXPECT_EQ(db.query_read("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"), schema_before);
+        EXPECT_EQ(sqlite3_total_changes(db.db().handle()), changes_before);
+    }
 }
 
 TEST(LocalMetadata, MutationAndReceiptRollbackTogetherThenSurviveReopen) {
@@ -149,30 +159,46 @@ TEST(LocalMetadata, MetadataNeverAppearsInAuditOrRegeneratedHistory) {
     db.force_compact_audit_log();
     EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM AuditLog WHERE tableName <> 'LocalMetadataMutation'"), 0);
     EXPECT_EQ(db.local_metadata(ns, "local"), "receipt-only");
-    EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger' AND tbl_name='_lattice_local_metadata_v1'"), 0);
+    // Storage-capability guards are not audit triggers. Admit exactly those
+    // three definitions, retaining the no-audit/history assertions above.
+    EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger' AND tbl_name='_lattice_local_metadata_v1'"), 3);
+    EXPECT_TRUE(detail::only_sync_storage_guards(db.db(), "_lattice_local_metadata_v1"));
 }
 
 TEST(LocalMetadata, SyncCannotCreateOrMutateReservedMetadata) {
-    MetadataFile file;
-    lattice_db db(file.config());
-    int index = 0;
-    for (int phase = 0; phase < 2; ++phase) {
-        for (const auto& table : {"_lattice_local_metadata_v1", "_LATTICE_LOCAL_METADATA_V1", "main.\"_lattice_local_metadata_v1\""}) {
-            audit_log_entry forged;
-            forged.global_id = "forged-entry-" + std::to_string(index++);
-            forged.global_row_id = "forged-row";
-            forged.table_name = table;
-            forged.operation = "INSERT";
-            EXPECT_FALSE(audit_log_entry::from_json(forged.to_json()).has_value());
-            EXPECT_TRUE(apply_remote_changes(db, {forged}).empty());
+    for (const bool cold : {false, true}) {
+        SCOPED_TRACE(cold ? "explicit missing-table fixture" : "canonical precreated table");
+        MetadataFile file;
+        lattice_db db(file.config());
+        ASSERT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), 1);
+        if (cold) db.db().execute("DROP TABLE _lattice_local_metadata_v1");
+        int index = 0;
+        for (int phase = 0; phase < 2; ++phase) {
+            const auto schema_before = db.query_read("SELECT type,name,tbl_name,sql FROM sqlite_master "
+                "WHERE name='_lattice_local_metadata_v1' OR tbl_name='_lattice_local_metadata_v1' ORDER BY type,name");
+            const auto rows_before = cold && phase == 0 ? std::vector<database::row_t>{}
+                : db.query_read("SELECT * FROM _lattice_local_metadata_v1 ORDER BY namespace,key");
+            for (const auto& table : {"_lattice_local_metadata_v1", "_LATTICE_LOCAL_METADATA_V1", "main.\"_lattice_local_metadata_v1\""}) {
+                audit_log_entry forged;
+                forged.global_id = "forged-entry-" + std::to_string(index++);
+                forged.global_row_id = "forged-row";
+                forged.table_name = table;
+                forged.operation = "INSERT";
+                EXPECT_FALSE(audit_log_entry::from_json(forged.to_json()).has_value());
+                EXPECT_TRUE(apply_remote_changes(db, {forged}).empty());
+            }
+            EXPECT_EQ(db.query_read("SELECT type,name,tbl_name,sql FROM sqlite_master "
+                "WHERE name='_lattice_local_metadata_v1' OR tbl_name='_lattice_local_metadata_v1' ORDER BY type,name"), schema_before);
+            if (!(cold && phase == 0))
+                EXPECT_EQ(db.query_read("SELECT * FROM _lattice_local_metadata_v1 ORDER BY namespace,key"), rows_before);
+            if (phase == 0) {
+                EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), cold ? 0 : 1);
+                db.write([&] { ASSERT_TRUE(db.insert_local_metadata_if_absent(ns, "local", "original")); });
+            }
         }
-        if (phase == 0) {
-            EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name='_lattice_local_metadata_v1'"), 0);
-            db.write([&] { ASSERT_TRUE(db.insert_local_metadata_if_absent(ns, "local", "original")); });
-        }
+        EXPECT_EQ(db.local_metadata(ns, "local"), "original");
+        EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM AuditLog"), 0);
     }
-    EXPECT_EQ(db.local_metadata(ns, "local"), "original");
-    EXPECT_EQ(scalar(db, "SELECT COUNT(*) AS n FROM AuditLog"), 0);
 }
 
 TEST(LocalMetadata, CorruptValueIsAnErrorRatherThanAbsence) {

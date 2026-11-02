@@ -6640,6 +6640,9 @@ private:
         std::mutex mutex;
         std::condition_variable cv;
         bool transitioning = false;
+        bool setup_retry_requested = false;
+        bool policy_ready = false;
+        uint64_t filter_revision = 0;
         std::thread::id transition_thread;
         size_t borrowers = 0;
         std::map<std::thread::id, size_t> borrower_threads;
@@ -6663,6 +6666,7 @@ private:
     class sync_borrow {
     public:
         explicit sync_borrow(const lattice_db& owner, bool mutation = false);
+        sync_borrow(lattice_db& owner, const std::optional<std::vector<sync_filter_entry>>& filter);
         ~sync_borrow();
         sync_borrow(const sync_borrow&) = delete;
         sync_borrow& operator=(const sync_borrow&) = delete;
@@ -6676,12 +6680,12 @@ private:
         bool admitted_ = false;
     };
     // Transition admission never holds its mutex over SQL, callbacks or joins.
-    bool begin_sync_transition(bool wait);
+    bool begin_sync_transition(bool wait, bool retry_setup = false, bool require_empty_owner = false);
     void end_sync_transition();
     void setup_sync_owned(bool finite_cycle = false,
                           std::shared_ptr<std::atomic<bool>> cancellation = {},
                           bool allow_sibling_kick = true);
-    bool retire_wss_owned(bool drain, bool handoff);
+    bool retire_wss_owned(bool drain, bool handoff, std::optional<std::string> successor_url = std::nullopt);
     void restore_parent_after_sync_owned(uint64_t generation);
     static void replay_sync_state_subscription(const std::shared_ptr<sync_lifecycle_state>& state);
     std::atomic<bool> sync_start_requested_{true};
@@ -6799,7 +6803,7 @@ private:
 
 protected:
     // Initialize synchronizer if configured
-    void setup_sync_if_configured();
+    void setup_sync_if_configured(bool retry_setup = false);
 
     // Initialize IPC synchronizers if configured
     void setup_ipc_if_configured();
@@ -6810,13 +6814,10 @@ private:
     // a dormant sibling so cross-instance sync continuity survives the
     // closing of the current owner.
     //
-    // `fire_handoff = false` skips the hand-off block. Used by the URL-
-    // change kick path in `setup_sync_if_configured`: when a new instance
-    // with a different URL kicks an old instance to take over the flock,
-    // we MUST NOT let the kicked instance resurrect another same-URL
-    // sibling — that would re-hold the flock against our new URL and
-    // re-trigger the same bug.
-    void teardown_sync(bool fire_handoff = true);
+    // `fire_handoff = false` skips handoff. A URL-change kick instead supplies
+    // the requested successor URL, so final callback retirement cannot wake
+    // an old-URL sibling and re-hold the flock against that successor.
+    void teardown_sync(bool fire_handoff = true, std::optional<std::string> successor_url = std::nullopt);
 
     // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
     static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
@@ -9411,7 +9412,7 @@ namespace lattice {
 // (synchronizer is fully defined via sync.hpp included above)
 // ============================================================================
 
-inline void lattice_db::teardown_sync(bool fire_handoff) {
+inline void lattice_db::teardown_sync(bool fire_handoff, std::optional<std::string> successor_url) {
     {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
         if (sync_lifecycle_->generation && sync_lifecycle_->cancellation)
@@ -9446,7 +9447,7 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
         managed = sync_lifecycle_->generation != 0;
     }
-    retire_wss_owned(!managed, fire_handoff && !managed);
+    retire_wss_owned(!managed, fire_handoff && !managed, std::move(successor_url));
 }
 
 inline void lattice_db::close() {
@@ -9575,9 +9576,8 @@ inline void lattice_db::sync_now() {
 }
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
-    config_.sync_filter = filter;
+    if (is_closed()) return;
+    sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>(filter));
     if (current) current->update_sync_filter(filter);
     {
         std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
@@ -9588,10 +9588,9 @@ inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter
 
 inline void lattice_db::update_sync_filter(const std::string& channel,
                                           std::vector<sync_filter_entry> filter) {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
+    if (is_closed()) return;
     if (channel.empty()) {
-        config_.sync_filter = filter;
+        sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>(filter));
         if (current) current->update_sync_filter(std::move(filter));
         return;
     }
@@ -9601,9 +9600,8 @@ inline void lattice_db::update_sync_filter(const std::string& channel,
 }
 
 inline void lattice_db::clear_sync_filter() {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
-    config_.sync_filter = std::nullopt;
+    if (is_closed()) return;
+    sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>{});
     if (current) current->clear_sync_filter();
     std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
     for (auto& target : config_.ipc_targets) target.sync_filter = std::nullopt;
@@ -9611,10 +9609,9 @@ inline void lattice_db::clear_sync_filter() {
 }
 
 inline void lattice_db::clear_sync_filter(const std::string& channel) {
-    sync_borrow current(*this, true);
-    if (!current.admitted()) return;
+    if (is_closed()) return;
     if (channel.empty()) {
-        config_.sync_filter = std::nullopt;
+        sync_borrow current(*this, std::optional<std::vector<sync_filter_entry>>{});
         if (current) current->clear_sync_filter();
         return;
     }

@@ -271,6 +271,12 @@ struct sync_callback_gate {
         drained.wait(lock,[&] {return active==0;});return true;
     }
 };
+// Keep this non-template cleanup owner outside the generic callback lambda so
+// its destructor has an ordinary inline definition on every supported toolchain.
+struct sync_callback_ticket {
+    std::shared_ptr<sync_callback_gate> gate;
+    ~sync_callback_ticket() {gate->leave();}
+};
 template<class Function>
 auto guard_sync_callback(std::shared_ptr<sync_callback_gate> gate,Function function) {
     return [gate=std::move(gate),function=std::move(function)](auto&&... args) mutable {
@@ -278,10 +284,7 @@ auto guard_sync_callback(std::shared_ptr<sync_callback_gate> gate,Function funct
         auto owner=gate->owner.lock();
         if(gate->owner_required && !owner) return;
         if(!gate->enter()) return;
-        struct ticket {
-            std::shared_ptr<sync_callback_gate> gate;
-            ~ticket() {gate->leave();}
-        } admitted{gate};
+        sync_callback_ticket admitted{gate};
         function(std::forward<decltype(args)>(args)...);
     };
 }

@@ -74,6 +74,7 @@ struct replay_owner {
         config.chunk_size = 1; config.upload_coalesce_ms = 0; config.ack_timeout_base_ms = 60'000;
         config.checkpoint_passive_interval_ms = 0; config.checkpoint_truncate_interval_ms = 0;
         config.finite_cycle = finite;
+        if (finite) config.websocket_url = "wss://migration-fixture.invalid"; // injected transport; never dialed
         auto transport = std::make_unique<lattice::mock_sync_transport>(); wire = transport.get();
         sync = std::make_unique<lattice::synchronizer>(std::move(owned), config, std::move(transport));
         sync->connect();
@@ -208,6 +209,21 @@ TEST(SyncOutboxMigration, NullMetadataAndOversizeAreRefusedBeforePayloadHydratio
 
 TEST(SyncOutboxMigration, PreCutoverHandleCannotWriteOrdinaryNoHistoryOrLazyMetadata) {
     predecessor_store fixture;
+    // An old Lattice handle has the audit helper but not the new writer
+    // capability. Reach the capability guard rather than failing SQL prepare
+    // merely because this fixture uses a bare SQLite connection.
+    ASSERT_EQ(sqlite3_create_function_v2(fixture.raw->handle(), "sync_disabled", 0,
+        SQLITE_UTF8, fixture.raw->handle(), [](sqlite3_context* context, int, sqlite3_value**) {
+            auto* db = static_cast<sqlite3*>(sqlite3_user_data(context));
+            sqlite3_stmt* statement = nullptr;
+            int disabled = 0;
+            if (sqlite3_prepare_v2(db, "SELECT disabled FROM _SyncControl WHERE id=1", -1,
+                                   &statement, nullptr) == SQLITE_OK) {
+                if (sqlite3_step(statement) == SQLITE_ROW) disabled = sqlite3_column_int(statement, 0);
+                sqlite3_finalize(statement);
+            }
+            sqlite3_result_int(context, disabled);
+        }, nullptr, nullptr, nullptr), SQLITE_OK);
     // These tables did not exist on a store that never used either API.
     fixture.raw->execute("DROP TABLE _lattice_local_metadata_v1");
     fixture.raw->execute("DROP TABLE _lattice_applied_receipts");

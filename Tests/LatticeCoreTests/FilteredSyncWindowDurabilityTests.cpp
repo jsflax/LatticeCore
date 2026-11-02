@@ -230,7 +230,7 @@ struct filtered_window_fixture {
             "FROM _lattice_sync_outbox WHERE sync_id=?", {config.sync_id});
     }
 
-    void restart() {
+    void restart(std::function<void(const std::string&)> on_error = {}) {
         sync->disconnect();
         sync.reset(); // Destroy the owning connection and all in-memory retry state.
         auto owned = std::make_unique<lattice::lattice_db>(
@@ -241,6 +241,7 @@ struct filtered_window_fixture {
         delivered_messages = 0;
         sync = std::make_unique<lattice::synchronizer>(
             std::move(owned), config, std::move(transport));
+        sync->set_on_error(std::move(on_error));
         sync->connect();
     }
 
@@ -486,7 +487,9 @@ TEST(FilteredSyncWindowDurability, PrivateRemovalIsNotPublishedIntoGlobalAuditHi
 }
 
 TEST(FilteredSyncWindowDurability, StagingRollbackKeepsSourcePendingAndMembership) {
+    std::vector<std::string> errors;
     filtered_window_fixture fixture;
+    fixture.sync->set_on_error([&](const std::string& error) { errors.push_back(error); });
     int attempts = 0;
     struct ResetHook {
         ~ResetHook() { lattice::test_hooks::sync_outbox_after_insert = nullptr; }
@@ -498,7 +501,10 @@ TEST(FilteredSyncWindowDurability, StagingRollbackKeepsSourcePendingAndMembershi
     // Commit notification may run inline; an exception must not be mistaken
     // for a rollback of the already committed application edit.
     try { fixture.set_target_age(0); } catch (const std::runtime_error&) {}
-    EXPECT_THROW(fixture.sync->sync_now(), std::runtime_error);
+    errors.clear();
+    EXPECT_NO_THROW(fixture.sync->sync_now());
+    ASSERT_FALSE(errors.empty());
+    EXPECT_EQ(errors.back(), "injected outbox staging failure");
     EXPECT_GT(attempts, 0);
     EXPECT_EQ(fixture.outbox_count(), 0);
     EXPECT_TRUE(fixture.target_is_member());
@@ -576,12 +582,15 @@ TEST(FilteredSyncWindowDurability, PendingPayloadSurvivesSourceHistoryCompaction
 }
 
 TEST(FilteredSyncWindowDurability, InvalidStoredPayloadDoesNotDiscardDelivery) {
+    std::vector<std::string> errors;
     filtered_window_fixture fixture;
     fixture.set_target_age(0);
     ASSERT_EQ(fixture.outbox_count(), 1);
     fixture.source->db().execute(
         "UPDATE _lattice_sync_outbox SET wire_json='{' WHERE sync_id=?", {fixture.config.sync_id});
-    EXPECT_THROW(fixture.restart(), std::runtime_error);
+    EXPECT_NO_THROW(fixture.restart([&](const std::string& error) { errors.push_back(error); }));
+    ASSERT_FALSE(errors.empty());
+    EXPECT_EQ(errors.back(), "invalid durable delivery wire row");
     EXPECT_EQ(fixture.outbox_count(), 1);
     EXPECT_TRUE(fixture.peer_has_target());
     EXPECT_TRUE(fixture.wire->get_sent_messages().empty());

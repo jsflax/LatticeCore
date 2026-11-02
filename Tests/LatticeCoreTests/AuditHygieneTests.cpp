@@ -692,18 +692,28 @@ void expect_apply_preamble_denial(ApplyPreambleDenial::Point point) {
         "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized) "
         "SELECT id, 'chan-a', 0 FROM AuditLog ORDER BY id LIMIT 1", {});
 
+    if (point == ApplyPreambleDenial::Point::receipts_create) {
+        // Current startup precreates this guarded table. Remove only its empty
+        // fixture instance to exercise the retained cold CREATE failure path.
+        ASSERT_TRUE(db.db().query("SELECT * FROM _lattice_applied_receipts", {}).empty());
+        db.db().execute("DROP TABLE _lattice_applied_receipts", {});
+    }
     auto receipts_schema = db.db().query(
         "SELECT name FROM sqlite_master WHERE type = 'table' "
         "AND name = '_lattice_applied_receipts'", {});
-    ASSERT_TRUE(receipts_schema.empty()) << "cold fixture must reach actual CREATE";
-    if (point == ApplyPreambleDenial::Point::cursor_probe) {
+    if (point == ApplyPreambleDenial::Point::receipts_create) {
+        ASSERT_TRUE(receipts_schema.empty()) << "cold fixture must reach actual CREATE";
+    } else {
         // Isolate the later PRAGMA denial: its preceding CREATE is already a
         // no-op, so this failure must leave all existing rows and DDL intact.
-        db.db().execute(
-            "CREATE TABLE _lattice_applied_receipts (globalId TEXT PRIMARY KEY)", {});
+        ASSERT_EQ(receipts_schema.size(), 1u);
         db.db().execute(
             "INSERT INTO _lattice_applied_receipts VALUES ('existing-receipt')", {});
     }
+    const auto receipt_schema_before = db.db().query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name='_lattice_applied_receipts' OR tbl_name='_lattice_applied_receipts' "
+        "ORDER BY type,name", {});
     const auto receipt_rows_before = point == ApplyPreambleDenial::Point::cursor_probe
         ? db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId", {})
         : std::vector<lattice::database::row_t>{};
@@ -737,6 +747,10 @@ void expect_apply_preamble_denial(ApplyPreambleDenial::Point point) {
     EXPECT_EQ(after.sync_state, before.sync_state);
     EXPECT_EQ(after.slots, before.slots) << "including the exact sentinel download cursor";
     EXPECT_EQ(after.sync_control, before.sync_control);
+    EXPECT_EQ(db.db().query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name='_lattice_applied_receipts' OR tbl_name='_lattice_applied_receipts' "
+        "ORDER BY type,name", {}), receipt_schema_before);
     if (point == ApplyPreambleDenial::Point::receipts_create) {
         EXPECT_TRUE(db.db().query(
             "SELECT name FROM sqlite_master WHERE type = 'table' "

@@ -3326,13 +3326,22 @@ TEST(SyncDelivery, FilteredByteDeferralPreservesEverySourceUntilItsOwnAck) {
         size_t observed_messages=0;
         std::vector<lattice::audit_log_entry> observed_entries;
         const auto observe=[&]() -> const std::vector<lattice::audit_log_entry>& {
+            trace("observe-snapshot-start");
             const auto messages=transport->get_sent_messages();
+            trace("observe-snapshot-complete");
+            std::fprintf(stderr,"filtered_bytes observed=%zu snapshot_messages=%zu\n",observed_messages,messages.size());
             if(messages.size()<observed_messages) throw std::runtime_error("mock message history shrank");
             for(;observed_messages<messages.size();++observed_messages) {
+                if(observed_messages<32) {
+                    std::fprintf(stderr,"filtered_bytes message=%zu bytes=%zu\n",observed_messages,messages[observed_messages].data.size());
+                    trace("observe-parse-start",static_cast<int>(observed_messages));
+                }
                 const auto event=lattice::server_sent_event::from_json(messages[observed_messages].as_string());
+                if(observed_messages<32) trace("observe-parse-complete",static_cast<int>(observed_messages));
                 if(!event) throw std::runtime_error("invalid mock message");
                 if(event->event_type==lattice::server_sent_event::type::audit_log)
                     observed_entries.insert(observed_entries.end(),event->audit_logs.begin(),event->audit_logs.end());
+                if(observed_messages<32) trace("observe-retain-complete",static_cast<int>(observed_messages));
             }
             return observed_entries;
         };
@@ -3843,7 +3852,7 @@ namespace {
 struct publication_signal {
     std::mutex mutex;std::condition_variable changed;bool signalled=false;
     void set() {{std::lock_guard<std::mutex> lock(mutex);signalled=true;}changed.notify_all();}
-    bool wait() {std::unique_lock<std::mutex> lock(mutex);return changed.wait_for(lock,std::chrono::seconds(3),[&] {return signalled;});}
+    bool wait(std::chrono::milliseconds timeout=std::chrono::seconds(3)) {std::unique_lock<std::mutex> lock(mutex);return changed.wait_for(lock,timeout,[&] {return signalled;});}
 };
 struct publication_transport_state {
     std::atomic<int> connects{0},disconnects{0},audit_attempts{0};
@@ -4141,6 +4150,56 @@ TEST(SyncPublication, ErrorHandlerReplacementAndCallbackOwnerReleaseKeepAdmitted
         EXPECT_TRUE(new_called.wait());EXPECT_TRUE(reached);EXPECT_FALSE(timed_out);EXPECT_TRUE(retained);
         EXPECT_EQ(old_calls,1);EXPECT_EQ(new_calls,1);
         ASSERT_TRUE(outbox_wait_quiescent(observer,cfg.sync_id));EXPECT_TRUE(weak.expired());
+    });
+}
+
+TEST(SyncPublication, LiveOwnerNoopSetupKeepsFilterAdmissionOpen) {
+    bounded_mock_case([] {
+        struct retryable_owner : lattice::lattice_db {
+            using lattice::lattice_db::lattice_db;
+            using lattice::lattice_db::setup_sync_if_configured;
+        };
+        auto factory=std::make_shared<publication_network_factory>();lattice::set_network_factory(factory);
+        TempDB tmp{"pubwssnoop"};publication_paths paths(tmp,false);
+        lattice::lattice_db observer{lattice::configuration(tmp.str())};
+        observer.add(TestPerson{"excluded",1,std::nullopt});observer.add(TestPerson{"included",2,std::nullopt});
+        lattice::configuration config(tmp.str(),"ws://fixture-noop","token");config.sync_autostart=false;
+        config.sync_filter=std::vector<lattice::sync_filter_entry>{};
+        retryable_owner owner(config);owner.connect_sync();
+        const auto connected_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        while(!owner.is_sync_connected() && std::chrono::steady_clock::now()<connected_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        ASSERT_TRUE(owner.is_sync_connected());ASSERT_TRUE(factory->probe->messages().empty());
+        publication_signal disconnect_entered,release,setup_returned,uploaded;
+        std::atomic<bool> timed_out{false},failed{false};
+        factory->probe->before_disconnect=[&] {
+            disconnect_entered.set();if(!release.wait(std::chrono::seconds(5))) timed_out=true;
+        };
+        factory->probe->before_audit=[&] {uploaded.set();};
+        // Keep an actual live-owner borrow outstanding. No-op setup must not
+        // start a transition and wait for that borrow before accepting policy.
+        std::thread disconnecting([&] {try {owner.disconnect_sync();} catch(...) {failed=true;}});
+        const bool reached=disconnect_entered.wait();
+        std::thread retrying([&] {
+            try {owner.setup_sync_if_configured(true);} catch(...) {failed=true;}
+            setup_returned.set();
+        });
+        const bool returned_before_release=setup_returned.wait(std::chrono::seconds(1));
+        try {owner.update_sync_filter({{"TestPerson",std::string("age=2")}});} catch(...) {failed=true;}
+        release.set();disconnecting.join();retrying.join();factory->probe->before_disconnect={};
+        EXPECT_TRUE(reached);EXPECT_TRUE(returned_before_release);EXPECT_FALSE(timed_out);EXPECT_FALSE(failed);
+        owner.connect_sync();EXPECT_TRUE(uploaded.wait());
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        auto messages=factory->probe->messages();
+        while(messages.empty() && std::chrono::steady_clock::now()<deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));messages=factory->probe->messages();
+        }
+        ASSERT_FALSE(messages.empty());size_t rows=0;
+        for(const auto& json:messages) {
+            const auto event=lattice::server_sent_event::from_json(json);ASSERT_TRUE(event);
+            for(const auto& row:event->audit_logs) {++rows;EXPECT_EQ(std::get<int64_t>(row.changed_fields.at("age").value),2);}
+        }
+        EXPECT_EQ(rows,1u);owner.close();ASSERT_TRUE(outbox_wait_quiescent(observer,"wss:ws://fixture-noop"));
     });
 }
 

@@ -60,7 +60,11 @@ TEST(DetachedRead, EverySelectedRowIsPreflightedBeforeVariableHydration) {
     sqlite3_trace_v2(connection->handle(),0,nullptr,nullptr);
     db->db().execute("UPDATE ScopedAsset SET payload=? WHERE globalId=?",{std::vector<uint8_t>{2},identity(2)});
     EXPECT_EQ(lattice::detached_read::by_ids(db,request({identity(1),identity(2)})).rows.size(),2u);
+    // Inject a malformed stored scalar without asking the audit JSON encoder to serialize it.
+    // Restore auditing before exercising the reader's independent scalar preflight.
+    db->db().execute("UPDATE _SyncControl SET disabled=1 WHERE id=1");
     db->db().execute("UPDATE ScopedAsset SET ordinal=zeroblob(1048576) WHERE globalId=?",{identity(1)});
+    db->db().execute("UPDATE _SyncControl SET disabled=0 WHERE id=1");
     EXPECT_THROW(lattice::detached_read::by_ids(db,request({identity(1)})),lattice::db_error);db->close();
 }
 TEST(DetachedRead, MetadataPagesUseRealIndexAndAdvanceOnlyThroughIncludedRows) {

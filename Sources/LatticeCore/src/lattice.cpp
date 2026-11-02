@@ -701,17 +701,38 @@ lattice_db::sync_borrow::~sync_borrow() {
     state_->cv.notify_all();
 }
 
-bool lattice_db::begin_sync_transition(bool wait) {
+lattice_db::sync_borrow::sync_borrow(lattice_db& owner,
+        const std::optional<std::vector<sync_filter_entry>>& filter)
+    : state_(owner.sync_lifecycle_) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (owner.is_closed()) return;
+    owner.config_.sync_filter = filter;
+    ++state_->filter_revision;
+    // A factory-time request is retained without borrowing a half-built owner.
+    // Once setup publishes its policy target, normal borrow retirement applies.
+    if (state_->transitioning && !state_->policy_ready) return;
+    admitted_ = true;
+    pointer_ = owner.synchronizer_.get();
+    ++state_->borrowers;
+    ++state_->borrower_threads[std::this_thread::get_id()];
+}
+
+bool lattice_db::begin_sync_transition(bool wait, bool retry_setup, bool require_empty_owner) {
     const auto state = sync_lifecycle_;
     std::unique_lock<std::mutex> lock(state->mutex);
     if (state->transitioning) {
+        if (retry_setup) state->setup_retry_requested = true;
         if (!wait || state->transition_thread == std::this_thread::get_id() ||
             state->borrower_threads.count(std::this_thread::get_id()) ||
             (state->worker && state->worker->is_on_thread())) return false;
         state->cv.wait(lock, [&] { return !state->transitioning; });
     }
+    // An ordinary handoff scan may visit an already-live sibling. Its no-op
+    // setup must not close policy admission or strand a concurrent filter.
+    if (require_empty_owner && synchronizer_) return false;
     if (!wait && state->borrower_threads.count(std::this_thread::get_id())) return false;
     state->transitioning = true;
+    state->policy_ready = false;
     state->transition_thread = std::this_thread::get_id();
     // Teardown can retire its owner off-thread if reached inside a borrow.
     // Setup never runs reentrantly and must settle existing borrowers first.
@@ -722,10 +743,16 @@ bool lattice_db::begin_sync_transition(bool wait) {
 
 void lattice_db::end_sync_transition() {
     const auto state = sync_lifecycle_;
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->transitioning = false;
-    state->transition_thread = {};
-    state->cv.notify_all();
+    bool retry;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->transitioning = false;
+        state->transition_thread = {};
+        retry = std::exchange(state->setup_retry_requested, false);
+        state->cv.notify_all();
+    }
+    if (retry && !is_closed() && !config_.background_sync_managed &&
+        current_background_sync_generation() == 0) setup_sync_if_configured(true);
 }
 
 void lattice_db::replay_sync_state_subscription(const std::shared_ptr<sync_lifecycle_state>& state) {
@@ -752,8 +779,8 @@ void lattice_db::replay_sync_state_subscription(const std::shared_ptr<sync_lifec
     });
 }
 
-void lattice_db::setup_sync_if_configured() {
-    if (!begin_sync_transition(false)) return;
+void lattice_db::setup_sync_if_configured(bool retry_setup) {
+    if (!begin_sync_transition(false, retry_setup, true)) return;
     try {
         setup_sync_owned();
         if (is_closed()) {
@@ -802,9 +829,9 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
             //
             // The kick must happen INSIDE the registry callback so the
             // registry's notify_refcount keeps the victim alive while
-            // teardown_sync runs. fire_handoff=false prevents the victim's
-            // own teardown from waking another same-URL sibling, which
-            // would re-hold the flock against our new URL.
+            // teardown_sync runs. Its value-only successor request targets
+            // this URL after the old callback releases the flock/key; an
+            // immediate retry alone can miss that deferred release.
             bool kicked = false;
             if (allow_sibling_kick) instance_registry::instance().for_each_alive(config_.path,
                 [&](lattice_db* sibling) {
@@ -821,7 +848,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
                              "kicking sibling=%p (URL=%s) for URL change to %s",
                              (void*)sibling, sibling->config_.websocket_url.c_str(),
                              config_.websocket_url.c_str());
-                    sibling->teardown_sync(/*fire_handoff=*/false);
+                    sibling->teardown_sync(/*fire_handoff=*/true, config_.websocket_url);
                     kicked = true;
                 });
             if (!kicked || !try_acquire_lock()) {
@@ -852,9 +879,14 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     }
     // Create sync config from our configuration
     sync_config sync_cfg;
+    uint64_t filter_revision;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
-    sync_cfg.sync_filter = config_.sync_filter;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        sync_cfg.sync_filter = config_.sync_filter;
+        filter_revision = sync_lifecycle_->filter_revision;
+    }
     sync_cfg.finite_cycle = finite_cycle;
 
     // Always use per-synchronizer sync state
@@ -964,12 +996,46 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     if (cancellation && cancellation->load(std::memory_order_acquire))
         throw db_error("background sync was cancelled during setup");
 
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(callback_state->mutex);
+        // Native setup owns a distinct serial worker. Queue the latest policy
+        // before its first connect; no SQL or user callback runs on this thread.
+        // Publishing the target in the same critical section closes the gap
+        // between retaining a factory-time request and admitting a live borrow.
+        if (filter_revision != callback_state->filter_revision) {
+            if (config_.sync_filter) synchronizer_->update_sync_filter(*config_.sync_filter);
+            else synchronizer_->clear_sync_filter();
+        }
+        callback_state->policy_ready = true;
+    }
+#else
+    // Browser setup is single-threaded and borrows the parent scheduler. Apply
+    // outside the metadata lock because that scheduler may run inline.
+    std::optional<std::vector<sync_filter_entry>> latest_filter;
+    bool filter_changed;
+    {
+        std::lock_guard<std::mutex> lock(callback_state->mutex);
+        latest_filter = config_.sync_filter;
+        filter_changed = filter_revision != callback_state->filter_revision;
+        callback_state->policy_ready = true;
+    }
+    if (filter_changed) {
+        if (latest_filter) synchronizer_->update_sync_filter(*latest_filter);
+        else synchronizer_->clear_sync_filter();
+    }
+#endif
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
     replay_sync_state_subscription(callback_state);
     } catch (...) {
         // Manual start is retryable on the same local handle after setup fails.
         // Do not strand an ownership key/flock or tear down unrelated IPC.
+        {
+            std::unique_lock<std::mutex> lock(sync_lifecycle_->mutex);
+            sync_lifecycle_->policy_ready = false;
+            sync_lifecycle_->cv.wait(lock, [&] { return sync_lifecycle_->borrowers == 0; });
+        }
         synchronizer_.reset();
         unregister_sync_key(config_.path, config_.websocket_url);
 #ifndef __EMSCRIPTEN__
@@ -1139,7 +1205,7 @@ void lattice_db::restore_parent_after_sync_owned(uint64_t generation) {
     if (prior_retention) start_audit_maintenance();
 }
 
-bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
+bool lattice_db::retire_wss_owned(bool drain, bool handoff, std::optional<std::string> successor_url) {
     const auto state = sync_lifecycle_;
     bool defer;
     uint64_t generation;
@@ -1150,7 +1216,8 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
         if (generation && state->cancellation)
             state->cancellation->store(true, std::memory_order_release);
         defer = state->borrower_threads.count(std::this_thread::get_id()) ||
-                (state->worker && state->worker->is_on_thread());
+                (state->worker && state->worker->is_on_thread()) ||
+                (!generation && successor_url.has_value());
     }
     // Admission is already closed. Moving the owner does not invalidate an
     // existing lease; cleanup waits for every such borrow before destruction.
@@ -1158,7 +1225,24 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
     const int lock_fd = std::exchange(sync_lock_fd_, -1);
     const auto path = config_.path;
     const auto url = config_.websocket_url;
-    auto cleanup = [state, owner = std::move(retired), lock_fd, path, url, generation, drain](bool finish_transition) mutable {
+    const auto next_url = successor_url.value_or(url);
+    const auto notify_successor = [state, path, next_url, handoff, generation] {
+        if (!handoff || generation) return;
+        bool handed_off = false;
+        instance_registry::instance().for_each_alive(path, [&](lattice_db* sibling) {
+            if (handed_off || sibling->sync_lifecycle_ == state || sibling->is_closed() ||
+                !sibling->sync_start_requested_ || sibling->config_.background_sync_managed ||
+                sibling->current_background_sync_generation() != 0 ||
+                !sibling->config_.is_sync_enabled() || sibling->config_.websocket_url != next_url) return;
+            // If its initiating setup has not yet returned, retain exactly one
+            // retry in that transition instead of losing the release edge.
+            sibling->setup_sync_if_configured(true);
+            sync_borrow current(*sibling);
+            handed_off = bool(current);
+        });
+    };
+    auto cleanup = [state, owner = std::move(retired), lock_fd, path, url, generation, drain,
+                    notify_successor](bool finish_transition) mutable {
         {
             std::unique_lock<std::mutex> lock(state->mutex);
             state->cv.wait(lock, [&] { return state->borrowers == 0; });
@@ -1182,9 +1266,16 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
             if (finish_transition) {
                 state->transitioning = false;
                 state->transition_thread = {};
+                state->setup_retry_requested = false;
                 state->cv.notify_all();
             }
         }
+        settled_worker.reset();
+        // This owns only shared lifecycle state and value identities. It is
+        // valid after the primary handle has closed or been destroyed.
+        try { notify_successor(); }
+        catch (const std::exception& error) { LOG_ERROR("sync", "Deferred handoff failed: %s", error.what()); }
+        catch (...) { LOG_ERROR("sync", "Deferred handoff failed with an unknown exception"); }
     };
 #ifndef __EMSCRIPTEN__
     if (defer) {
@@ -1197,17 +1288,6 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
     cleanup(false);
     restore_parent_after_sync_owned(generation);
     end_sync_transition();
-    if (handoff && !generation) {
-        bool handed_off = false;
-        instance_registry::instance().for_each_alive(path, [&](lattice_db* sibling) {
-            if (handed_off || sibling == this || sibling->is_closed() ||
-                !sibling->sync_start_requested_ || sibling->config_.background_sync_managed ||
-                !sibling->config_.is_sync_enabled() || sibling->config_.websocket_url != url) return;
-            sibling->setup_sync_if_configured();
-            sync_borrow current(*sibling);
-            handed_off = bool(current);
-        });
-    }
     return true;
 }
 

@@ -586,4 +586,46 @@ TEST(ManagedBackgroundSync, WritableLocalBorrowerHasManagedLifecycleWithoutWSS) 
 TEST(ManagedBackgroundSync, ReadOnlyLocalBorrowerHasManagedLifecycleWithoutWSS) {
     managed_local_file_lifecycle(true);
 }
+
+TEST(ManagedBackgroundSync, SuspensionCancelsActualRetentionTickWithoutTouchingForeignTransaction) {
+    managed_fixture fixture;
+    constexpr int busy_budget_ms = 3000;
+    lattice::configuration cfg(fixture.file.str());
+    cfg.background_sync_managed = true;
+    cfg.busy_timeout_ms = busy_budget_ms;
+    cfg.audit_retention_seconds = 1;
+    lattice::lattice_db local(cfg);
+    lattice::database foreign(fixture.file.str());
+    const auto run = local.resume_background_sync({}, false);
+    ASSERT_EQ(run.admission, admission::started);
+    foreign.begin_transaction();
+    foreign.execute("INSERT INTO _lattice_meta(key,value) VALUES('foreign-retention-lock','kept')");
+    std::atomic<bool> tick_entered{false};
+    struct trace_guard {
+        sqlite3* connection;
+        ~trace_guard() { sqlite3_trace_v2(connection, 0, nullptr, nullptr); }
+    } trace{local.db().handle()};
+    sqlite3_trace_v2(trace.connection, SQLITE_TRACE_STMT,
+        [](unsigned, void* raw, void* statement, void*) -> int {
+            const auto* sql = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
+            if (sql && std::strncmp(sql, "BEGIN", 5) == 0)
+                static_cast<std::atomic<bool>*>(raw)->store(true, std::memory_order_release);
+            return 0;
+        }, &tick_entered);
+    // This is the actual timer-owned retention thread, not a direct invocation
+    // of its helper. The foreign transaction forces its BEGIN into a busy wait.
+    const bool entered = await_condition([&] { return tick_entered.load(std::memory_order_acquire); });
+    const auto requested = std::chrono::steady_clock::now();
+    const bool settled = local.suspend_background_sync(run.generation);
+    const auto elapsed = std::chrono::steady_clock::now() - requested;
+    EXPECT_TRUE(entered);
+    EXPECT_TRUE(settled);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(busy_budget_ms / 2));
+    EXPECT_FALSE(lattice::background_sync_lifecycle_test_access::retention_running(local));
+    EXPECT_TRUE(foreign.is_in_transaction());
+    EXPECT_EQ(foreign.query("SELECT value FROM _lattice_meta WHERE key='foreign-retention-lock'").size(), 1u);
+    foreign.rollback();
+    EXPECT_TRUE(local.db().query("SELECT value FROM _lattice_meta WHERE key='foreign-retention-lock'").empty());
+    EXPECT_NO_THROW(local.add(TestPerson{"app writer after retention cancellation", 7, std::nullopt}));
+}
 #endif

@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include <set>
 
 // ============================================================================
 // Multi-channel sync set tests (A1: per-sync_id _lattice_sync_set)
@@ -27,6 +28,21 @@ std::string global_id_of(lattice::lattice_db& db, const std::string& name) {
     auto it = rows[0].find("globalId");
     return it != rows[0].end() && std::holds_alternative<std::string>(it->second)
         ? std::get<std::string>(it->second) : "";
+}
+
+void acknowledge_emitted_rows(lattice::mock_sync_transport& transport) {
+    std::set<std::string> acknowledged;
+    for(int pass=0;pass<16;++pass) {
+        std::vector<std::string> ids;
+        for(const auto& message:transport.get_sent_messages()) {
+            const auto event=lattice::server_sent_event::from_json(message.as_string());
+            if(event && event->event_type==lattice::server_sent_event::type::audit_log)
+                for(const auto& row:event->audit_logs) if(acknowledged.insert(row.global_id).second) ids.push_back(row.global_id);
+        }
+        if(ids.empty()) return;
+        transport.simulate_message(lattice::transport_message::from_string(lattice::server_sent_event::make_ack(ids).to_json()));
+    }
+    FAIL()<<"matching ACK fixture did not drain";
 }
 
 } // namespace
@@ -77,6 +93,13 @@ TEST(MultiChannelSyncSet, PerSyncIdCrudIsolation) {
     ASSERT_NE(ws_a, ws_b);
     sync_b.connect();
     sync_b.sync_now();
+
+    // Sending is not durable receipt. Each channel's membership commits only after its own
+    // matching wire ACK; keep this pre-ACK assertion while preserving the isolation assertions.
+    EXPECT_EQ(count_rows(reader,"SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id IN ('chan-a','chan-b')"),0);
+    acknowledge_emitted_rows(*ws_a);
+    EXPECT_EQ(count_rows(reader,"SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id='chan-b'"),0);
+    acknowledge_emitted_rows(*ws_b);
 
     // Membership is disjoint and correctly attributed.
     EXPECT_EQ(count_rows(reader,

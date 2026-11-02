@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include <lattice/sync_storage.hpp>
 #include <algorithm>
 #include <stdexcept>
 
@@ -150,6 +151,85 @@ struct filtered_window_fixture {
             "AND global_row_id=?", {config.sync_id, target_gid}).empty();
     }
 
+    // Reconstruct a released64 on-disk receipt, not a v9 row with a legacy flag.
+    // The live engine supplies a real synthetic payload/source identity; the
+    // literal predecessor below applies released stage semantics: wire id zero,
+    // membership and channel disposition settled, then the upload floor advanced.
+    // Reopening must run the production six-column migration before any assertion.
+    void reopen_with_released_target_receipt() {
+        const auto rows = source->db().query(
+            "SELECT receipt_id,sync_id,source_audit_id,source_global_id,wire_json "
+            "FROM _lattice_sync_outbox ORDER BY receipt_id");
+        if (rows.size() != 1 || std::get<std::string>(rows[0].at("sync_id")) != config.sync_id)
+            throw std::runtime_error("released fixture requires one pending channel receipt");
+        const auto& row = rows[0];
+        auto delivery = lattice::audit_log_entry::from_json(std::get<std::string>(row.at("wire_json")));
+        if (!delivery || delivery->global_row_id != target_gid ||
+            (delivery->operation != "INSERT" && delivery->operation != "DELETE"))
+            throw std::runtime_error("released fixture requires its actual target transition");
+        delivery->id = 0; // Core64 stage_sync_delivery persisted this wire form.
+        const auto source_id = std::get<int64_t>(row.at("source_audit_id"));
+        sync->disconnect();
+        sync.reset();
+        source = nullptr;
+        wire = nullptr;
+        {
+            lattice::database raw(source_path.str());
+            raw.begin_transaction();
+            try {
+                // Epoch9 guards/fingerprints did not exist in the predecessor.
+                const auto guards = raw.query("SELECT name FROM sqlite_schema WHERE type='trigger' "
+                    "AND name GLOB '_lattice_writer_v9_*'");
+                for (const auto& guard : guards)
+                    raw.execute("DROP TRIGGER " + lattice::detail::sync_storage_quote(
+                        std::get<std::string>(guard.at("name"))));
+                raw.execute("DROP TABLE _lattice_sync_outbox");
+                raw.execute("CREATE TABLE _lattice_sync_outbox ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, sync_id TEXT NOT NULL, "
+                    "source_audit_id INTEGER, source_global_id TEXT, "
+                    "event_global_id TEXT NOT NULL, payload TEXT NOT NULL, "
+                    "UNIQUE(sync_id, event_global_id))");
+                raw.execute("CREATE INDEX idx_sync_outbox_source ON _lattice_sync_outbox(sync_id, source_audit_id)");
+                raw.execute("INSERT INTO _lattice_sync_outbox VALUES(?,?,?,?,?,?)", {
+                    row.at("receipt_id"), config.sync_id, row.at("source_audit_id"),
+                    row.at("source_global_id"), delivery->global_id, delivery->to_json()});
+                if (delivery->operation == "DELETE")
+                    raw.execute("DELETE FROM _lattice_sync_set WHERE sync_id=? AND table_name=? AND global_row_id=?",
+                        {config.sync_id, delivery->table_name, delivery->global_row_id});
+                else
+                    raw.execute("INSERT OR IGNORE INTO _lattice_sync_set(sync_id,table_name,global_row_id) VALUES(?,?,?)",
+                        {config.sync_id, delivery->table_name, delivery->global_row_id});
+                raw.execute("INSERT INTO _lattice_sync_state(audit_entry_id,sync_id,is_synchronized) VALUES(?,?,1) "
+                    "ON CONFLICT(audit_entry_id,sync_id) DO UPDATE SET is_synchronized=1", {source_id, config.sync_id});
+                // All prior fixture deliveries were ACKed; this is the only pending source.
+                lattice::advance_upload_floor(raw, config.sync_id, source_id);
+                raw.execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%'");
+                raw.commit();
+            } catch (...) {
+                if (raw.is_in_transaction()) raw.rollback();
+                throw;
+            }
+        }
+        auto owned = std::make_unique<lattice::lattice_db>(lattice::configuration(source_path.str()));
+        source = owned.get();
+        auto transport = std::make_unique<lattice::mock_sync_transport>();
+        wire = transport.get();
+        delivered_messages = 0;
+        sync = std::make_unique<lattice::synchronizer>(std::move(owned), config, std::move(transport));
+        sync->connect();
+    }
+
+    void duplicate_current_receipt_to_other_channel() {
+        // After reopen this is a canonical v9 row. Copy every disposition/byte
+        // field, assigning only a fresh local receipt id and the other channel.
+        source->db().execute(
+            "INSERT INTO _lattice_sync_outbox(sync_id,source_audit_id,source_global_id,wire_global_id,"
+            "table_name,global_row_id,membership,wire_json,routing_key,encoded_charge,legacy_receipt) "
+            "SELECT 'other-channel',source_audit_id,source_global_id,wire_global_id,table_name,global_row_id,"
+            "membership,wire_json,routing_key,encoded_charge,legacy_receipt "
+            "FROM _lattice_sync_outbox WHERE sync_id=?", {config.sync_id});
+    }
+
     void restart() {
         sync->disconnect();
         sync.reset(); // Destroy the owning connection and all in-memory retry state.
@@ -272,6 +352,7 @@ TEST(FilteredSyncWindowDurability, ReenteringFilterRetriesAfterDisconnectBeforeA
 TEST(FilteredSyncWindowDurability, RemovalRetainsPayloadAcrossSourceRestart) {
     filtered_window_fixture fixture;
     fixture.set_target_age(0);
+    fixture.reopen_with_released_target_receipt();
     const auto original = fixture.pending_target_wire();
     ASSERT_FALSE(original.empty());
     ASSERT_EQ(fixture.outbox_count(), 1);
@@ -289,6 +370,7 @@ TEST(FilteredSyncWindowDurability, FullRowInsertRetainsPayloadAcrossSourceRestar
     fixture.pump();
     ASSERT_FALSE(fixture.peer_has_target());
     fixture.set_target_age(1);
+    fixture.reopen_with_released_target_receipt();
     const auto original = fixture.pending_target_wire();
     ASSERT_FALSE(original.empty());
     ASSERT_EQ(fixture.outbox_count(), 1);
@@ -326,6 +408,7 @@ TEST(FilteredSyncWindowDurability, ReconciliationDeleteRetriesAfterSourceRestart
 TEST(FilteredSyncWindowDurability, LatestFilterReconcilesAfterAdmittedDelivery) {
     filtered_window_fixture fixture;
     fixture.set_target_age(0); // An admitted removal is awaiting the peer's ACK.
+    fixture.reopen_with_released_target_receipt();
     const auto removal = fixture.pending_target_wire();
     fixture.sync->update_sync_filter({{"TestPerson", "age = 0"}});
     EXPECT_EQ(fixture.outbox_count(), 1);
@@ -341,6 +424,7 @@ TEST(FilteredSyncWindowDurability, LatestFilterReconcilesAfterAdmittedDelivery) 
 TEST(FilteredSyncWindowDurability, ClearingFilterDoesNotDiscardAdmittedDelivery) {
     filtered_window_fixture fixture;
     fixture.set_target_age(0);
+    fixture.reopen_with_released_target_receipt();
     const auto removal = fixture.pending_target_wire();
     fixture.sync->clear_sync_filter();
     EXPECT_EQ(fixture.outbox_count(), 1);
@@ -353,14 +437,11 @@ TEST(FilteredSyncWindowDurability, ClearingFilterDoesNotDiscardAdmittedDelivery)
 TEST(FilteredSyncWindowDurability, AcknowledgmentOnlyRemovesMatchingChannelDelivery) {
     filtered_window_fixture fixture;
     fixture.set_target_age(0);
+    fixture.reopen_with_released_target_receipt();
     ASSERT_EQ(fixture.outbox_count(), 1);
     // The same wire UUID is deliberately present under another channel. A
     // matching ACK on this connection must never delete the other channel row.
-    fixture.source->db().execute(
-        "INSERT INTO _lattice_sync_outbox "
-        "(sync_id, source_audit_id, source_global_id, event_global_id, payload) "
-        "SELECT 'other-channel', source_audit_id, source_global_id, event_global_id, payload "
-        "FROM _lattice_sync_outbox WHERE sync_id=?", {fixture.config.sync_id});
+    fixture.duplicate_current_receipt_to_other_channel();
     fixture.wire->simulate_message(lattice::transport_message::from_string(
         lattice::server_sent_event::make_ack({"unrelated-uuid"}).to_json()));
     EXPECT_EQ(fixture.outbox_count(), 1);
@@ -476,6 +557,7 @@ TEST(FilteredSyncWindowDurability, PendingPayloadSurvivesSourceHistoryCompaction
     fixture.set_target_age(0);
     fixture.pump();
     fixture.set_target_age(1);
+    fixture.reopen_with_released_target_receipt();
     const auto original = fixture.pending_target_wire();
     ASSERT_FALSE(original.empty());
     ASSERT_EQ(fixture.outbox_count(), 1);
@@ -498,7 +580,7 @@ TEST(FilteredSyncWindowDurability, InvalidStoredPayloadDoesNotDiscardDelivery) {
     fixture.set_target_age(0);
     ASSERT_EQ(fixture.outbox_count(), 1);
     fixture.source->db().execute(
-        "UPDATE _lattice_sync_outbox SET payload='{' WHERE sync_id=?", {fixture.config.sync_id});
+        "UPDATE _lattice_sync_outbox SET wire_json='{' WHERE sync_id=?", {fixture.config.sync_id});
     EXPECT_THROW(fixture.restart(), std::runtime_error);
     EXPECT_EQ(fixture.outbox_count(), 1);
     EXPECT_TRUE(fixture.peer_has_target());
@@ -508,9 +590,11 @@ TEST(FilteredSyncWindowDurability, InvalidStoredPayloadDoesNotDiscardDelivery) {
 TEST(FilteredSyncWindowDurability, UppercaseSyntheticAcknowledgmentResolvesSourceAndOnlyItsChannelOutbox) {
     filtered_window_fixture fixture;
     fixture.set_target_age(0);
+    fixture.reopen_with_released_target_receipt();
     ASSERT_EQ(fixture.outbox_count(), 1);
     const auto rows = fixture.source->db().query(
-        "SELECT source_audit_id,event_global_id,payload FROM _lattice_sync_outbox WHERE sync_id=?",
+        "SELECT source_audit_id,wire_global_id AS event_global_id,wire_json AS payload "
+        "FROM _lattice_sync_outbox WHERE sync_id=?",
         {fixture.config.sync_id});
     ASSERT_EQ(rows.size(), 1u);
     const auto source_id = std::get<int64_t>(rows[0].at("source_audit_id"));
@@ -520,10 +604,7 @@ TEST(FilteredSyncWindowDurability, UppercaseSyntheticAcknowledgmentResolvesSourc
     const auto delivery = lattice::audit_log_entry::from_json(std::get<std::string>(rows[0].at("payload")));
     ASSERT_TRUE(delivery);
     ASSERT_EQ(lattice::apply_remote_changes_for(fixture.peer, {*delivery}, "fixture-source").size(), 1u);
-    fixture.source->db().execute(
-        "INSERT INTO _lattice_sync_outbox(sync_id,source_audit_id,source_global_id,event_global_id,payload) "
-        "SELECT 'other-channel',source_audit_id,source_global_id,event_global_id,payload "
-        "FROM _lattice_sync_outbox WHERE sync_id=?", {fixture.config.sync_id});
+    fixture.duplicate_current_receipt_to_other_channel();
     fixture.wire->simulate_message(lattice::transport_message::from_string(
         lattice::server_sent_event::make_ack({upper}).to_json()));
     EXPECT_EQ(fixture.outbox_count(), 0);

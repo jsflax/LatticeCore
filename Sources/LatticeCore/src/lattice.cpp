@@ -122,8 +122,7 @@ bool lattice_db::prepare_for_audited_writes() {
             shape += c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
         }
         if (shape != "createtable_synccontrol(idintegerprimarykeycheck(id=1),disabledintegernotnulldefault0)" ||
-            !db_->query("SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger' "
-                        "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty() ||
+            !detail::only_sync_storage_guards(*db_, "_SyncControl") ||
             !db_->query("SELECT 1 FROM temp.sqlite_schema WHERE type = 'trigger' "
                         "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty())
             throw db_error("audited writes require the canonical sync control shape without triggers");
@@ -1214,131 +1213,69 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
 
 void lattice_db::setup_ipc_if_configured() {
 #ifndef __EMSCRIPTEN__
-    if (!config_.is_ipc_enabled()) {
-        return;
-    }
-
-    // Only one IPC endpoint per {path, channel} across all instances
-    // (mirrors the WSS dedup via try_register_sync_key).
-    // Filter out channels that are already registered by another instance.
-    std::vector<size_t> active_indices;
-    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
-        const auto& channel = config_.ipc_targets[i].channel;
-        if (try_register_sync_key(config_.path, "ipc:" + channel)) {
-            active_indices.push_back(i);
-        } else {
-            LOG_DEBUG("lattice_db", "IPC synchronizer already active for %s on channel %s, skipping",
-                      config_.path.c_str(), channel.c_str());
+    if(is_closed() || !config_.is_ipc_enabled()) return;
+    const auto config=config_;
+    const auto all_ids=collect_all_sync_ids(config);
+    std::vector<std::shared_ptr<ipc_sync_state>> channels;
+    for(const auto& target:config.ipc_targets) {
+        auto resources=std::make_shared<sync_owner_resources>();
+        resources->key=acquire_sync_key(config.path,"ipc:"+target.channel);
+        if(!resources->key) continue;
+        const auto socket_path=target.socket_path.value_or(resolve_ipc_socket_path(target.channel));
+        const auto lock_path=socket_path+".lock";
+        const int fd=::open(lock_path.c_str(),O_CREAT|O_RDWR,0600);
+        if(fd>=0) {
+            if(::flock(fd,LOCK_EX|LOCK_NB)==0) resources->file=adopt_sync_file(fd);
+            else ::close(fd); // existing IPC role negotiation still works when another process owns this lock
         }
-    }
-    if (active_indices.empty()) return;
-
-    auto all_ids = collect_all_sync_ids(config_);
-
-    // Phase 1: Create all endpoints and store them in the vector.
-    // We must do this BEFORE starting any endpoint, because:
-    // - The server callback fires asynchronously on the accept thread
-    // - Capturing &state.sync from a local that is later moved = dangling pointer
-    // - reserve() ensures push_back won't invalidate references
-    ipc_synchronizers_.reserve(active_indices.size());
-
-    for (size_t idx : active_indices) {
-        ipc_sync_state state;
-        state.endpoint = std::make_unique<ipc_endpoint>(config_.ipc_targets[idx].channel,
-                                                        config_.ipc_targets[idx].socket_path);
-
-        // Acquire per-channel flock — mirrors sync_lock_fd_ for WSS.
-        // Set during construction so is_sync_agent() returns true before
-        // the accept callback creates the synchronizer (avoids timing races).
-        const auto& target_cfg = config_.ipc_targets[idx];
-        std::string sock_path = target_cfg.socket_path.value_or(
-            resolve_ipc_socket_path(target_cfg.channel));
-        std::string lock_path = sock_path + ".lock";
-        int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
-        if (lock_fd >= 0) {
-            if (::flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
-                state.lock_fd = lock_fd;
-                LOG_INFO("ipc_sync", "Acquired IPC lock: %s (fd=%d)", lock_path.c_str(), lock_fd);
-            } else {
-                // Another process holds this channel — still proceed (IPC handles roles via bind)
-                // but don't set lock_fd so is_sync_agent() reflects the true owner.
-                ::close(lock_fd);
-                LOG_INFO("ipc_sync", "IPC lock held by another process: %s", lock_path.c_str());
-            }
-        }
-
-        ipc_synchronizers_.push_back(std::move(state));
-    }
-
-    // Phase 2: Start endpoints using stable references into the vector.
-    for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
-        const auto& target = config_.ipc_targets[active_indices[i]];
-        std::string sync_id = "ipc:" + target.channel;
-        auto& sync_slot = ipc_synchronizers_[i].sync;
-
-        ipc_synchronizers_[i].endpoint->start(
-            [this, sync_id, all_ids, &target, &sync_slot,
-             ep = ipc_synchronizers_[i].endpoint.get()](std::unique_ptr<ipc_socket_client> transport) {
-                LOG_INFO("ipc_sync", "[%s] Accept callback fired (sync_slot=%s, db=%s)",
-                         sync_id.c_str(), sync_slot ? "OCCUPIED" : "empty",
-                         config_.path.c_str());
-
-                sync_config ipc_cfg;
-                ipc_cfg.sync_id = sync_id;
-                // Log-only identity: hub and spoke share the same sync_id on
-                // an IPC channel; role + db basename is what makes their
-                // interleaved lines in one process log tell apart.
-                const auto slash = config_.path.find_last_of('/');
-                ipc_cfg.log_label = sync_id + (ep->is_server() ? "#srv@" : "#cli@") +
-                    (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
-                ipc_cfg.all_active_sync_ids = all_ids;
-                ipc_cfg.is_observer = config_.sync_is_observer;
-                ipc_cfg.sync_filter = target.sync_filter;
-                ipc_cfg.narrowing_emits_removals = target.narrowing_emits_removals;
-                config_.tuning.apply(ipc_cfg);
-                // Coalescing off by default — see the WSS note above.
-
-                // Create dedicated lattice_db for this IPC synchronizer
-                configuration ipc_db_config(config_.path,
-                                            std::make_shared<std_thread_scheduler>());
-                ipc_db_config.busy_timeout_ms = config_.busy_timeout_ms;
-                ipc_db_config.target_schema_version = config_.target_schema_version;
-                ipc_db_config.migration_block = config_.migration_block;
-                auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);
-
-                LOG_INFO("ipc_sync", "[%s] Creating synchronizer (replacing old=%p)",
-                         sync_id.c_str(), sync_slot ? (void*)sync_slot.get() : nullptr);
-
-                auto sync = std::make_unique<synchronizer>(
-                    std::move(ipc_db), ipc_cfg, std::move(transport));
-
-                // Lock ipc_callbacks_mutex_ to synchronize with set_on_sync_progress/
-                // set_on_sync_state_change/set_on_sync_error on the main thread.
-                // Without this, the accept thread and main thread can race: both
-                // check-then-act on {on_sync_progress_, sync_slot} and miss each other.
-                {
-                    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
-
-                    // Apply stored callbacks to the newly-created synchronizer
-                    if (on_sync_progress_) {
-                        sync->set_on_progress(on_sync_progress_);
-                    }
-                    if (on_sync_state_change_) {
-                        sync->set_on_state_change(on_sync_state_change_);
-                    }
-                    if (on_sync_error_) {
-                        sync->set_on_error(on_sync_error_);
-                    }
-
-                    sync->connect();
-                    sync_slot = std::move(sync);
-                }
-
-                LOG_INFO("ipc_sync", "[%s] New synchronizer installed (this=%p)",
-                         sync_id.c_str(), (void*)sync_slot.get());
+        auto channel=std::make_shared<ipc_sync_state>();channel->channel=target.channel;channel->resources=resources;
+        channel->endpoint=std::make_unique<ipc_endpoint>(target.channel,target.socket_path);
+        sync_config settings;settings.sync_id="ipc:"+target.channel;
+        const auto slash=config.path.find_last_of('/');
+        settings.log_label=settings.sync_id+"@"+(slash==std::string::npos ? config.path : config.path.substr(slash+1));
+        settings.all_active_sync_ids=all_ids;settings.is_observer=config.sync_is_observer;
+        settings.owner_active=resources->active;
+        settings.sync_filter=target.sync_filter;settings.narrowing_emits_removals=target.narrowing_emits_removals;
+        config.tuning.apply(settings);
+        configuration database_config(config.path);
+        database_config.busy_timeout_ms=config.busy_timeout_ms;
+        database_config.target_schema_version=config.target_schema_version;
+        database_config.migration_block=config.migration_block;
+        channel->publication=std::make_shared<detail::ipc_publication_state>(settings,
+            [database_config,resources](std::unique_ptr<ipc_socket_client> transport,const sync_config& latest) {
+                auto owned_config=database_config;owned_config.sched=std::make_shared<std_thread_scheduler>();
+                auto database=std::make_unique<lattice_db>(owned_config);
+                return synchronizer::create_owned(std::move(database),latest,std::move(transport),resources);
             });
+        channels.push_back(std::move(channel));
     }
-#endif // !__EMSCRIPTEN__
+    if(channels.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        if(is_closed()) return;
+        for(const auto& channel:channels) {
+            channel->publication->set_progress(on_sync_progress_);
+            channel->publication->set_state(on_sync_state_change_);
+            channel->publication->set_error(on_sync_error_);
+        }
+        ipc_synchronizers_.insert(ipc_synchronizers_.end(),channels.begin(),channels.end());
+    }
+    // Only shared channel state is used after publication. A callback may close its parent while
+    // an endpoint starts; revoke/endpoint_mutex serialize that race without parent/slot captures.
+    try {for(const auto& channel:channels) channel->start();}
+    catch(...) {
+        std::vector<std::shared_ptr<synchronizer>> failed;
+        for(const auto& channel:channels) if(auto sync=channel->publication->revoke()) failed.push_back(std::move(sync));
+        for(const auto& sync:failed) sync->disconnect();
+        for(const auto& channel:channels) channel->stop();
+        {
+            std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+            ipc_synchronizers_.erase(std::remove_if(ipc_synchronizers_.begin(),ipc_synchronizers_.end(),
+                [&](const auto& entry) {return std::find(channels.begin(),channels.end(),entry)!=channels.end();}),ipc_synchronizers_.end());
+        }
+        throw;
+    }
+#endif
 }
 
 static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {
@@ -1443,6 +1380,8 @@ std::vector<database::row_t> lattice_db::query_xproc(
 }
 
 void lattice_db::close_read_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     std::shared_ptr<database> reader, xproc;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -1455,6 +1394,8 @@ void lattice_db::close_read_db() {
 }
 
 void lattice_db::close_write_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     std::shared_ptr<database> writer;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -1493,6 +1434,8 @@ void lattice_db::restore_attached_views(database& connection) {
 }
 
 void lattice_db::reopen_write_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -1523,6 +1466,8 @@ void lattice_db::reopen_write_db() {
 }
 
 void lattice_db::reopen_read_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     if (config_.is_in_memory() || config_.read_only) return;
     uint64_t revision;
     {
@@ -1554,6 +1499,8 @@ void lattice_db::reopen_read_db() {
 }
 
 void lattice_db::attach(lattice_db &lattice) {
+    if (config_.required_existing_schema_version != 0 || lattice.config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles cannot participate in attachments");
     // Serialize attach/detach: the already-attached consult below is
     // check-then-act, and view regeneration must not interleave with a
     // concurrent attach/detach on another thread.

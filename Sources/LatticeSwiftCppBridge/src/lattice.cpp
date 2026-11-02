@@ -172,6 +172,19 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
     : lattice_db(config, /*defer_sync=*/true), swift_config_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
+    if (config.required_existing_schema_version != 0) {
+        try {
+            require_existing_schema_in_transaction();
+            require_existing_fingerprint_in_transaction(compute_swift_fingerprint_key(schemas));
+            populate_swift_in_memory_state(schemas);
+            finish_existing_schema_admission();
+        } catch (...) { abandon_existing_schema_admission(); throw; }
+        if (!config.read_only) {
+            lattice_db::setup_sync_if_configured();
+            lattice_db::setup_ipc_if_configured();
+        }
+        return;
+    }
     if (!config.read_only) {
         LOG_DEBUG("swift_lattice", "ensure_swift_tables");
         ensure_swift_tables(schemas);
@@ -190,19 +203,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
-    : lattice_db(config, /*defer_sync=*/true), swift_config_(std::move(config)) {
-    if (!swift_config_.read_only) {
-        ensure_swift_tables(schemas);
-        lattice_db::setup_sync_if_configured();
-        lattice_db::setup_ipc_if_configured();
-    } else {
-        // In read-only mode, just store schemas without creating tables
-        for (const auto& entry : schemas) {
-            schemas_[entry.table_name] = entry.properties;
-            constraints_[entry.table_name] = entry.constraints;
-        }
-    }
-}
+    : swift_lattice(static_cast<const swift_configuration&>(config), schemas) {}
 
 // A `@Unique(..., allowsUpsert: true)` whose conflict set includes a to-one link
 // uses the `<link>__link_gid` shadow column (Phase 8a). That column is normally
@@ -1132,6 +1133,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // DDL, so the captured schema cookie reflects this pass. The core-layer
     // marker is re-stamped because this pass's DDL bumped the cookie and would
     // otherwise leave it permanently one-open stale.
+    detail::ensure_sync_storage_guards(db());
     store_fingerprint_marker(fp_key);
     store_fingerprint_marker(compute_core_fingerprint_key());
 

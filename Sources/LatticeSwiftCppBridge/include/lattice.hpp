@@ -45,6 +45,10 @@ void _lattice_post_cross_process_notification(const std::string& db_path);
 
 namespace lattice {
 
+inline int64_t sync_max_encoded_message_bytes_value() {
+    return static_cast<int64_t>(sync_max_encoded_message_bytes);
+}
+
 // ============================================================================
 // swift_dynamic_object - A type-erased model for Swift interop
 // Swift models map to this, with schema/properties set dynamically
@@ -874,14 +878,7 @@ public:
         }
     }
 
-    audit_read_fence read_audit_read_fence() SWIFT_NAME(auditReadFence()) {
-        last_bridge_error().clear();
-        try { return lattice_db::read_audit_read_fence(); }
-        catch (const std::exception& error) {
-            last_bridge_error() = error.what();
-            return {};
-        }
-    }
+
 
     // Strict metadata query: zero is only a sealed failure sentinel.
     int32_t stored_schema_version() SWIFT_NAME(storedSchemaVersion()) {
@@ -890,6 +887,33 @@ public:
         catch (const std::exception& error) {
             last_bridge_error() = error.what();
             return 0;
+        }
+    }
+
+    audit_cursor read_audit_cursor() SWIFT_NAME(auditCursor()) {
+        last_bridge_error().clear();
+        try { return lattice_db::read_audit_cursor(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
+    bool require_main_file_unmoved(const std::string& expected_path) SWIFT_NAME(requireMainFileUnmoved(_:)) {
+        last_bridge_error().clear();
+        try { lattice_db::require_main_file_unmoved(expected_path); return true; }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return false;
+        }
+    }
+
+    audit_read_fence read_audit_read_fence() SWIFT_NAME(auditReadFence()) {
+        last_bridge_error().clear();
+        try { return lattice_db::read_audit_read_fence(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
         }
     }
 
@@ -1112,8 +1136,16 @@ public:
     void clear_sync_filter_for_channel(const std::string& channel);
     /// A6 — permanently retire a dead sync channel (state + set + slot).
     /// For channels that will reconnect, use reset via the daemon instead.
+    bool remove_sync_channel_state_checked(const std::string& sync_id) {
+        last_bridge_error().clear();
+        try { lattice_db::remove_sync_channel_state(sync_id); return true; }
+        catch (const std::exception& error) { last_bridge_error() = error.what(); return false; }
+        catch (...) { last_bridge_error() = "Sync channel retirement failed"; return false; }
+    }
+    // Preserve the old signature, but never let a native refusal escape into Swift.
+    // Callers needing a completion guarantee use the checked API/error slot.
     void remove_sync_channel_state(const std::string& sync_id) {
-        lattice_db::remove_sync_channel_state(sync_id);
+        (void)remove_sync_channel_state_checked(sync_id);
     }
 
     /// Register a callback for cross-process idle hints (no new AuditLog entries).
@@ -3188,6 +3220,7 @@ namespace detail {
         fp += config.sync_is_observer ? 'O' : 'P';
         fp += config.sync_autostart ? 'A' : 'D';
         fp += config.background_sync_managed ? 'M' : 'U';
+        fp += std::to_string(config.required_existing_schema_version); fp += '|';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         append_cache_string(fp, config.authorization_token);
@@ -3282,6 +3315,13 @@ template <typename ConfigT>
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
+            if (config.required_existing_schema_version != 0) {
+                // Disk admission can wait for a writer. Never hold the global cache mutex across it,
+                // and never key-cache a strict handle: each call must admit the currently opened file.
+                auto instance = std::make_shared<swift_lattice>(config, schemas);
+                register_pointer(instance);
+                return instance;
+            }
 
             // Build schema hash from table names and properties (sorted for
             // consistency). Pure computation over `schemas` — done before locking
@@ -3780,12 +3820,22 @@ public:
         return impl().grouped_counts(table_name, group_by, where_clause, distinct_by, params);
     }
 
-    audit_read_fence read_audit_read_fence() const SWIFT_NAME(auditReadFence()) {
-        return impl().read_audit_read_fence();
-    }
+
 
     int32_t stored_schema_version() const SWIFT_NAME(storedSchemaVersion()) {
         return impl().stored_schema_version();
+    }
+
+    audit_cursor read_audit_cursor() const SWIFT_NAME(auditCursor()) {
+        return impl().read_audit_cursor();
+    }
+
+    bool require_main_file_unmoved(const std::string& expected_path) const SWIFT_NAME(requireMainFileUnmoved(_:)) {
+        return impl().require_main_file_unmoved(expected_path);
+    }
+
+    audit_read_fence read_audit_read_fence() const SWIFT_NAME(auditReadFence()) {
+        return impl().read_audit_read_fence();
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema
@@ -4063,8 +4113,14 @@ public:
     void clear_sync_filter_for_channel(const std::string& channel) const {
         sealed([&] { impl().clear_sync_filter_for_channel(channel); });
     }
+    bool remove_sync_channel_state_checked(const std::string& sync_id) const {
+        last_bridge_error().clear();
+        try { return impl().remove_sync_channel_state_checked(sync_id); }
+        catch (const std::exception& error) { last_bridge_error() = error.what(); return false; }
+        catch (...) { last_bridge_error() = "Sync channel retirement failed"; return false; }
+    }
     void remove_sync_channel_state(const std::string& sync_id) const {
-        sealed([&] { impl().remove_sync_channel_state(sync_id); });
+        (void)remove_sync_channel_state_checked(sync_id);
     }
     /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
     /// see lattice_db::delete_rows_no_relay for why a normal delete is
@@ -4252,6 +4308,8 @@ private:
     swift_lattice_ref() = default;
 
     static std::shared_ptr<swift_lattice> create_dynamic_shared(const swift_configuration& config) {
+        if (config.required_existing_schema_version != 0)
+            throw db_error("Existing schema admission requires a complete typed schema");
         swift_configuration cfg = config;
         cfg.read_only = true;
         auto impl = std::make_shared<swift_lattice>(std::move(cfg));

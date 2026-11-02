@@ -212,6 +212,17 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/BridgeCacheConfigurationTests.cpp
+    Tests/LatticeCoreTests/ExistingSchemaAccessTests.cpp
+    Tests/LatticeCoreTests/MainFileCurrentnessTests.cpp
+    Tests/LatticeCoreTests/SyncOutboxMigrationTests.cpp
+    Tests/LatticeCoreTests/DetachedReadTests.cpp
+    Tests/LatticeCoreTests/FiniteSyncCycleTests.cpp
+    Tests/LatticeCoreTests/ManagedBackgroundSyncTests.cpp
+    Tests/LatticeCoreTests/BackgroundSyncSuspensionCharacterizationTests.cpp
+    Tests/LatticeCoreTests/NoHistoryNullTests.cpp
+    Tests/LatticeCoreTests/FilteredSyncWindowDurabilityTests.cpp
+    Tests/LatticeCoreTests/FilterRemovalGateTests.cpp
+    Tests/LatticeCoreTests/MultiChannelSyncSetTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
@@ -253,6 +264,11 @@ target_link_libraries(LatticeAuditedWritesPreparationTests PRIVATE LatticeCore g
 add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)
 target_link_libraries(LatticeNoHistoryNullTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 
+# Focused exact-open and scalar-cursor regressions. TestHelpers requires caller-owned TMPDIR and
+# LATTICE_TEST_LOG_PATH for isolated runs; no full unrelated test suite needs to compile.
+add_executable(LatticeExistingSchemaAccessTests Tests/LatticeCoreTests/ExistingSchemaAccessTests.cpp)
+target_link_libraries(LatticeExistingSchemaAccessTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp)
@@ -263,6 +279,7 @@ set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 
 include(GoogleTest)
 gtest_discover_tests(LatticeCoreTests)
+gtest_discover_tests(LatticeExistingSchemaAccessTests TEST_PREFIX "Focused.")
 
 # =============================================================================
 # LatticeCAPITests - behavioral tests against the C ABI (links the C surface)

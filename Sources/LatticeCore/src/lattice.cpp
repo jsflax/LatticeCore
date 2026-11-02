@@ -169,9 +169,9 @@ static log_level initial_log_level() {
 }
 std::atomic<log_level> g_log_level{initial_log_level()};
 
-std::unordered_map<const instance_guard*, int>& instance_guard::tls_depths() {
-    thread_local std::unordered_map<const instance_guard*, int> depths;
-    return depths;
+instance_guard::callback_frame*& instance_guard::tls_frames() noexcept {
+    thread_local callback_frame* head = nullptr;
+    return head;
 }
 
 // Singleton instance - defined here to ensure single copy across all translation units

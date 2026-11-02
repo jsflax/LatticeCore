@@ -95,15 +95,33 @@ struct instance_guard {
     /// yield spin in ~lattice_db during the test suite). A callback that
     /// triggers destruction must not touch the lattice afterwards — which is
     /// inherently true for deinit-triggered teardown.
-    // Keep the TLS accessor out of line. Combined-object builds may localize
-    // hidden inline TLS independently in Core, bridge, and caller objects;
-    // destruction must read the same map that callback admission increments.
-    static std::unordered_map<const instance_guard*, int>& tls_depths();
-    static int tls_depth(const instance_guard* g) {
-        auto& m = tls_depths();
-        auto it = m.find(g);
-        return it == m.end() ? 0 : it->second;
+    struct callback_frame {
+        instance_guard* guard;
+        callback_frame* previous;
+    };
+    // Keep one out-of-line, trivially destructible TLS head across Core,
+    // bridge and callers. Swift/Foundation pthread-key destructors can close
+    // a store AFTER C++ TLS destructors; a TLS container is already dead then.
+    // Frames live only on the active callback stack: no per-thread heap leak.
+    static callback_frame*& tls_frames() noexcept;
+    static int tls_depth(const instance_guard* g) noexcept {
+        int depth = 0;
+        for (auto* frame = tls_frames(); frame; frame = frame->previous)
+            if (frame->guard == g) ++depth;
+        return depth;
     }
+    struct callback_hold {
+        callback_frame frame;
+        explicit callback_hold(instance_guard* g) noexcept : frame{g, tls_frames()} {
+            tls_frames() = &frame;
+        }
+        callback_hold(const callback_hold&) = delete;
+        callback_hold& operator=(const callback_hold&) = delete;
+        ~callback_hold() {
+            tls_frames() = frame.previous;
+            frame.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+        }
+    };
 };
 
 class instance_registry {
@@ -166,17 +184,7 @@ public:
             // RAII: an observer exception now legally unwinds through here to
             // the writer (docs/design-deferred-memory-delivery.md) — a leaked
             // refcount would wedge the instance's destructor drain-wait.
-            auto* g = e.guard.get();
-            struct hold_release {
-                instance_guard* g;
-                ~hold_release() {
-                    auto& depths = instance_guard::tls_depths();
-                    if (--depths[g] == 0) depths.erase(g);
-                    g->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
-                }
-            };
-            ++instance_guard::tls_depths()[g];
-            hold_release release{g};
+            instance_guard::callback_hold release{e.guard.get()};
             fn(e.ptr);
         }
     }

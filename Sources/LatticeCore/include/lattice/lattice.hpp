@@ -3630,8 +3630,10 @@ public:
                  std::optional<std::string> where_clause = std::nullopt,
                  std::optional<std::string> group_by = std::nullopt,
                  std::optional<std::string> distinct_by = std::nullopt,
-                 const std::vector<column_value_t>& params = {}) {
-        auto rows = query_read(build_count_sql(table_name, where_clause, group_by, distinct_by), params);
+                 const std::vector<column_value_t>& params = {},
+                 bool require_open = false) {
+        const auto sql = build_count_sql(table_name, where_clause, group_by, distinct_by);
+        auto rows = require_open ? query_read_checked(sql, params) : query_read(sql, params);
         if (!rows.empty()) {
             auto it = rows[0].find("cnt");
             if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
@@ -4797,9 +4799,11 @@ public:
         std::optional<int64_t> offset = std::nullopt,
         std::optional<std::string> group_by = std::nullopt,
         std::optional<std::string> distinct_by = std::nullopt,
-        const std::vector<column_value_t>& params = {}) {
-        return query_read(build_query_rows_sql(
-            table_name, where_clause, order_by, limit, offset, group_by, distinct_by), params);
+        const std::vector<column_value_t>& params = {},
+        bool require_open = false) {
+        const auto sql = build_query_rows_sql(
+            table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
+        return require_open ? query_read_checked(sql, params) : query_read(sql, params);
     }
 
     // Query objects from a table with optional filtering, sorting, and pagination
@@ -4810,8 +4814,14 @@ public:
         std::optional<std::string> order_by = std::nullopt,
         std::optional<int64_t> limit = std::nullopt,
         std::optional<int64_t> offset = std::nullopt,
-        const std::vector<column_value_t>& params = {}) {
+        const std::vector<column_value_t>& params = {},
+        bool require_open = false) {
 
+        if (require_open) {
+            auto connection = borrow_read_connection();
+            if (is_closed() || connection->is_closed())
+                throw db_error("Query connection is closed");
+        }
         if (table_names.empty()) {
             return {};
         }
@@ -4819,7 +4829,8 @@ public:
         // Get columns for each table using PRAGMA table_info (name -> type)
         std::vector<std::map<std::string, std::string>> table_columns;
         for (const auto& table_name : table_names) {
-            auto pragma_result = query_read("PRAGMA table_info(" + table_name + ")");
+            const auto pragma = "PRAGMA table_info(" + table_name + ")";
+            auto pragma_result = require_open ? query_read_checked(pragma) : query_read(pragma);
             std::map<std::string, std::string> cols;
             for (const auto& row : pragma_result) {
                 auto name_it = row.find("name");
@@ -4908,7 +4919,7 @@ public:
                 repeated.insert(repeated.end(), params.begin(), params.end());
             }
         }
-        return query_read(sql.str(), repeated);
+        return require_open ? query_read_checked(sql.str(), repeated) : query_read(sql.str(), repeated);
     }
 
     /// Immutable, namespaced state local to this physical database. It is
@@ -5019,6 +5030,11 @@ public:
     std::shared_ptr<database> borrow_read_connection();
     std::shared_ptr<database> borrow_xproc_read_connection();
     std::vector<database::row_t> query_read(
+        const std::string& sql, const std::vector<column_value_t>& params = {});
+    /// Strict reads for sealed language boundaries: retain the actual selected
+    /// connection and distinguish logical close from a healthy empty result.
+    /// Generic query_read retains its existing tolerant C++ behavior.
+    std::vector<database::row_t> query_read_checked(
         const std::string& sql, const std::vector<column_value_t>& params = {});
     std::vector<database::row_t> query_xproc(
         const std::string& sql, const std::vector<column_value_t>& params = {});

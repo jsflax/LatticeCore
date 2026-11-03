@@ -1454,6 +1454,17 @@ std::vector<database::row_t> lattice_db::query_read(
     return connection->query(sql, params);
 }
 
+std::vector<database::row_t> lattice_db::query_read_checked(
+    const std::string& sql, const std::vector<column_value_t>& params) {
+    auto connection = borrow_read_connection();
+    if (is_closed() || connection->is_closed())
+        throw db_error("Query connection is closed");
+    auto rows = connection->query(sql, params);
+    if (is_closed() || connection->is_closed())
+        throw db_error("Query connection is closed");
+    return rows;
+}
+
 std::vector<database::row_t> lattice_db::query_xproc(
     const std::string& sql, const std::vector<column_value_t>& params) {
     auto connection = borrow_xproc_read_connection();

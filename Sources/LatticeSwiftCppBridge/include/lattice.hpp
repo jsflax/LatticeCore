@@ -800,7 +800,7 @@ public:
         // empty on failure, e.g. transient SQLITE_NOMEM under memory pressure.
         last_bridge_error().clear();
         try {
-        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
+        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params, true);
         return hydrate_swift_rows(rows, table_name);
         } catch (const std::exception& e) {
             last_bridge_error() = e.what();
@@ -821,7 +821,7 @@ public:
         // terminated the process at the interop boundary).
         last_bridge_error().clear();
         try {
-        auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset, params);
+        auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset, params, true);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
 
@@ -924,7 +924,7 @@ public:
                  OptionalString distinct_by,
                  const ColumnValueVector& params = {}) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, group_by, distinct_by, params); }
+        try { return lattice_db::count(table_name, where_clause, group_by, distinct_by, params, true); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
@@ -932,19 +932,19 @@ public:
                  OptionalString where_clause,
                  OptionalString group_by) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, group_by); }
+        try { return lattice_db::count(table_name, where_clause, group_by, std::nullopt, {}, true); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name,
                  OptionalString where_clause) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, std::nullopt); }
+        try { return lattice_db::count(table_name, where_clause, std::nullopt, std::nullopt, {}, true); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name) {
-        return lattice_db::count(table_name, std::nullopt, std::nullopt);
+        return count(table_name, std::nullopt, std::nullopt, std::nullopt, {});
     }
 
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause,
@@ -1340,6 +1340,15 @@ public:
     }
     
     void commit() { lattice_db::commit(); }
+    // Internal memory read-gate cleanup must not erase the query's outcome.
+    // A real COMMIT failure wins and is reported separately by the Swift caller.
+    bool commit_read_gate() {
+        auto query_error = last_bridge_error();
+        sealed([&] { lattice_db::commit(); });
+        if (!last_bridge_error().empty()) return false;
+        last_bridge_error() = std::move(query_error);
+        return true;
+    }
     void rollback() { lattice_db::rollback(); }
     void write(void (*fn)()) {
         begin_transaction();
@@ -1774,6 +1783,8 @@ public:
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt,
         const ColumnValueVector& params = {}) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         try {
             auto rows = query_at_generation(
@@ -1802,6 +1813,8 @@ public:
                      OptionalString group_by = std::nullopt,
                      OptionalString distinct_by = std::nullopt,
                      const ColumnValueVector& params = {}) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         try {
             auto rows = query_at_generation(
@@ -1840,6 +1853,8 @@ public:
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         try {
             bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
@@ -1873,6 +1888,8 @@ public:
                                       OptionalString where_clause = std::nullopt,
                                       OptionalString order_by = std::nullopt,
                                       const ColumnValueVector& params = {}) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         const auto sql = build_query_rows_sql(table_name, where_clause, order_by,
                                               std::nullopt, std::nullopt,
@@ -3963,6 +3980,7 @@ public:
     // the same slot instead of trapping.
     void begin_transaction() const { sealed([&] { impl().begin_transaction(); }); }
     void commit() const { sealed([&] { impl().commit(); }); }
+    bool commit_read_gate() const { return impl().commit_read_gate(); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
 

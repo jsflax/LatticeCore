@@ -188,6 +188,27 @@ TEST(GroupedCounts, ConnectionClosedDuringQueryRefusesCompletedRows) {
     EXPECT_TRUE(retained->is_closed());
 }
 
+TEST(CheckedQueryRead, ConnectionClosedDuringQueryRefusesCompletedRows) {
+    lattice_db owner;
+    owner.db().execute("CREATE TABLE CheckedCloseProbe(id INTEGER PRIMARY KEY,globalId TEXT,value TEXT)");
+    owner.db().execute("INSERT INTO CheckedCloseProbe VALUES(1,'checked-close-one','one')");
+    const auto retained = owner.borrow_read_connection();
+    int rows_seen = 0;
+    struct ClearRowHook {
+        ~ClearRowHook() { database_query_test_access::set(nullptr); }
+    } clear_hook;
+    database_query_test_access::set([&](sqlite3_stmt*) {
+        ++rows_seen;
+        // The owned borrow keeps extraction safe, but a completed row from
+        // this now-closed connection must not be returned as valid data.
+        retained->close();
+    });
+    EXPECT_THROW(owner.query_read_checked("SELECT value FROM CheckedCloseProbe"), db_error);
+    EXPECT_EQ(rows_seen, 1);
+    EXPECT_FALSE(owner.is_closed());
+    EXPECT_TRUE(retained->is_closed());
+}
+
 TEST(DatabaseText, BindingPreservesBytesAgainstRawSQLiteOracle) {
     database db(":memory:");
     db.execute("CREATE TABLE TextBytes(id INTEGER PRIMARY KEY,value TEXT)");

@@ -393,3 +393,99 @@ TEST(ExistingSchemaAuditReadFence, RejectsMalformedAmbiguousMissingAndDeniedMeta
     writer->close();
     EXPECT_THROW(core.read_audit_read_fence(), lattice::db_error);
 }
+
+// A Swift sealed query must not confuse a logically closed handle with no rows.
+// The ordinary C++ tolerant query contract remains unchanged.
+TEST(ExistingSchemaAccess, SwiftSealedQueriesDistinguishClosedFromHealthyEmpty) {
+    for (bool memory : {false, true}) {
+        TempDB file{"sealed_closed"};
+        auto owner = seed_asset(memory ? ":memory:" : file.str());
+        const lattice::OptionalString no_match{std::string("payload = 'missing'")};
+        EXPECT_TRUE(owner->objects("ExistingAssetFixture", no_match).empty());
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+        EXPECT_EQ(owner->count("ExistingAssetFixture", no_match), 0u);
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+        EXPECT_TRUE(owner->union_objects({"ExistingAssetFixture"}, no_match).empty());
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+        owner->close();
+        EXPECT_TRUE(owner->objects("ExistingAssetFixture").empty());
+        EXPECT_FALSE(lattice::last_bridge_error().empty());
+        EXPECT_EQ(owner->count("ExistingAssetFixture"), 0u);
+        EXPECT_FALSE(lattice::last_bridge_error().empty());
+        EXPECT_TRUE(owner->union_objects({"ExistingAssetFixture"}).empty());
+        EXPECT_FALSE(lattice::last_bridge_error().empty());
+        EXPECT_TRUE(owner->union_objects({}).empty());
+        EXPECT_FALSE(lattice::last_bridge_error().empty());
+        EXPECT_NO_THROW(EXPECT_TRUE(owner->query_rows("ExistingAssetFixture").empty()));
+    }
+}
+
+TEST(ExistingSchemaAccess, SwiftSealedQueryRefusesClosedSelectedConnectionWithOpenParent) {
+    TempDB file{"sealed_reader_closed"};
+    auto owner = seed_asset(file.str());
+    auto reader = owner->borrow_read_connection();
+    ASSERT_NE(reader.get(), &owner->db());
+    reader->close();
+    ASSERT_FALSE(owner->is_closed());
+    EXPECT_TRUE(owner->objects("ExistingAssetFixture").empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    EXPECT_EQ(owner->count("ExistingAssetFixture"), 0u);
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    EXPECT_TRUE(owner->union_objects({"ExistingAssetFixture"}).empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    owner->close();
+}
+
+TEST(ExistingSchemaAccess, HealthyGenerationReadClearsAnUnrelatedClosedQueryError) {
+    TempDB file{"sealed_generation_healthy"}, other{"sealed_generation_closed"};
+    auto healthy = seed_asset(file.str());
+    auto closed = seed_asset(other.str());
+    const auto generation = healthy->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    const lattice::OptionalString no_match{std::string("payload = 'missing'")};
+    closed->close();
+    EXPECT_TRUE(closed->objects("ExistingAssetFixture").empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    EXPECT_TRUE(healthy->objects_at(generation, "ExistingAssetFixture", no_match).empty());
+    EXPECT_FALSE(healthy->last_generation_read_stale());
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+    EXPECT_EQ(closed->count("ExistingAssetFixture"), 0u);
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    EXPECT_EQ(healthy->count_at(generation, "ExistingAssetFixture", no_match), 0);
+    EXPECT_FALSE(healthy->last_generation_read_stale());
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+    healthy->release_read_generation(generation);
+    healthy->close();
+}
+
+TEST(ExistingSchemaAccess, ReadGateCleanupPreservesQueryOutcomeAndReportsCommitFailure) {
+    auto owner = seed_asset(":memory:");
+    owner->begin_transaction();
+    EXPECT_TRUE(owner->objects("MissingReadGateFixture").empty());
+    const auto query_error = lattice::last_bridge_error();
+    ASSERT_FALSE(query_error.empty());
+    EXPECT_TRUE(owner->commit_read_gate());
+    EXPECT_EQ(lattice::last_bridge_error(), query_error);
+
+    owner->begin_transaction();
+    const lattice::OptionalString no_match{std::string("payload = 'missing'")};
+    EXPECT_TRUE(owner->objects("ExistingAssetFixture", no_match).empty());
+    EXPECT_TRUE(owner->commit_read_gate());
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+
+    owner->begin_transaction();
+    EXPECT_TRUE(owner->objects("MissingReadGateFixture").empty());
+    ASSERT_FALSE(lattice::last_bridge_error().empty());
+    sqlite3_set_authorizer(owner->db().handle(), [](void*, int action, const char* operation,
+                                                  const char*, const char*, const char*) -> int {
+        return action == SQLITE_TRANSACTION && operation && std::string(operation) == "COMMIT"
+            ? SQLITE_DENY : SQLITE_OK;
+    }, nullptr);
+    EXPECT_FALSE(owner->commit_read_gate());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    EXPECT_NE(lattice::last_bridge_error(), query_error);
+    sqlite3_set_authorizer(owner->db().handle(), nullptr, nullptr);
+    owner->rollback();
+    owner->close();
+    lattice::last_bridge_error().clear();
+}

@@ -117,3 +117,120 @@ TEST(TransportAuthentication, LegacyBearerHeaderIsUnchanged) {
     db.close();
 }
 } // namespace
+
+namespace {
+struct PinAdmission {
+    bool supported = false;
+    std::vector<std::string> pins;
+    std::vector<Attempt> attempts;
+};
+class PinTransport : public mock_sync_transport {
+    std::shared_ptr<PinAdmission> admission_;
+public:
+    explicit PinTransport(std::shared_ptr<PinAdmission> admission) : admission_(std::move(admission)) {}
+    bool configure_certificate_pin(const std::string& pin) override {
+        admission_->pins.push_back(pin);
+        return pin.empty() || admission_->supported;
+    }
+    void connect(const std::string& url, const HeadersMap& headers) override {
+        admission_->attempts.push_back({url, headers});
+    }
+};
+class PinFactory : public network_factory {
+public:
+    std::shared_ptr<PinAdmission> admission = std::make_shared<PinAdmission>();
+    std::unique_ptr<http_client> create_http_client() override { return std::make_unique<null_http_client>(); }
+    std::unique_ptr<sync_transport> create_sync_transport() override { return std::make_unique<PinTransport>(admission); }
+};
+struct PinNetworkScope {
+    std::shared_ptr<network_factory> previous = get_network_factory();
+    std::shared_ptr<PinFactory> recording = std::make_shared<PinFactory>();
+    PinNetworkScope() { set_network_factory(recording); }
+    ~PinNetworkScope() { set_network_factory(previous); }
+};
+
+TEST(TransportAuthentication, PinUnsupportedDefaultsAndGenericCallbackFailClosed) {
+    const std::string pin(64, 'a');
+    mock_sync_transport unsupported;
+    EXPECT_TRUE(unsupported.configure_certificate_pin(""));
+    EXPECT_FALSE(unsupported.configure_certificate_pin(pin));
+    PinAdmission admission;
+    generic_sync_transport generic(&admission, nullptr, nullptr, nullptr, nullptr);
+    EXPECT_TRUE(generic.configure_certificate_pin(""));
+    EXPECT_FALSE(generic.configure_certificate_pin(pin));
+    generic.set_certificate_pin_callback([](void* context, const void* value) -> bool {
+        auto& seen = *static_cast<PinAdmission*>(context);
+        seen.pins.push_back(*static_cast<const std::string*>(value));
+        return seen.supported;
+    });
+    EXPECT_FALSE(generic.configure_certificate_pin(pin));
+    admission.supported = true;
+    EXPECT_TRUE(generic.configure_certificate_pin(pin));
+    ASSERT_EQ(admission.pins.size(), 2u);
+    EXPECT_EQ(admission.pins[0], pin);
+    EXPECT_EQ(admission.pins[1], pin);
+}
+
+TEST(TransportAuthentication, PinIsForwardedBeforeConnectAndUnsupportedTransportNeverDials) {
+    for (bool supported : {false, true}) {
+        PinNetworkScope network;
+        auto observed = network.recording->admission;
+        observed->supported = supported;
+        File file;
+        configuration config(file.path);
+        config.audit_retention_seconds = 0;
+        config.websocket_url = "wss://fixture.invalid/sync";
+        config.authorization_token = "fixture-token";
+        config.pinned_server_certificate_sha256 = std::string(64, 'a');
+        lattice_db db(config);
+        ASSERT_EQ(observed->pins.size(), 1u);
+        EXPECT_EQ(observed->pins.front(), config.pinned_server_certificate_sha256);
+        EXPECT_EQ(observed->attempts.size(), supported ? 1u : 0u);
+        if (supported) {
+            EXPECT_EQ(observed->attempts.front().headers.at("Authorization"), "Bearer fixture-token");
+            db.reconnect_sync();
+            ASSERT_EQ(observed->pins.size(), 2u);
+            EXPECT_EQ(observed->pins.back(), config.pinned_server_certificate_sha256);
+            EXPECT_EQ(observed->attempts.size(), 2u);
+        }
+        db.close();
+    }
+}
+
+TEST(TransportAuthentication, PinCannotAdmitAnInsecureWebSocketEvenIfTransportClaimsSupport) {
+    PinNetworkScope network;
+    network.recording->admission->supported = true;
+    File file;
+    configuration config(file.path);
+    config.audit_retention_seconds = 0;
+    config.websocket_url = "ws://fixture.invalid/sync";
+    config.authorization_token = "fixture-token";
+    config.pinned_server_certificate_sha256 = std::string(64, 'a');
+    lattice_db db(config);
+    EXPECT_TRUE(network.recording->admission->pins.empty());
+    EXPECT_TRUE(network.recording->admission->attempts.empty());
+    db.close();
+}
+
+TEST(TransportAuthentication, DifferentPinsNeverShareTheNativeCachedConnection) {
+    File file;
+    swift_configuration unpinned(file.path);
+    unpinned.audit_retention_seconds = 0;
+    unpinned.sync_autostart = false;
+    unpinned.websocket_url = "wss://fixture.invalid/sync";
+    unpinned.authorization_token = "fixture-token";
+    auto pin_a = unpinned; pin_a.set_certificate_pin(std::string(64, 'a'));
+    auto pin_b = unpinned; pin_b.set_certificate_pin(std::string(64, 'b'));
+    EXPECT_NE(detail::connection_fingerprint(unpinned), detail::connection_fingerprint(pin_a));
+    EXPECT_NE(detail::connection_fingerprint(pin_a), detail::connection_fingerprint(pin_b));
+    auto& cache = detail::LatticeCache::instance();
+    auto original = cache.get_or_create(unpinned, SchemaVector{});
+    auto first = cache.get_or_create(pin_a, SchemaVector{});
+    auto second = cache.get_or_create(pin_b, SchemaVector{});
+    EXPECT_NE(original.get(), first.get());
+    EXPECT_NE(first.get(), second.get());
+    EXPECT_EQ(first.get(), cache.get_or_create(pin_a, SchemaVector{}).get());
+    EXPECT_EQ(first->config().pinned_server_certificate_sha256, std::string(64, 'a'));
+    second->close(); first->close(); original->close();
+}
+} // namespace

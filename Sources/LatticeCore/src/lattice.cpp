@@ -883,6 +883,8 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     uint64_t filter_revision;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
+    sync_cfg.pinned_server_certificate_sha256 = config_.pinned_server_certificate_sha256;
+    sync_cfg.uploads_enabled = config_.uploads_enabled;
     {
         std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
         sync_cfg.sync_filter = config_.sync_filter;
@@ -900,7 +902,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
             (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
     }
     sync_cfg.all_active_sync_ids = all_ids;
-    sync_cfg.is_observer = config_.sync_is_observer;
+    sync_cfg.is_observer = config_.sync_is_observer || !config_.uploads_enabled;
     config_.tuning.apply(sync_cfg);
     // Upload coalescing stays at the library default (0 = legacy immediate
     // dispatch): with the upload floor + classify gating, passes are cheap,
@@ -1315,6 +1317,7 @@ void lattice_db::setup_ipc_if_configured() {
         const auto slash=config.path.find_last_of('/');
         settings.log_label=settings.sync_id+"@"+(slash==std::string::npos ? config.path : config.path.substr(slash+1));
         settings.all_active_sync_ids=all_ids;settings.is_observer=config.sync_is_observer;
+        settings.uploads_enabled=config.uploads_enabled;
         settings.owner_active=resources->active;
         settings.sync_filter=target.sync_filter;settings.narrowing_emits_removals=target.narrowing_emits_removals;
         config.tuning.apply(settings);

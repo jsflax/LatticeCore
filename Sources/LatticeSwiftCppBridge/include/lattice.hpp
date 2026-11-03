@@ -496,6 +496,10 @@ struct swift_configuration : public configuration {
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
 
+    void set_certificate_pin(const std::string& fingerprint) { pinned_server_certificate_sha256 = fingerprint; }
+
+    void set_uploads_enabled(bool enabled) { uploads_enabled = enabled; }
+
     void set_sync_filter(const SyncFilterVector& filter) {
         sync_filter = std::vector<sync_filter_entry>(filter.begin(), filter.end());
     }
@@ -3230,6 +3234,7 @@ namespace detail {
     inline std::string connection_fingerprint(const configuration& config) {
         std::string fp = config.read_only ? "R" : "W";
         fp += config.sync_is_observer ? 'O' : 'P';
+        fp += config.uploads_enabled ? 'U' : 'D';
         fp += config.sync_autostart ? 'A' : 'D';
         fp += config.background_sync_managed ? 'M' : 'U';
         fp += std::to_string(config.required_existing_schema_version); fp += '|';
@@ -3237,6 +3242,7 @@ namespace detail {
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         fp += std::to_string(static_cast<int>(config.sync_authentication_mode)); fp += '|';
         append_cache_string(fp, config.authorization_token);
+        append_cache_string(fp, config.pinned_server_certificate_sha256);
         append_cache_filter(fp, config.sync_filter);
         return fp;
     }

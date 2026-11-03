@@ -501,6 +501,13 @@ struct configuration {
     /// Authorization token for sync. Required in the default bearer-token mode.
     std::string authorization_token;
 
+    /// Optional lowercase SHA-256 of the TLS leaf certificate DER.
+    /// Nonempty pins require a WSS transport that explicitly enforces them.
+    std::string pinned_server_certificate_sha256;
+
+    /// Suppress sync data uploads without disabling downloads or their ACKs.
+    bool uploads_enabled = true;
+
     /// Defer WSS ownership, sync repair and transport creation until connect_sync().
     /// Local schema/integrity initialization and configured IPC remain unchanged.
     bool sync_autostart = true;

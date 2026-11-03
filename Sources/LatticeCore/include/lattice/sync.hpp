@@ -329,6 +329,8 @@ struct sync_config {
 
     std::string websocket_url;
     std::string authorization_token;
+    std::string pinned_server_certificate_sha256;
+    bool uploads_enabled = true;
     int max_reconnect_attempts = 0;  // 0 = unlimited
     double base_delay_seconds = 1.0;
     double max_delay_seconds = 60.0;

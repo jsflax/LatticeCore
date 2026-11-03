@@ -4476,3 +4476,144 @@ TEST(SyncPolicyAdmission, RequestAfterReservationReturnsDuringEnqueueAndRejectsE
     });
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class upload_suppression_probe final : public lattice::synchronizer {
+public:
+    using lattice::synchronizer::synchronizer;
+    using lattice::synchronizer::send_entries;
+    using lattice::synchronizer::reconcile_sync_filter;
+    using lattice::synchronizer::upload_pending_changes;
+};
+}
+
+TEST(SyncUploadsDisabled, LocalWritesAndFilterChangesStayLocalWhileDownloadsAreAcknowledged) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"downloadonly"}; auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        auto* owned=db.get(); db->add(TestPerson{"local",1,std::nullopt});
+        auto cfg=outbox_config("wss:downloadonly"); cfg.uploads_enabled=false;
+        upload_suppression_probe sync(std::move(db),cfg); sync.connect();
+        auto* transport=factory->last_websocket(); ASSERT_NE(transport,nullptr);
+        auto pending=lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id); ASSERT_EQ(pending.size(),1u);
+        sync.send_entries(pending); sync.reconcile_sync_filter(); sync.upload_pending_changes();
+        sync.update_sync_filter({}); sync.clear_sync_filter();
+        owned->add(TestPerson{"later-local",2,std::nullopt}); sync.upload_pending_changes();
+        EXPECT_TRUE(outbox_sent(*transport).empty());
+        EXPECT_TRUE(lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id).empty());
+        EXPECT_EQ(lattice::read_upload_floor(owned->db(),cfg.sync_id),0);
+        EXPECT_EQ(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).size(),2u);
+
+        TempDB remote_file{"downloadsource"}; lattice::lattice_db remote{lattice::configuration(remote_file.str())};
+        remote.add(TestPerson{"downloaded",3,std::nullopt});
+        const auto incoming=lattice::query_audit_log(remote.db()); ASSERT_EQ(incoming.size(),1u);
+        transport->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_audit_log(incoming).to_json()));
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM TestPerson WHERE name='downloaded'"),1);
+        bool acknowledged=false;
+        for(const auto& message:transport->get_sent_messages()) {
+            const auto event=lattice::server_sent_event::from_json(message.as_string());
+            if(event && event->event_type==lattice::server_sent_event::type::ack)
+                acknowledged |= std::find(event->acked_ids.begin(),event->acked_ids.end(),incoming[0].global_id)!=event->acked_ids.end();
+        }
+        EXPECT_TRUE(acknowledged); EXPECT_TRUE(outbox_sent(*transport).empty());
+        sync.disconnect(); sync.connect();
+        EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
+    });
+}
+
+TEST(SyncUploadsDisabled, RetainedDeliverySurvivesDownloadOnlyReopenAndResumesExactIdentity) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"retaineddownload"}; auto cfg=outbox_config("wss:retaineddownload");
+        lattice::lattice_db observer{lattice::configuration(tmp.str())};
+        observer.add(TestPerson{"pending",1,std::nullopt});
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+            lattice::synchronizer sync(std::move(db),cfg); sync.connect();
+        }
+        ASSERT_TRUE(outbox_wait_quiescent(observer,cfg.sync_id));
+        const auto original=lattice::detail::read_sync_outbox(observer.db(),cfg.sync_id);
+        ASSERT_EQ(original.size(),1u);
+        const auto floor=lattice::read_upload_floor(observer.db(),cfg.sync_id);
+        const auto sources=observer.db().query("SELECT id,globalId,isSynchronized FROM AuditLog ORDER BY id");
+        const auto states=observer.db().query("SELECT * FROM _lattice_sync_state ORDER BY sync_id,audit_entry_id");
+        const auto expect_retained=[&] {
+            const auto retained=lattice::detail::read_sync_outbox(observer.db(),cfg.sync_id);
+            ASSERT_EQ(retained.size(),1u);
+            EXPECT_EQ(retained[0].receipt_id,original[0].receipt_id);
+            EXPECT_EQ(retained[0].source_id,original[0].source_id);
+            EXPECT_EQ(retained[0].source_global_id,original[0].source_global_id);
+            EXPECT_EQ(retained[0].wire.global_id,original[0].wire.global_id);
+            EXPECT_EQ(retained[0].wire_json,original[0].wire_json);
+            EXPECT_EQ(retained[0].routing_key,original[0].routing_key);
+            EXPECT_EQ(retained[0].membership,original[0].membership);
+            EXPECT_EQ(retained[0].charge,original[0].charge);
+            EXPECT_EQ(retained[0].legacy_receipt,original[0].legacy_receipt);
+            EXPECT_EQ(lattice::read_upload_floor(observer.db(),cfg.sync_id),floor);
+            EXPECT_EQ(observer.db().query("SELECT id,globalId,isSynchronized FROM AuditLog ORDER BY id"),sources);
+            EXPECT_EQ(observer.db().query("SELECT * FROM _lattice_sync_state ORDER BY sync_id,audit_entry_id"),states);
+        };
+        cfg.uploads_enabled=false;
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+            upload_suppression_probe sync(std::move(db),cfg); sync.connect(); auto* transport=factory->last_websocket();
+            int completed=0;
+            sync.set_on_sync_complete([&](const auto&) {++completed;});
+            sync.update_sync_filter({{"TestPerson",std::string("age > 100")}});
+            // No ACK under the narrowed policy may cancel the old delivery or
+            // resolve an unattempted source, including a late exact receipt.
+            outbox_ack(*transport,{}); expect_retained();
+            outbox_ack(*transport,{"ffffffff-ffff-4fff-8fff-ffffffffffff"}); expect_retained();
+            outbox_ack(*transport,{original[0].source_global_id}); expect_retained();
+            outbox_ack(*transport,{original[0].wire.global_id}); expect_retained();
+            EXPECT_EQ(completed,0);
+            sync.reconcile_sync_filter(); sync.upload_pending_changes();
+            transport->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_replay_request().to_json()));
+            expect_retained(); sync.clear_sync_filter(); expect_retained();
+            EXPECT_TRUE(outbox_sent(*transport).empty());
+            sync.set_on_sync_complete({});
+        }
+        ASSERT_TRUE(outbox_wait_quiescent(observer,cfg.sync_id));
+        cfg.finite_cycle=true;
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+            lattice::synchronizer sync(std::move(db),cfg); sync.connect(); auto* transport=factory->last_websocket();
+            using phase=lattice::synchronizer_base::finite_cycle_phase;
+            EXPECT_EQ(sync.get_finite_cycle_status().phase,phase::running); expect_retained();
+            transport->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_catch_up_complete().to_json()));
+            EXPECT_EQ(sync.get_finite_cycle_status().phase,phase::work_complete); expect_retained();
+            EXPECT_TRUE(outbox_sent(*transport).empty());
+        }
+        ASSERT_TRUE(outbox_wait_quiescent(observer,cfg.sync_id));
+        cfg.uploads_enabled=true; cfg.finite_cycle=false;
+        auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        lattice::synchronizer resumed(std::move(db),cfg); resumed.connect();
+        const auto sent=outbox_sent(*factory->last_websocket()); ASSERT_FALSE(sent.empty());
+        EXPECT_EQ(sent[0].global_id,original[0].wire.global_id);
+        EXPECT_EQ(sent[0].to_json(),original[0].wire_json);
+    });
+}
+
+TEST(SyncUploadsDisabled, FiniteDownloadWaitsForCatchUpWithoutResolvingPendingUpload) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"finitedownload"}; auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        auto* owned=db.get(); db->add(TestPerson{"still-local",1,std::nullopt});
+        auto cfg=outbox_config("wss:finitedownload"); cfg.uploads_enabled=false; cfg.finite_cycle=true;
+        lattice::synchronizer sync(std::move(db),cfg); sync.connect(); auto* transport=factory->last_websocket();
+        using phase=lattice::synchronizer_base::finite_cycle_phase;
+        EXPECT_EQ(sync.get_finite_cycle_status().phase,phase::running);
+        transport->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_catch_up_complete().to_json()));
+        EXPECT_EQ(sync.get_finite_cycle_status().phase,phase::work_complete);
+        EXPECT_TRUE(outbox_sent(*transport).empty());
+        EXPECT_EQ(lattice::read_upload_floor(owned->db(),cfg.sync_id),0);
+        EXPECT_EQ(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).size(),1u);
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+    });
+}
+#endif

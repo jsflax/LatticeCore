@@ -1237,19 +1237,21 @@ void synchronizer_base::complete_finite_cycle_if_drained() {
     if (!config_.finite_cycle || !is_connected_) return;
     const auto status = get_finite_cycle_status();
     if (status.phase != finite_cycle_phase::running || !status.horizon_captured ||
-        !status.catch_up_received || reconciliation_pending_) return;
+        !status.catch_up_received || (config_.uploads_enabled && reconciliation_pending_)) return;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         if (!in_flight_ids_.empty()) return;
     }
     // In-flight progress alone is insufficient: the next upload window can
     // still be queued, and outbox sources may already have been compacted.
-    if (!db().db().query("SELECT 1 FROM _lattice_sync_outbox WHERE sync_id=? LIMIT 1",
-                        {config_.sync_id}).empty()) return;
-    const int64_t floor = config_.use_upload_floor
-        ? read_upload_floor(db().db(), config_.sync_id) : 0;
-    if (!query_audit_log_for_sync(db().db(), config_.sync_id, config_.sync_filter,
-                                 floor, 1, status.upload_horizon).empty()) return;
+    if (config_.uploads_enabled) {
+        if (!db().db().query("SELECT 1 FROM _lattice_sync_outbox WHERE sync_id=? LIMIT 1",
+                            {config_.sync_id}).empty()) return;
+        const int64_t floor = config_.use_upload_floor
+            ? read_upload_floor(db().db(), config_.sync_id) : 0;
+        if (!query_audit_log_for_sync(db().db(), config_.sync_id, config_.sync_filter,
+                                     floor, 1, status.upload_horizon).empty()) return;
+    }
     std::lock_guard<std::mutex> lock(finite_cycle_mutex_);
     if (finite_cycle_status_.phase == finite_cycle_phase::running &&
         finite_cycle_status_.connection_generation == status.connection_generation &&
@@ -1278,6 +1280,15 @@ void synchronizer_base::connect() {
         throw std::invalid_argument("finite sync requires a WSS endpoint");
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
+    // Admit the pin before either the WSS or injected/IPC connect branch. A
+    // nonempty pin must never be silently discarded by an unsupported transport.
+    if ((!config_.pinned_server_certificate_sha256.empty() &&
+         config_.websocket_url.compare(0, 6, "wss://") != 0) ||
+        !ws_client_->configure_certificate_pin(config_.pinned_server_certificate_sha256)) {
+        should_reconnect_ = false;
+        on_websocket_error("This transport cannot enforce the configured server certificate pin.");
+        return;
+    }
     if (config_.websocket_url.empty()) {
         // IPC or injected transport — connect without URL/headers.
         // Dialer-side IPC clients auto-reconnect with backoff (they redial
@@ -1613,6 +1624,11 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             invoke_on_scheduler([this, generation, ids = std::move(ids)] {
                 if (is_destroyed_ || connection_generation_ != generation ||
                     !finite_cycle_accepts_work(generation)) return;
+                // A download-only owner makes no upload attempts. Even a late
+                // exact receipt stays pending for the next enabled owner; an
+                // unsolicited ACK must not cancel receipts, settle sources or
+                // report upload completion. ACKs we send for downloads are separate.
+                if (!config_.uploads_enabled) return;
                 try {
                     mark_as_synced(ids);
                     complete_finite_cycle_if_drained();
@@ -1661,6 +1677,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     fail_finite_cycle(finite_cycle_failure::invalid_frame, generation);
                     return;
                 }
+                if (!config_.uploads_enabled) return; // Preserve any old outbound receipt.
                 if (!config_.sync_filter) {
                     LOG_INFO("synchronizer", "[%s] replay request ignored (no sync filter on this side)",
                              log_id());
@@ -1977,6 +1994,7 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
         }
         config_.sync_filter = std::move(filter);
         applied_filter_version_ = version;
+        if (!config_.uploads_enabled) return;
         reconciliation_pending_=true;
         refresh_delivery_outbox();
         cancel_disallowed_deliveries();
@@ -2034,6 +2052,7 @@ void synchronizer_base::clear_sync_filter() {
         config_.sync_filter = std::nullopt; // widening, never authority revocation
         reconciliation_pending_=false;
         applied_filter_version_ = version;
+        if (!config_.uploads_enabled) return;
         refresh_delivery_outbox();
         cancel_disallowed_deliveries();
         // Retain uncertain predecessors until ACK even after widening. Their exact replay must
@@ -2048,6 +2067,7 @@ void synchronizer_base::clear_sync_filter() {
 // ============================================================================
 
 void synchronizer_base::reconcile_sync_filter() {
+    if (!config_.uploads_enabled) return;
     if(!is_connected_ || !config_.sync_filter ||
        filter_version_.load(std::memory_order_acquire)!=applied_filter_version_) return;
     const auto quote=[](const std::string& value) {
@@ -2718,6 +2738,7 @@ void synchronizer_base::resend_delivery_outbox() {
 
 void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries,
         const std::unordered_map<std::string, detail::sync_delivery>* admissions) {
+    if (!config_.uploads_enabled) return;
     if (!finite_cycle_accepts_work(connection_generation_.load())) return;
     if (entries.empty()) return;
 
@@ -2909,6 +2930,17 @@ void synchronizer_base::upload_pending_changes() {
         if (!finite_cycle_ready_) return;
     }
     try {
+        if (!config_.uploads_enabled) {
+            // A finite download-only cycle still waits for catch-up, but must not
+            // enumerate, resolve or resend retained outbound work to finish.
+            if (config_.finite_cycle) {
+                std::lock_guard<std::mutex> lock(finite_cycle_mutex_);
+                finite_cycle_status_.horizon_captured = true;
+                finite_cycle_status_.upload_horizon = 0;
+            }
+            complete_finite_cycle_if_drained();
+            return;
+        }
         upload_pending_changes_impl();
         complete_finite_cycle_if_drained();
     } catch (...) {

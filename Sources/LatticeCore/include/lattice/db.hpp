@@ -14,6 +14,8 @@ namespace lattice {
 class lattice_db;
 namespace detail { bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&); }
 
+struct audit_log_entry;
+
 /// Default statement-level busy timeout. Headless/server processes tolerate long
 /// waits; interactive apps should pass a smaller value (e.g. 5000) via
 /// configuration::busy_timeout_ms so a stuck writer can't hang the UI thread.
@@ -25,6 +27,10 @@ public:
 };
 
 class database {
+    // Selected audit capture spans bounded reads on one snapshot and must not
+    // deliver previously sealed observers until its outer statement unlocks.
+    friend std::vector<audit_log_entry> query_audit_log_selected(database&,
+        const std::vector<std::pair<int64_t, std::string>>&, size_t);
     friend class lattice_db;
     friend class synchronizer_base;
     friend struct detached_read_access;

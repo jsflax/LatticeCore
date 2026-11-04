@@ -696,6 +696,7 @@ TEST(ManagedBackgroundSync, ChangedDialURLReplaysOriginalIdentityReceiptAndCurso
     const std::string original_id = "wss:" + original_url;
     const std::string unused_id = "wss:" + updated_url;
     auto original = fixture.config(); original.websocket_url = original_url;
+    original.sync_filter = std::vector<lattice::sync_filter_entry>{{"TestPerson", "age = 41"}};
     EXPECT_TRUE(original.websocket_sync_identity.empty());
     EXPECT_EQ(original.effective_websocket_sync_identity(), original_url);
     auto first = std::make_unique<lattice::lattice_db>(original);
@@ -731,6 +732,7 @@ TEST(ManagedBackgroundSync, ChangedDialURLReplaysOriginalIdentityReceiptAndCurso
     ASSERT_TRUE(fixture.lock_available());
 
     auto updated = fixture.config(); updated.websocket_url = updated_url;
+    updated.sync_filter = original.sync_filter;
     updated.websocket_sync_identity = original_url;
     EXPECT_EQ(updated.effective_websocket_sync_identity(), original_url);
     lattice::lattice_db next(updated);

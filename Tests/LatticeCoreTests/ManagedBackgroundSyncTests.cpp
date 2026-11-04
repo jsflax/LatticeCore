@@ -15,6 +15,12 @@ struct background_sync_lifecycle_test_access {
     static bool parent_suspended(lattice_db& db) { return db.background_sync_suspended_.load(); }
     static void notify(lattice_db& db) { db.handle_cross_process_notification(); }
     static auto xproc_connection(lattice_db& db) { return db.borrow_xproc_read_connection(); }
+    static bool reserve_identity_key(const configuration& cfg) {
+        return lattice_db::try_register_sync_key(cfg.path, cfg.effective_websocket_sync_identity());
+    }
+    static void release_identity_key(const configuration& cfg) {
+        lattice_db::unregister_sync_key(cfg.path, cfg.effective_websocket_sync_identity());
+    }
 };
 }
 namespace {
@@ -638,5 +644,188 @@ TEST(ManagedBackgroundSync, SuspensionCancelsActualRetentionTickWithoutTouchingF
     foreign.rollback();
     EXPECT_TRUE(local.db().query("SELECT value FROM _lattice_meta WHERE key='foreign-retention-lock'").empty());
     EXPECT_NO_THROW(local.add(TestPerson{"app writer after retention cancellation", 7, std::nullopt}));
+}
+namespace {
+class identity_transport : public lattice::mock_sync_transport {
+    mutable std::mutex observation_mutex_;
+    std::string target_;
+public:
+    void connect(const std::string& target,
+                 const std::map<std::string, std::string>& headers = {}) override {
+        { std::lock_guard<std::mutex> lock(observation_mutex_); target_ = target; }
+        lattice::mock_sync_transport::connect(target, headers);
+    }
+    std::string target() const {
+        std::lock_guard<std::mutex> lock(observation_mutex_); return target_;
+    }
+};
+class identity_network : public lattice::mock_network_factory {
+    mutable std::mutex observation_mutex_;
+    identity_transport* latest_ = nullptr;
+    size_t count_ = 0;
+public:
+    std::unique_ptr<lattice::sync_transport> create_sync_transport() override {
+        auto value = std::make_unique<identity_transport>();
+        { std::lock_guard<std::mutex> lock(observation_mutex_); latest_ = value.get(); ++count_; }
+        return value;
+    }
+    identity_transport* latest() const {
+        std::lock_guard<std::mutex> lock(observation_mutex_); return latest_;
+    }
+    size_t count() const {
+        std::lock_guard<std::mutex> lock(observation_mutex_); return count_;
+    }
+};
+std::vector<lattice::audit_log_entry> identity_uploads(identity_transport& wire) {
+    std::vector<lattice::audit_log_entry> result;
+    for (const auto& message : wire.get_sent_messages()) {
+        const auto event = lattice::server_sent_event::from_json(message.as_string());
+        if (event && event->event_type == lattice::server_sent_event::type::audit_log)
+            result.insert(result.end(), event->audit_logs.begin(), event->audit_logs.end());
+    }
+    return result;
+}
+}
+
+TEST(ManagedBackgroundSync, ChangedDialURLReplaysOriginalIdentityReceiptAndCursor) {
+    managed_fixture fixture;
+    auto network = std::make_shared<identity_network>();
+    lattice::set_network_factory(network);
+    const std::string original_url = "ws://fixture.invalid/sync?schema=5";
+    const std::string updated_url = "ws://fixture.invalid/sync?schema=6";
+    const std::string original_id = "wss:" + original_url;
+    const std::string unused_id = "wss:" + updated_url;
+    auto original = fixture.config(); original.websocket_url = original_url;
+    EXPECT_TRUE(original.websocket_sync_identity.empty());
+    EXPECT_EQ(original.effective_websocket_sync_identity(), original_url);
+    auto first = std::make_unique<lattice::lattice_db>(original);
+    first->add(TestPerson{"uncertain local delivery", 41, std::nullopt});
+    const auto first_run = first->resume_background_sync({}, true);
+    ASSERT_EQ(first_run.admission, admission::started);
+    auto* first_wire = network->latest(); ASSERT_NE(first_wire, nullptr);
+    ASSERT_TRUE(await_condition([&] { return identity_uploads(*first_wire).size() == 1; }));
+    const auto sent = identity_uploads(*first_wire).front();
+
+    // Receive through the real transport handler so the old cursor is written by normal apply.
+    lattice::audit_log_entry remote;
+    remote.global_id = "remote-cursor-before-schema-change";
+    remote.global_row_id = "remote-row-before-schema-change";
+    remote.table_name = "TestPerson"; remote.operation = "INSERT";
+    remote.timestamp = "2026-11-01 00:00:00";
+    remote.changed_fields = {{"name", lattice::any_property("remote")},
+                             {"age", lattice::any_property(int64_t(7))}};
+    remote.changed_fields_names = {"name", "age"};
+    first_wire->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_audit_log({remote}).to_json()));
+    ASSERT_TRUE(await_condition([&] {
+        auto rows = first->db().query("SELECT last_received_event_id FROM _lattice_replication_slots WHERE sync_id=?", {original_id});
+        return rows.size() == 1 && rows.front().at("last_received_event_id") == lattice::column_value_t(remote.global_id);
+    }));
+    const auto retained = first->db().query("SELECT * FROM _lattice_sync_outbox WHERE sync_id=?", {original_id});
+    ASSERT_EQ(retained.size(), 1u);
+    EXPECT_EQ(retained.front().at("wire_global_id"), lattice::column_value_t(sent.global_id));
+    // The local upload was sent, but never ACKed. Cancel/join must retain that exact obligation.
+    ASSERT_TRUE(first->suspend_background_sync(first_run.generation));
+    EXPECT_EQ(first->db().query("SELECT * FROM _lattice_sync_outbox WHERE sync_id=?", {original_id}), retained);
+    first.reset();
+    ASSERT_TRUE(fixture.lock_available());
+
+    auto updated = fixture.config(); updated.websocket_url = updated_url;
+    updated.websocket_sync_identity = original_url;
+    EXPECT_EQ(updated.effective_websocket_sync_identity(), original_url);
+    lattice::lattice_db next(updated);
+    EXPECT_EQ(next.db().query("SELECT * FROM _lattice_sync_outbox WHERE sync_id=?", {original_id}), retained);
+    const auto second_run = next.resume_background_sync({}, true);
+    ASSERT_EQ(second_run.admission, admission::started);
+    auto* second_wire = network->latest(); ASSERT_NE(second_wire, nullptr);
+    ASSERT_EQ(network->count(), 2u);
+    ASSERT_TRUE(await_condition([&] { return identity_uploads(*second_wire).size() == 1; }));
+    const auto target = second_wire->target();
+    EXPECT_EQ(target.find(updated_url), 0u);
+    EXPECT_EQ(target.find("schema=5"), std::string::npos);
+    EXPECT_NE(target.find("last-event-id=" + remote.global_id), std::string::npos);
+    EXPECT_EQ(identity_uploads(*second_wire).front().to_json(), sent.to_json());
+    EXPECT_EQ(next.db().query("SELECT * FROM _lattice_sync_outbox WHERE sync_id=?", {original_id}), retained);
+    for (const auto* table : {"_lattice_sync_outbox", "_lattice_sync_state", "_lattice_sync_set", "_lattice_replication_slots"}) {
+        EXPECT_TRUE(next.db().query(std::string("SELECT 1 FROM ") + table + " WHERE sync_id=?", {unused_id}).empty());
+    }
+    EXPECT_EQ(next.db().query("SELECT 1 FROM TestPerson").size(), 2u);
+    second_wire->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_ack({sent.global_id}).to_json()));
+    ASSERT_TRUE(await_condition([&] {
+        return next.db().query("SELECT 1 FROM _lattice_sync_outbox WHERE sync_id=?", {original_id}).empty();
+    }));
+    const auto final_cursor = next.db().query("SELECT last_received_event_id FROM _lattice_replication_slots WHERE sync_id=?", {original_id});
+    ASSERT_EQ(final_cursor.size(), 1u);
+    EXPECT_EQ(final_cursor.front().at("last_received_event_id"), lattice::column_value_t(remote.global_id));
+    EXPECT_TRUE(next.db().query("SELECT 1 FROM _lattice_replication_slots WHERE sync_id=?", {unused_id}).empty());
+    EXPECT_TRUE(next.suspend_background_sync(second_run.generation));
+}
+
+TEST(ManagedBackgroundSync, SameLogicalIdentityDoesNotEvictOwnerOrReserveASecondKey) {
+    managed_fixture fixture;
+    auto network = std::make_shared<identity_network>();
+    lattice::set_network_factory(network);
+    auto original = fixture.config(false);
+    original.websocket_url = "ws://fixture.invalid/sync?schema=5";
+    auto first = std::make_unique<lattice::lattice_db>(original);
+    ASSERT_TRUE(first->is_sync_agent());
+    auto* first_wire = network->latest(); ASSERT_NE(first_wire, nullptr);
+    ASSERT_TRUE(await_condition([&] { return first_wire->state() == lattice::transport_state::open; }));
+    // Preserve the old same-dial no-kick behavior even with a distinct explicit peer.
+    {
+        auto distinct = original;
+        distinct.websocket_sync_identity = "ws://fixture.invalid/distinct-logical-peer";
+        lattice::lattice_db same_dial(distinct);
+        ASSERT_TRUE(first->is_sync_agent());
+        EXPECT_FALSE(same_dial.is_sync_agent());
+        ASSERT_EQ(network->count(), 1u);
+        EXPECT_EQ(first_wire->state(), lattice::transport_state::open);
+    }
+    auto updated = fixture.config(false);
+    updated.websocket_url = "ws://fixture.invalid/sync?schema=6";
+    updated.websocket_sync_identity = original.websocket_url;
+    // Direct reservation checks the actual setup key independently of native flock admission.
+    const bool duplicate_key = lattice::background_sync_lifecycle_test_access::reserve_identity_key(updated);
+    if (duplicate_key) lattice::background_sync_lifecycle_test_access::release_identity_key(updated);
+    EXPECT_FALSE(duplicate_key);
+    lattice::lattice_db dormant(updated);
+    ASSERT_TRUE(first->is_sync_agent());
+    EXPECT_FALSE(dormant.is_sync_agent());
+    ASSERT_EQ(network->count(), 1u);
+    EXPECT_EQ(first_wire->state(), lattice::transport_state::open);
+    first.reset();
+    dormant.connect_sync();
+    ASSERT_TRUE(dormant.is_sync_agent());
+    auto* next_wire = network->latest(); ASSERT_NE(next_wire, nullptr);
+    ASSERT_TRUE(await_condition([&] { return next_wire->state() == lattice::transport_state::open; }));
+    EXPECT_EQ(next_wire->target().find(updated.websocket_url), 0u);
+    EXPECT_EQ(network->count(), 2u);
+    EXPECT_TRUE(dormant.db().query("SELECT 1 FROM _lattice_replication_slots WHERE sync_id=?",
+        {"wss:" + updated.websocket_url}).empty());
+}
+
+TEST(ManagedBackgroundSync, InvalidIdentityIsRejectedBeforeOpenAndExactBoundaryIsAccepted) {
+    managed_fixture fixture;
+    auto cfg = fixture.config();
+    ASSERT_FALSE(std::filesystem::exists(fixture.file.path));
+    cfg.websocket_sync_identity = std::string(4093, 'x');
+    EXPECT_THROW({ lattice::lattice_db invalid(cfg); }, lattice::db_error);
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.path));
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.str() + "-wal"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.str() + "-shm"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.str() + ".sync.lock"));
+    cfg.websocket_sync_identity = std::string("old\0peer", 8);
+    EXPECT_THROW({ lattice::lattice_db invalid(cfg); }, lattice::db_error);
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.path));
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.str() + "-wal"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.str() + "-shm"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.file.str() + ".sync.lock"));
+    cfg.websocket_sync_identity = std::string(4092, 'x');
+    lattice::lattice_db accepted(cfg);
+    EXPECT_EQ(cfg.effective_websocket_sync_identity(), cfg.websocket_sync_identity);
+    EXPECT_TRUE(std::filesystem::exists(fixture.file.path));
+    EXPECT_FALSE(accepted.is_sync_agent());
+    EXPECT_NO_THROW(accepted.add(TestPerson{"identity boundary", 1, std::nullopt}));
 }
 #endif

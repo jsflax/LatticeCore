@@ -498,6 +498,16 @@ struct configuration {
     /// Example: "ws://localhost:8080/sync"
     std::string websocket_url;
 
+    /// Optional stable identity for the same logical WSS peer. Empty preserves the
+    /// endpoint-derived identity. Changing transport negotiation must not strand
+    /// that peer's durable outbox, checkpoints or replication slot. Callers must
+    /// not reuse an identity for a different peer or authorization scope.
+    std::string websocket_sync_identity;
+
+    const std::string& effective_websocket_sync_identity() const noexcept {
+        return websocket_sync_identity.empty() ? websocket_url : websocket_sync_identity;
+    }
+
     /// Authorization token for sync. Required in the default bearer-token mode.
     std::string authorization_token;
 
@@ -6708,6 +6718,11 @@ private:
 
     configuration config_;
     static configuration validate_background_sync_configuration(const configuration& config) {
+        // Validate the new override before constructing any database connection.
+        // The durable channel adds the four-byte "wss:" prefix to this identity.
+        if (config.websocket_sync_identity.size() > 4092 ||
+            config.websocket_sync_identity.find('\0') != std::string::npos)
+            throw db_error("WSS sync identity is oversized or contains an embedded NUL");
         // The SDK's public policy validates a writable WSS owner. Its derived
         // file handles use this same internal local-producer lifecycle without
         // registering a task or constructing another transport.
@@ -6920,7 +6935,7 @@ private:
     // an old-URL sibling and re-hold the flock against that successor.
     void teardown_sync(bool fire_handoff = true, std::optional<std::string> successor_url = std::nullopt);
 
-    // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
+    // Synchronizer registry — at most one owner per {path, effective logical peer identity}.
     static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
     static void unregister_sync_key(const std::string& path, const std::string& ws_url);
 

@@ -496,6 +496,9 @@ struct swift_configuration : public configuration {
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
 
+    void set_websocket_sync_identity(const std::string& identity) { websocket_sync_identity = identity; }
+    std::string get_websocket_sync_identity() const { return websocket_sync_identity; }
+
     void set_certificate_pin(const std::string& fingerprint) { pinned_server_certificate_sha256 = fingerprint; }
 
     // Return an owned value across the Swift boundary, not an inherited-field projection.
@@ -3280,6 +3283,7 @@ namespace detail {
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
         fp += std::to_string(static_cast<int>(config.sync_authentication_mode)); fp += '|';
         append_cache_string(fp, config.authorization_token);
+        append_cache_string(fp, config.websocket_sync_identity);
         append_cache_string(fp, config.pinned_server_certificate_sha256);
         append_cache_filter(fp, config.sync_filter);
         return fp;

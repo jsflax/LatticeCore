@@ -840,7 +840,7 @@ void lattice_db::handle_cross_process_notification() {
 }
 
 // Synchronizer registry — at most one synchronizer per {path, key}
-// Used for both WSS (key = websocket_url) and IPC (key = channel name).
+// Used for WSS (key = effective logical peer identity) and IPC (key = channel name).
 static std::mutex& sync_registry_mutex() {
     // Intentionally leaked: prevents use-after-destroy when destructors
     // run during process teardown (static destruction order is undefined).
@@ -868,7 +868,7 @@ void lattice_db::unregister_sync_key(const std::string& path, const std::string&
 static std::vector<std::string> collect_all_sync_ids(const configuration& config) {
     std::vector<std::string> ids;
     if (config.is_sync_enabled()) {
-        ids.push_back("wss:" + config.websocket_url);
+        ids.push_back("wss:" + config.effective_websocket_sync_identity());
     }
     for (const auto& target : config.ipc_targets) {
         ids.push_back("ipc:" + target.channel);
@@ -1000,9 +1000,9 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     // own the WSS synchronizer for a given path. If the lock is held, we
     // distinguish three cases:
     //   1. Held by another *process* — silent skip (today's behavior).
-    //   2. Held by an in-process sibling on the SAME wssEndpoint — silent
+    //   2. Held by an in-process sibling with the SAME URL or logical identity — silent
     //      skip (legitimate dormant duplicate, e.g. cross-actor cache miss).
-    //   3. Held by an in-process sibling on a DIFFERENT wssEndpoint — this
+    //   3. Held by an in-process sibling with a DIFFERENT URL and logical identity — this
     //      is a URL-change scenario (e.g. peer rejoining after host
     //      republished). Kick the sibling and take over.
     //
@@ -1023,7 +1023,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
 
         if (!try_acquire_lock()) {
             // Try to find a kickable in-process sibling — one that owns
-            // sync (synchronizer_ != nullptr) on a DIFFERENT URL.
+            // sync (synchronizer_ != nullptr) on a DIFFERENT URL and logical peer.
             //
             // The kick must happen INSIDE the registry callback so the
             // registry's notify_refcount keeps the victim alive while
@@ -1041,7 +1041,9 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
                         // Managed lifecycles are never evicted by ordinary URL handoff.
                         if (sibling->current_background_sync_generation() != 0) return;
                     }
-                    if (sibling->config_.websocket_url == config_.websocket_url) return;
+                    if (sibling->config_.websocket_url == config_.websocket_url ||
+                        sibling->config_.effective_websocket_sync_identity() ==
+                        config_.effective_websocket_sync_identity()) return;
                     LOG_INFO("lattice_db",
                              "kicking sibling=%p (URL=%s) for URL change to %s",
                              (void*)sibling, sibling->config_.websocket_url.c_str(),
@@ -1057,8 +1059,8 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     }
 #endif
 
-    // Only one synchronizer per {path, websocket_url} across all instances
-    if (!try_register_sync_key(config_.path, config_.websocket_url)) {
+    // One synchronizer per durable peer, including platforms without the file lock.
+    if (!try_register_sync_key(config_.path, config_.effective_websocket_sync_identity())) {
         LOG_DEBUG("lattice_db", "Synchronizer already active for this path, skipping");
 #ifndef __EMSCRIPTEN__
         if (sync_lock_fd_ >= 0) {
@@ -1091,7 +1093,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
 
     // Always use per-synchronizer sync state
     auto all_ids = collect_all_sync_ids(config_);
-    sync_cfg.sync_id = "wss:" + config_.websocket_url;
+    sync_cfg.sync_id = "wss:" + config_.effective_websocket_sync_identity();
     {
         // Log-only identity (see sync_config::log_label).
         const auto slash = config_.path.find_last_of('/');
@@ -1237,7 +1239,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
             sync_lifecycle_->cv.wait(lock, [&] { return sync_lifecycle_->borrowers == 0; });
         }
         synchronizer_.reset();
-        unregister_sync_key(config_.path, config_.websocket_url);
+        unregister_sync_key(config_.path, config_.effective_websocket_sync_identity());
 #ifndef __EMSCRIPTEN__
         if (sync_lock_fd_ >= 0) {
             ::flock(sync_lock_fd_, LOCK_UN); ::close(sync_lock_fd_); sync_lock_fd_ = -1;
@@ -1425,6 +1427,7 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff, std::optional<std::s
     const int lock_fd = std::exchange(sync_lock_fd_, -1);
     const auto path = config_.path;
     const auto url = config_.websocket_url;
+    const auto registry_key = config_.effective_websocket_sync_identity();
     const auto next_url = successor_url.value_or(url);
     const auto notify_successor = [state, path, next_url, handoff, generation] {
         if (!handoff || generation) return;
@@ -1441,7 +1444,7 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff, std::optional<std::s
             handed_off = bool(current);
         });
     };
-    auto cleanup = [state, owner = std::move(retired), lock_fd, path, url, generation, drain,
+    auto cleanup = [state, owner = std::move(retired), lock_fd, path, registry_key, generation, drain,
                     notify_successor](bool finish_transition) mutable {
         {
             std::unique_lock<std::mutex> lock(state->mutex);
@@ -1451,7 +1454,7 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff, std::optional<std::s
             if (drain) owner->drain(std::chrono::steady_clock::now() + std::chrono::milliseconds(2000));
             if (generation) owner->cancel_finite_cycle();
             owner.reset(); // Fences transport, pacer and queued SQL before releasing ownership.
-            unregister_sync_key(path, url);
+            unregister_sync_key(path, registry_key);
         }
         if (lock_fd >= 0) { ::flock(lock_fd, LOCK_UN); ::close(lock_fd); }
         std::shared_ptr<scheduler> settled_worker;

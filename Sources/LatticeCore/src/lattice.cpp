@@ -3,6 +3,7 @@
 
 #include "lattice/lattice.hpp"
 #include "lattice/ipc.hpp"
+#include <nlohmann/json.hpp>
 #include <cstdlib>
 #include <set>
 #include <unordered_set>
@@ -11,6 +12,202 @@
 #include <unistd.h>
 
 namespace lattice {
+
+namespace {
+constexpr const char* current_history_tables_sql =
+    "SELECT name FROM sqlite_master WHERE type='table' "
+    "AND name NOT LIKE 'sqlite_%' "
+    "AND name NOT IN ('AuditLog', '_SyncControl') "
+    "AND name NOT LIKE '\\_lattice\\_%' ESCAPE '\\' "
+    "AND name NOT LIKE '%_vec0' AND name NOT LIKE '%_rtree%' "
+    "AND name NOT LIKE '%\\_fts' ESCAPE '\\' "
+    "AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' "
+    "AND name NOT LIKE '%\\_old' ESCAPE '\\' ORDER BY name";
+
+std::string history_quote(const std::string& value, char delimiter) {
+    std::string result(1, delimiter);
+    for (char c : value) { result += c; if (c == delimiter) result += c; }
+    return result + delimiter;
+}
+} // namespace
+
+bool lattice_db::has_applied_sync_event(const std::string& global_id) {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("Applied-event lookup requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("Applied-event lookup requires a checked transaction on this thread");
+    if (global_id.empty()) return false;
+    auto& reader = *db_;
+    // Metadata probes choose only constant internal table/column names. The
+    // final single SELECT reads the caller's checked snapshot. In particular,
+    // never inspect a sync writer's uncommitted receipt on another thread.
+    // No DDL, model mutation, receipt insertion, or cursor update occurs here.
+    std::string sql = "SELECT 1 FROM AuditLog WHERE globalId = ?1";
+    const bool receipts_exist = !reader.query(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_lattice_applied_receipts'").empty();
+    if (receipts_exist) sql +=
+        " UNION ALL SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1";
+
+    // Receipt retention can remove an old receipt. Only equality with an
+    // actually persisted channel cursor is evidence for that exact event.
+    // A newer UUID, timestamp, local audit id, or cursor ordering is not proof.
+    for (const auto& row : reader.query("PRAGMA table_info(_lattice_replication_slots)")) {
+        auto name = row.find("name");
+        if (name != row.end() && std::holds_alternative<std::string>(name->second) &&
+            std::get<std::string>(name->second) == "last_received_event_id") {
+            sql += " UNION ALL SELECT 1 FROM _lattice_replication_slots WHERE last_received_event_id = ?1";
+            break;
+        }
+    }
+    sql += " LIMIT 1";
+    return !reader.query(sql, {global_id}).empty();
+}
+
+std::string lattice_db::current_identity_snapshot() {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("Identity snapshot requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("Identity snapshot requires a checked transaction");
+    auto result = nlohmann::json::object();
+    result["models"] = nlohmann::json::object();
+    result["links"] = nlohmann::json::object();
+    for (const auto& table_row : db_->query(current_history_tables_sql)) {
+        const auto table = std::get<std::string>(table_row.at("name"));
+        const auto identifier = history_quote(table, '"');
+        const auto columns = db_->query("PRAGMA table_info(" + identifier + ")");
+        bool has_id = false, has_global = false, has_lhs = false, has_rhs = false, has_rhs_type = false;
+        for (const auto& column : columns) {
+            const auto& name = std::get<std::string>(column.at("name"));
+            has_id |= name == "id"; has_global |= name == "globalId";
+            has_lhs |= name == "lhs"; has_rhs |= name == "rhs"; has_rhs_type |= name == "rhs_type";
+        }
+        const bool link = has_lhs && has_rhs && has_global && !has_id;
+        if (!link && !(has_id && has_global)) continue;
+        auto identities = nlohmann::json::array();
+        const auto rows = db_->query("SELECT lower(globalId) AS globalId" +
+            std::string(link ? ",lower(lhs) AS lhs,lower(rhs) AS rhs," + std::string(has_rhs_type ? "rhs_type" : "NULL AS rhs_type") : "") +
+            " FROM " + identifier + " ORDER BY globalId COLLATE NOCASE");
+        auto string_value = [](const auto& row, const char* key) -> std::string {
+            auto found = row.find(key);
+            if (found == row.end() || !std::holds_alternative<std::string>(found->second) || std::get<std::string>(found->second).empty())
+                throw std::runtime_error("Invalid row identity in bootstrap snapshot");
+            return std::get<std::string>(found->second);
+        };
+        for (const auto& row : rows) {
+            const auto global = string_value(row, "globalId");
+            if (link) {
+                auto identity = nlohmann::json::array({global, string_value(row, "lhs"), string_value(row, "rhs")});
+                identity.push_back(has_rhs_type ? nlohmann::json(string_value(row, "rhs_type")) : nlohmann::json(nullptr));
+                identities.push_back(std::move(identity));
+            } else identities.push_back(global);
+        }
+        result[link ? "links" : "models"][table] = std::move(identities);
+    }
+    return result.dump();
+}
+
+int64_t lattice_db::ensure_current_history() {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("History publication requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("History publication requires a checked write transaction");
+
+    // Match generate_history's model/link classification, but never batch-commit
+    // or change sync state: this entire repair belongs to the caller's transaction.
+    const auto tables = db_->query(current_history_tables_sql);
+    // One transient index bounds the per-row baseline lookup. Do not drop an
+    // index owned by a caller, and let rollback remove our DDL on any failure.
+    const bool existing_index = !db_->query(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lattice_current_history_baseline'").empty();
+    if (!existing_index) db_->execute(
+        "CREATE INDEX idx_lattice_current_history_baseline ON AuditLog(tableName,globalRowId,operation)");
+    int64_t count = 0;
+    for (const auto& table_row : tables) {
+        const auto table = std::get<std::string>(table_row.at("name"));
+        const auto identifier = history_quote(table, '"');
+        const auto columns = db_->query("PRAGMA table_info(" + identifier + ")");
+        bool has_id = false, has_global = false, has_lhs = false, has_rhs = false, has_rhs_type = false;
+        for (const auto& column : columns) {
+            const auto& name = std::get<std::string>(column.at("name"));
+            has_id |= name == "id"; has_global |= name == "globalId";
+            has_lhs |= name == "lhs"; has_rhs |= name == "rhs"; has_rhs_type |= name == "rhs_type";
+        }
+        const bool link = has_lhs && has_rhs && has_global && !has_id;
+        if (!link && !(has_id && has_global)) continue;
+
+        std::string fields, names;
+        for (const auto& column : columns) {
+            const auto name = std::get<std::string>(column.at("name"));
+            if (name == "id" || name == "globalId") continue;
+            if (link && name != "lhs" && name != "rhs" && !(has_rhs_type && name == "rhs_type")) continue;
+            const auto value = "t." + history_quote(name, '"');
+            const auto type = std::get<std::string>(column.at("type"));
+            if (!fields.empty()) { fields += ","; names += ","; }
+            names += history_quote(name, '\'');
+            fields += history_quote(name, '\'') + ",";
+            // Same flat payload as live audit triggers. REAL JSON must retain
+            // all bits, and optional BLOBs must remain NULL (hex(NULL) is '').
+            if (type == "BLOB") fields += "CASE WHEN " + value + " IS NULL THEN NULL ELSE hex(" + value + ") END";
+            else if (type == "REAL") fields += "CASE WHEN " + value + " IS NULL THEN NULL ELSE json(printf('%!.17g'," + value + ")) END";
+            else fields += value;
+        }
+        db_->execute(
+            "INSERT INTO AuditLog(tableName,operation,rowId,globalRowId,changedFields,changedFieldsNames,"
+            "timestamp,isFromRemote,isSynchronized,synthesized) "
+            "SELECT ?,'INSERT'," + std::string(link ? "0" : "t.id") + ",t.globalId,json_object(" + fields + "),json_array(" + names + "),"
+            "unixepoch('subsec'),0,0,0 FROM " + identifier + " t WHERE NOT EXISTS ("
+            "SELECT 1 FROM AuditLog a WHERE a.tableName=? AND a.globalRowId=t.globalId AND a.operation='INSERT') "
+            "ORDER BY " + std::string(link ? "t.rowid" : "t.id"), {table, table});
+        count += sqlite3_changes(db_->handle());
+    }
+    if (!existing_index) db_->execute("DROP INDEX idx_lattice_current_history_baseline");
+    return count;
+}
+
+int64_t lattice_db::append_current_snapshots(const std::vector<std::string>& tables, const std::string& snapshot_key) {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("Snapshot publication requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("Snapshot publication requires the owning checked write transaction");
+    if (snapshot_key.empty() || snapshot_key.size() > 256) throw std::runtime_error("Invalid snapshot publication key");
+    const auto key = "authoritative_snapshot:" + snapshot_key;
+    if (!db_->query("SELECT value FROM _lattice_meta WHERE key = ?", {key}).empty()) return 0;
+    int64_t count = 0;
+    std::set<std::string> seen;
+    for (const auto& table : tables) {
+        if (!seen.insert(table).second) continue;
+        if (table.empty() || table.front() == '_' || table == "AuditLog" ||
+            table.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+            throw std::runtime_error("Invalid model snapshot table");
+        for (const auto& row : db_->query("SELECT * FROM \"" + table + "\" ORDER BY id")) {
+            auto id = row.find("id"), global = row.find("globalId");
+            if (id == row.end() || global == row.end() || !std::holds_alternative<int64_t>(id->second) ||
+                !std::holds_alternative<std::string>(global->second)) throw std::runtime_error("Snapshot requires a model table");
+            audit_log_entry entry;
+            for (const auto& [name, value] : row) {
+                if (name == "id" || name == "globalId") continue;
+                entry.changed_fields[name] = any_property::from_column_value(value);
+                entry.changed_fields_names.push_back(name);
+            }
+            // Match live trigger JSON: raw scalars and hex BLOB strings. This
+            // preserves exact numbers without introducing the typed DATA
+            // wire format, whose Swift Codable representation is different.
+            auto typed = nlohmann::json::parse(entry.changed_fields_to_json());
+            auto fields = nlohmann::json::object();
+            for (const auto& item : typed.items()) fields[item.key()] = item.value().at("value");
+            db_->execute("INSERT INTO AuditLog (tableName,operation,rowId,globalRowId,changedFields,changedFieldsNames,timestamp,isFromRemote,isSynchronized,synthesized) VALUES (?,'INSERT',?,?,?,?,unixepoch('subsec'),0,0,0)",
+                {table, std::get<int64_t>(id->second), std::get<std::string>(global->second), fields.dump(), entry.changed_fields_names_to_json()});
+            ++count;
+        }
+    }
+    db_->execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)", {key, std::to_string(count)});
+    return count;
+}
+
 
 namespace {
 bool valid_local_metadata_utf8(const std::string& text) {

@@ -180,6 +180,10 @@ struct server_sent_event {
     static std::optional<server_sent_event> from_json(
         const std::string& json, std::string* error_out);
 
+    /// Strict value shapes for opt-in immutable receive, composed with the
+    /// ordinary parser's complete-frame and control-message checks.
+    static std::optional<server_sent_event> from_json_immutable(const std::string& json);
+
     // Only emitted by a server after the negotiated initial replay.
     static server_sent_event make_catch_up_complete() {
         return {type::catch_up_complete, {}, {}, {}, {}};
@@ -918,6 +922,18 @@ extern std::function<void()> sync_outbox_after_insert;
 // Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.
 // Returns global IDs of successfully applied entries (entries that failed SQL execution are excluded).
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
+
+/// Opt-in append-only model rows: complete INSERT snapshots, identical replays
+/// only. Validation and all entries share the existing owned write transaction.
+/// Empty tables and no authorization preserve ordinary receive semantics.
+std::vector<std::string> apply_remote_changes_immutable(lattice_db& db,
+    const std::vector<audit_log_entry>& entries,
+    const std::vector<std::string>& immutable_tables,
+    const std::function<bool()>& authorize = {});
+
+/// ACK bookkeeping under the same checked authority boundary. No ACK is echoed.
+void mark_audit_entries_synced_authorized(lattice_db& db,
+    const std::vector<std::string>& global_ids, const std::function<bool()>& authorize);
 
 /// Apply remote audit log entries and mark them as synced for the receiving sync_id.
 /// Unlike apply_remote_changes, this uses per-synchronizer sync state so that OTHER

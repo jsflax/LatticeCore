@@ -4398,6 +4398,24 @@ public:
             {seconds});
     }
 
+    /// Append exact authoritative snapshots without removing history. Caller
+    /// must hold a checked write transaction and own these tables' state.
+    int64_t append_current_snapshots(const std::vector<std::string>& tables, const std::string& snapshot_key);
+
+    /// Repair retained history for a new peer of an authoritative database.
+    /// Requires the caller's write transaction. Appends current model and link
+    /// INSERTs only where no INSERT baseline remains; preserves all old events.
+    int64_t ensure_current_history();
+
+    /// Canonical model and relationship identities only, without scalar values
+    /// or audit history. Requires the caller's transaction for a consistent view.
+    std::string current_identity_snapshot();
+
+    /// Exact local event evidence from retained audit/receipt history or an
+    /// equal persisted download cursor. Read-only; requires this thread's
+    /// checked transaction. Does not certify a complete stream or model state.
+    bool has_applied_sync_event(const std::string& global_id);
+
     /// Generate audit log INSERT entries for objects not already in the audit log.
     /// Unlike compact_audit_log, this preserves existing entries and only adds
     /// entries for objects that are missing from the audit log.

@@ -498,6 +498,9 @@ struct swift_configuration : public configuration {
 
     void set_certificate_pin(const std::string& fingerprint) { pinned_server_certificate_sha256 = fingerprint; }
 
+    // Return an owned value across the Swift boundary, not an inherited-field projection.
+    std::string get_certificate_pin() const { return pinned_server_certificate_sha256; }
+
     void set_uploads_enabled(bool enabled) { uploads_enabled = enabled; }
 
     void set_sync_filter(const SyncFilterVector& filter) {
@@ -540,6 +543,11 @@ private:
 };
 
 // Internal implementation - inherits from lattice_db
+struct swift_sync_receive_result {
+    std::vector<std::string> ids;
+    OptionalString error;
+};
+
 class swift_lattice : public lattice_db {
 public:
     // Construct with full configuration (including optional sync)
@@ -3007,6 +3015,36 @@ public:
         }
     }
 
+    /// Caller-local ids/error; no shared last-error race across aliased handles.
+    swift_sync_receive_result receive_sync_data_authorized(const ByteVector& data,
+        const std::vector<std::string>& tables, void* context, bool (*authorize)(void*)) {
+        swift_sync_receive_result result;
+        try {
+            auto event = server_sent_event::from_json_immutable(std::string(data.begin(), data.end()));
+            if (!event) throw std::runtime_error("immutable sync violation: malformed frame");
+            std::function<bool()> checked;
+            if (authorize) checked = [=] { return authorize(context); };
+            if (event->event_type == server_sent_event::type::audit_log) {
+                result.ids = ::lattice::apply_remote_changes_immutable(*this, event->audit_logs, tables, checked);
+            } else if (event->event_type == server_sent_event::type::ack) {
+                ::lattice::mark_audit_entries_synced_authorized(*this, event->acked_ids, checked);
+                // ACK bookkeeping applies no entries; never start ACK-of-ACK ping-pong.
+            } else if (event->event_type == server_sent_event::type::nack) {
+                throw std::runtime_error("Sync upload rejected: " + event->nack_reason);
+            }
+        } catch (const std::exception& error) {
+            result.error = std::string(error.what());
+        } catch (...) {
+            result.error = std::string("unknown immutable sync receive failure");
+        }
+        return result;
+    }
+
+    swift_sync_receive_result receive_sync_data_immutable(const ByteVector& data,
+        const std::vector<std::string>& tables) {
+        return receive_sync_data_authorized(data, tables, nullptr, nullptr);
+    }
+
     /// Returns the error from the last receive_sync_data call, or nullopt if none.
     OptionalString last_receive_error() const { return last_receive_error_; }
 } SWIFT_UNSAFE_REFERENCE;
@@ -3953,6 +3991,19 @@ public:
         SWIFT_NAME(normalizeAuditTimestamps()) {
         return sealed([&] { return impl().normalize_audit_timestamps(); });
     }
+    int64_t append_current_snapshots(const std::vector<std::string>& tables, const std::string& key) const {
+        return sealed([&] { return impl().lattice_db::append_current_snapshots(tables, key); });
+    }
+    int64_t ensure_current_history() const {
+        return sealed([&] { return impl().lattice_db::ensure_current_history(); });
+    }
+    std::string current_identity_snapshot() const {
+        return sealed([&] { return impl().lattice_db::current_identity_snapshot(); });
+    }
+    bool has_applied_sync_event(const std::string& global_id) const {
+        return sealed([&] { return impl().lattice_db::has_applied_sync_event(global_id); });
+    }
+
     int64_t force_compact_audit_log() const {
         return sealed([&] { return impl().force_compact_audit_log(); });
     }
@@ -4115,6 +4166,13 @@ public:
 
     // Sync data ingestion
     std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }
+    swift_sync_receive_result receive_sync_data_immutable(const ByteVector& data, const std::vector<std::string>& tables) const {
+        return impl().receive_sync_data_immutable(data, tables);
+    }
+    swift_sync_receive_result receive_sync_data_authorized(const ByteVector& data, const std::vector<std::string>& tables,
+        void* context, bool (*authorize)(void*)) const {
+        return impl().receive_sync_data_authorized(data, tables, context, authorize);
+    }
     OptionalString last_receive_error() const { return impl().last_receive_error(); }
 
     /// The sealed query surface's error slot (see error.hpp): nullopt if

@@ -756,6 +756,57 @@ std::string server_sent_event::to_json() const {
     return j.dump();
 }
 
+std::optional<server_sent_event> server_sent_event::from_json_immutable(const std::string& text) {
+    try {
+        const auto root = json::parse(text);
+        if (!root.is_object()) return std::nullopt;
+        if (root.contains("auditLog")) {
+            if (!root["auditLog"].is_array()) return std::nullopt;
+            for (const auto& entry : root["auditLog"]) {
+                if (!entry.is_object()) return std::nullopt;
+                for (const auto& field : {"globalId", "globalRowId", "tableName", "operation"}) {
+                    if (!entry.contains(field) || !entry[field].is_string() || entry[field].get<std::string>().empty()) {
+                        return std::nullopt;
+                    }
+                }
+                if (!entry.contains("changedFields") || !entry.contains("changedFieldsNames")) return std::nullopt;
+                auto fields = entry["changedFields"];
+                auto names = entry["changedFieldsNames"];
+                if (fields.is_string()) fields = json::parse(fields.get<std::string>());
+                if (names.is_string()) names = json::parse(names.get<std::string>());
+                if (!fields.is_object() || !names.is_array()) return std::nullopt;
+                // Swift AuditLog stores SQLite UPDATE name lists as [String?]:
+                // unchanged columns are null placeholders. Preserve the ordinary
+                // parser's compacted names without accepting arbitrary nonstrings
+                // or inferring extra writes from the full changedFields dictionary.
+                std::unordered_set<std::string> selected;
+                for (const auto& name : names) {
+                    if (name.is_null() && entry["operation"] == "UPDATE") continue;
+                    if (!name.is_string()) return std::nullopt;
+                    const auto column = name.get<std::string>();
+                    if (column.empty() || !fields.contains(column) || !selected.insert(column).second) return std::nullopt;
+                }
+                if (entry["operation"] == "UPDATE" && selected.empty()) return std::nullopt;
+                for (const auto& [key, value] : fields.items()) {
+                    if (value.is_array()) return std::nullopt;
+                    if (!value.is_object()) continue;
+                    if (!value.contains("kind") || !value["kind"].is_number_integer()) return std::nullopt;
+                    const int kind = value["kind"].get<int>();
+                    if (kind < 0 || kind > 7) return std::nullopt;
+                    if (kind == 4) continue;
+                    if (!value.contains("value")) return std::nullopt;
+                    const auto& v = value["value"];
+                    if ((kind == 2 || kind == 6) ? !v.is_string() : !v.is_number()) return std::nullopt;
+                }
+                if (!audit_log_entry::from_json(entry.dump())) return std::nullopt;
+            }
+        }
+        auto result = from_json(text);
+        if (result && root.contains("auditLog") && result->audit_logs.size() != root["auditLog"].size()) return std::nullopt;
+        return result;
+    } catch (...) { return std::nullopt; }
+}
+
 std::optional<server_sent_event> server_sent_event::from_json(const std::string& json_str) {
     return from_json(json_str, nullptr);
 }
@@ -4443,6 +4494,141 @@ static double wire_timestamp_to_epoch(const std::string& ts) {
     return static_cast<double>(::time(nullptr));
 }
 
+// Immutable policy is deliberately enforced INSIDE the model-write transaction,
+// before audit-id dedup. INSERT uses an upsert in the ordinary protocol, so an
+// operation allowlist alone cannot make a command/event table append-only.
+static std::string immutable_lower(std::string text) {
+    for (auto& c : text) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return text;
+}
+
+static std::string immutable_quote(const std::string& name) {
+    std::string result = "\"";
+    for (char c : name) { result += c; if (c == '"') result += '"'; }
+    return result + "\"";
+}
+
+static json immutable_value(const column_value_t& value) {
+    return std::visit([](const auto& v) -> json {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+            // Distinguish blob bytes from application strings/arrays.
+            return json{{"blob", v}};
+        } else {
+            return json(v);
+        }
+    }, value);
+}
+
+static void enforce_immutable_entry(lattice_db& db, const audit_log_entry& entry,
+                                   const std::unordered_set<std::string>& tables) {
+    const auto table = immutable_lower(entry.table_name);
+    auto fail = [&](const std::string& reason) -> void {
+        throw std::runtime_error("immutable sync violation: " + entry.table_name + "." +
+                                 entry.global_row_id + ": " + reason);
+    };
+    // A payload must not overwrite the policy's own durable receipts (or
+    // forge an AuditLog that a catching-up peer will execute later).
+    if (table.rfind("_lattice_", 0) == 0 || table == "auditlog" || table == "_synccontrol") {
+        fail("internal table write");
+    }
+    auto events = db.db().query(
+        "SELECT tableName, globalRowId FROM _lattice_immutable_events WHERE globalId = ?",
+        {entry.global_id});
+    if (!events.empty() &&
+        (std::get<std::string>(events[0].at("tableName")) != table ||
+         std::get<std::string>(events[0].at("globalRowId")) != entry.global_row_id)) {
+        fail("audit identity was already used for another record");
+    }
+    if (!tables.count(table)) return;
+    if (entry.operation != "INSERT") fail("only complete INSERT snapshots are permitted");
+    if (entry.global_id.empty() || entry.global_row_id.empty()) fail("missing identity");
+    if (table.empty() || table.front() == '_') fail("only model tables are supported");
+
+    const auto schema = db.get_table_schema(entry.table_name);
+    if (schema.empty()) fail("unknown table");
+    std::unordered_set<std::string> names(entry.changed_fields_names.begin(), entry.changed_fields_names.end());
+    if (names.size() != entry.changed_fields_names.size() || names.size() != entry.changed_fields.size()) {
+        fail("field names must match the complete payload without duplicates");
+    }
+    // No skew dropping or absent-field defaults: an immutable record is a
+    // complete snapshot whose meaning cannot change after first acceptance.
+    for (const auto& [name, type] : schema) {
+        if (name == "id" || name == "globalId") continue;
+        if (!names.count(name) || !entry.changed_fields.count(name)) fail("missing field " + name);
+    }
+    for (const auto& name : names) {
+        if (name == "id" || name == "globalId" || !schema.count(name) || !entry.changed_fields.count(name)) {
+            fail("unknown, reserved, or absent field " + name);
+        }
+    }
+
+    // Normalize by SQL representation, not wire order, any_property integer
+    // width, sender row id, timestamp, or synthesized flag. TEXT containing
+    // JSON remains application text; the application owns its canonicalization.
+    json payload = json::object();
+    std::string predicate = "globalId = ?";
+    std::vector<column_value_t> params{entry.global_row_id};
+    for (const auto& name : names) {
+        auto value = entry.changed_fields.at(name).to_column_value();
+        const auto type = schema.at(name);
+        if (type == column_type::blob && std::holds_alternative<std::string>(value)) {
+            const auto hex = std::get<std::string>(value);
+            if (hex.size() % 2 || hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                fail("invalid hex blob " + name);
+            }
+            value = db.db().query("SELECT unhex(?) AS value", {value})[0].at("value");
+        }
+        if (!std::holds_alternative<std::nullptr_t>(value)) {
+            const bool integer = std::holds_alternative<int64_t>(value);
+            const bool real = std::holds_alternative<double>(value);
+            if ((type == column_type::text && !std::holds_alternative<std::string>(value)) ||
+                (type == column_type::blob && !std::holds_alternative<std::vector<uint8_t>>(value)) ||
+                ((type == column_type::integer || type == column_type::real) && !integer && !real)) {
+                fail("field type does not match schema: " + name);
+            }
+            if (real) {
+                const auto number = std::get<double>(value);
+                if (!std::isfinite(number) || (type == column_type::integer &&
+                    (std::trunc(number) != number || number < -9223372036854775808.0 || number >= 9223372036854775808.0))) {
+                    fail("invalid numeric value: " + name);
+                }
+            }
+        }
+        // SQLite numeric affinity makes 1 and 1.0 equal; json comparison
+        // also compares integer/float values numerically.
+        payload[name] = immutable_value(value);
+        predicate += " AND " + immutable_quote(name) + " IS ?";
+        params.push_back(value);
+    }
+    const auto quoted_table = immutable_quote(entry.table_name);
+    auto rows = db.db().query("SELECT 1 FROM " + quoted_table + " WHERE globalId = ?", {entry.global_row_id});
+    if (!rows.empty() && db.db().query("SELECT 1 FROM " + quoted_table + " WHERE " + predicate, params).empty()) {
+        fail("existing record has different content");
+    }
+    auto records = db.db().query(
+        "SELECT payload FROM _lattice_immutable_records WHERE tableName = ? AND globalRowId = ?",
+        {table, entry.global_row_id});
+    if (!records.empty() && json::parse(std::get<std::string>(records[0].at("payload"))) != payload) {
+        fail("record identity was already accepted with different content");
+    }
+    // Do not acknowledge a forged audit-id collision without storing its row.
+    auto audits = db.db().query("SELECT tableName, globalRowId FROM AuditLog WHERE globalId = ?", {entry.global_id});
+    if (!audits.empty() &&
+        (immutable_lower(std::get<std::string>(audits[0].at("tableName"))) != table ||
+         std::get<std::string>(audits[0].at("globalRowId")) != entry.global_row_id)) {
+        fail("audit identity was already used for another record");
+    }
+    if (events.empty() && audits.empty() && !db.db().query(
+            "SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?", {entry.global_id}).empty()) {
+        fail("legacy audit receipt cannot prove immutable identity");
+    }
+    db.db().execute("INSERT OR IGNORE INTO _lattice_immutable_records(tableName, globalRowId, payload) VALUES (?, ?, ?)",
+                    {table, entry.global_row_id, payload.dump()});
+    db.db().execute("INSERT OR IGNORE INTO _lattice_immutable_events(globalId, tableName, globalRowId) VALUES (?, ?, ?)",
+                    {entry.global_id, table, entry.global_row_id});
+}
+
 enum class audit_apply_mode { global, per_sync, pending_import };
 enum class pending_outcome { rejected, imported, already_present };
 
@@ -4453,10 +4639,20 @@ static std::vector<std::string> apply_remote_changes_impl(
     const std::vector<audit_log_entry>& entries,
     audit_apply_mode mode,
     const std::optional<std::string>& receiving_sync_id,
-    std::vector<pending_outcome>* outcomes = nullptr)
+    std::vector<pending_outcome>* outcomes = nullptr,
+    const std::vector<std::string>& immutable_tables = {},
+    const std::function<bool()>& authorize = {})
 {
+    std::unordered_set<std::string> immutable;
+    for (const auto& table : immutable_tables) immutable.insert(immutable_lower(table));
+    const bool atomic_frame = !immutable.empty() || static_cast<bool>(authorize);
     std::vector<std::string> applied_ids;
-    if (entries.empty()) return applied_ids;
+    if (entries.empty()) {
+        if (authorize) sync_apply_transaction_access::run(db, [&] {
+            if (!authorize()) throw std::runtime_error("sync authorization denied: this writer lease is no longer active");
+        });
+        return applied_ids;
+    }
     const bool pending_import = mode == audit_apply_mode::pending_import;
     std::unordered_map<std::string, size_t> pending_counts;
     if (pending_import) {
@@ -4481,6 +4677,7 @@ static std::vector<std::string> apply_remote_changes_impl(
         }
     } applying_flag(db.applying_remote_changes_);
     if (!applying_flag.acquired) {
+        if (atomic_frame) throw std::runtime_error("immutable sync violation: another delivery is applying");
         LOG_WARN("apply_remote", "another delivery is still applying; returning no ACKable entries");
         return applied_ids;
     }
@@ -4497,7 +4694,7 @@ static std::vector<std::string> apply_remote_changes_impl(
     } pending_cursor(db, pending_import);
 
     // Process in chunks to avoid holding the write lock for too long.
-    const size_t chunk_size = 50;
+    const size_t chunk_size = atomic_frame ? entries.size() : 50;
 
     // Durable idempotency receipts for suppressed no-op applies: suppression
     // (below) mints no AuditLog row, which is what the globalId dedup keys
@@ -4511,7 +4708,7 @@ static std::vector<std::string> apply_remote_changes_impl(
     // register_replication_slot, so probe rather than assume.
     bool cursor_column_ok = false;
     try {
-        db.db().execute(
+        if (!atomic_frame) db.db().execute(
             "CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
             "  globalId TEXT PRIMARY KEY)", {});
         if (receiving_sync_id) {
@@ -4526,11 +4723,13 @@ static std::vector<std::string> apply_remote_changes_impl(
             }
         }
     } catch (const std::exception& e) {
+        if (atomic_frame) throw;
         // No apply transaction or entry effects exist yet. Do not roll back
         // an unrelated caller's transaction or ACK an unprocessed entry.
         LOG_WARN("apply_remote", "delivery setup failed (%s); returning no ACKable entries", e.what());
         return applied_ids;
     } catch (...) {
+        if (atomic_frame) throw;
         LOG_WARN("apply_remote", "delivery setup failed (non-std exception); returning no ACKable entries");
         return applied_ids;
     }
@@ -4557,6 +4756,15 @@ static std::vector<std::string> apply_remote_changes_impl(
         try {
             if (test_hooks::apply_chunk_begin) test_hooks::apply_chunk_begin(chunk_start);
             sync_apply_transaction_access::run(db, [&] {
+            if (authorize && !authorize()) throw std::runtime_error("sync authorization denied: this writer lease is no longer active");
+            if (atomic_frame) {
+                db.db().execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts (globalId TEXT PRIMARY KEY)");
+                db.db().execute("CREATE TABLE IF NOT EXISTS _lattice_immutable_records ("
+                    "tableName TEXT NOT NULL, globalRowId TEXT NOT NULL, payload TEXT NOT NULL, "
+                    "PRIMARY KEY(tableName, globalRowId))");
+                db.db().execute("CREATE TABLE IF NOT EXISTS _lattice_immutable_events ("
+                    "globalId TEXT PRIMARY KEY, tableName TEXT NOT NULL, globalRowId TEXT NOT NULL)");
+            }
 
             for (size_t i = chunk_start; i < chunk_end; ++i) {
                 const auto& entry = entries[i];
@@ -4580,9 +4788,11 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // Typed Core callers bypass wire decoding. Reject invalid
                     // envelopes before dedup and schema-skew ACK shortcuts.
                     if (!remote_entry_envelope_valid(entry)) {
+                        if (atomic_frame) throw std::runtime_error("immutable sync violation: invalid entry envelope");
                         LOG_WARN("apply_remote", "invalid entry envelope at position %zu; not ACKing", i);
                         continue;
                     }
+                    if (atomic_frame) enforce_immutable_entry(db, entry, immutable);
                     // Re-check inside transaction (entry may have been inserted
                     // concurrently). A hit in EITHER AuditLog or the receipts
                     // table means already-applied: ack and move on.
@@ -4701,6 +4911,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // via catch-up/reconcile; the schema handshake surfaces
                     // the drift as a visible warning instead of a wedge.
                     if (is_model_table && schema.empty()) {
+                        if (atomic_frame) throw std::runtime_error("immutable sync violation: unknown table");
                         if (pending_import)
                             throw std::invalid_argument("Pending entry has an unsupported table");
                         LOG_ERROR("apply_remote",
@@ -4737,6 +4948,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                             if (schema.find(name) == schema.end()) { has_unknown = true; break; }
                         }
                         if (has_unknown) {
+                            if (atomic_frame) throw std::runtime_error("immutable sync violation: unknown column");
                             skew_filtered = entry;
                             auto& names = skew_filtered.changed_fields_names;
                             for (auto it = names.begin(); it != names.end();) {
@@ -4851,9 +5063,14 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
 
                     if (!sql_succeeded) {
+                        if (atomic_frame) throw std::runtime_error("immutable sync violation: model write failed");
                         if (pending_import) throw std::runtime_error("Pending model write failed");
                         continue;
                     }
+
+                    // Check the stored representation too: no-history/default handling
+                    // must not commit a different row from the accepted immutable snapshot.
+                    if (atomic_frame) enforce_immutable_entry(db, entry, immutable);
 
                     // NO-OP SUPPRESSION (per-sync/client mode only). With the
                     // value-guarded instructions, changes()==0 on an EXISTING
@@ -4954,6 +5171,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                     applied_ids.push_back(entry.global_id);
                     if (outcomes) (*outcomes)[i] = pending_outcome::imported;
                 } catch (const std::exception& e) {
+                    if (atomic_frame) throw;
                     if (pending_savepoint) {
                         // If cleanup itself fails, let the enclosing chunk
                         // roll back; continuing could commit an unjournalled
@@ -5001,8 +5219,10 @@ static std::vector<std::string> apply_remote_changes_impl(
                 }
             }
 
+            if (authorize && !authorize()) throw std::runtime_error("sync authorization denied: this writer lease is no longer active");
             });
         } catch (const std::exception& e) {
+            if (atomic_frame) throw;
             // A CHUNK-level failure (BEGIN lock timeout, COMMIT busy, the
             // trigger-gate UPDATEs) rolls back this chunk only. It must
             // NEVER throw out of the apply: entries committed by EARLIER
@@ -5038,6 +5258,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                      chunk_start, chunk_end, e.what(), applied_ids.size());
             break;
         } catch (...) {
+            if (atomic_frame) throw;
             // Non-std throw: same containment policy, no retry (unknown cause).
             applied_ids.resize(applied_before_chunk);
             if (outcomes) std::fill(outcomes->begin() + chunk_start,
@@ -5067,6 +5288,23 @@ static std::vector<std::string> apply_remote_changes_impl(
 
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries) {
     return apply_remote_changes_impl(db, entries, audit_apply_mode::global, std::nullopt);
+}
+
+std::vector<std::string> apply_remote_changes_immutable(lattice_db& db,
+    const std::vector<audit_log_entry>& entries,
+    const std::vector<std::string>& immutable_tables,
+    const std::function<bool()>& authorize) {
+    return apply_remote_changes_impl(db, entries, audit_apply_mode::global,
+                                    std::nullopt, nullptr, immutable_tables, authorize);
+}
+
+void mark_audit_entries_synced_authorized(lattice_db& db,
+    const std::vector<std::string>& global_ids, const std::function<bool()>& authorize) {
+    sync_apply_transaction_access::run(db, [&] {
+        if (authorize && !authorize()) throw std::runtime_error("sync authorization denied: this writer lease is no longer active");
+        mark_audit_entries_synced(db, global_ids);
+        if (authorize && !authorize()) throw std::runtime_error("sync authorization denied: this writer lease is no longer active");
+    });
 }
 
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,

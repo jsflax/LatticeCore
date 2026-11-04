@@ -4617,3 +4617,298 @@ TEST(SyncUploadsDisabled, FiniteDownloadWaitsForCatchUpWithoutResolvingPendingUp
     });
 }
 #endif
+
+TEST(SyncPrecision, AuthoritativeSnapshotRepairsOldAuditWithoutChangingStoredRows) {
+    lattice::lattice_db db;
+    const double original = 1788921763.083822;
+    auto dog = db.add(TestDog{"Existing", original, true});
+    // Existing databases can contain historical 15-digit JSON; preserve it.
+    db.db().execute("UPDATE AuditLog SET changedFields=json_object('weight',1788921763.08382) WHERE globalRowId=?", {dog.global_id()});
+    EXPECT_THROW(db.append_current_snapshots({"TestDog"}, "snapshot-1"), std::runtime_error);
+    db.begin_transaction();
+    EXPECT_EQ(db.append_current_snapshots({"TestDog"}, "snapshot-1"), 1);
+    EXPECT_EQ(db.append_current_snapshots({"TestDog"}, "snapshot-1"), 0);
+    db.commit();
+    auto rows = db.db().query("SELECT changedFields FROM AuditLog WHERE globalRowId=? ORDER BY id", {dog.global_id()});
+    ASSERT_EQ(rows.size(), 2u);
+    auto old = lattice::audit_log_entry::parse_changed_fields(std::get<std::string>(rows[0].at("changedFields")));
+    auto exact = lattice::audit_log_entry::parse_changed_fields(std::get<std::string>(rows[1].at("changedFields")));
+    EXPECT_NE(std::get<double>(old.at("weight").to_column_value()), original);
+    EXPECT_EQ(std::get<double>(exact.at("weight").to_column_value()), original);
+    EXPECT_EQ(std::get<double>(db.db().query("SELECT weight FROM TestDog")[0].at("weight")), original);
+    db.begin_transaction();
+    EXPECT_EQ(db.append_current_snapshots({"TestDog"}, "rolled-back"), 1);
+    db.rollback();
+    db.begin_transaction();
+    EXPECT_EQ(db.append_current_snapshots({"TestDog"}, "rolled-back"), 1);
+    db.commit();
+}
+
+// Immutable sync channels: these call the actual transactional apply, including
+// the legacy INSERT ... ON CONFLICT DO UPDATE path they must constrain.
+namespace {
+lattice::audit_log_entry immutable_person(std::string row, std::string event, std::string name = "Astra") {
+    lattice::audit_log_entry entry;
+    entry.global_id = std::move(event);
+    entry.global_row_id = std::move(row);
+    entry.table_name = "TestPerson";
+    entry.operation = "INSERT";
+    entry.timestamp = "2026-09-08T12:00:00Z";
+    entry.changed_fields_names = {"name", "age", "email"};
+    entry.changed_fields = {{"name", name}, {"age", 30}, {"email", nullptr}};
+    return entry;
+}
+void immutable_schema(lattice::lattice_db& db) { (void) db.objects<TestPerson>(); }
+int64_t immutable_count(lattice::lattice_db& db) {
+    return std::get<int64_t>(db.db().query("SELECT count(*) AS count FROM TestPerson")[0].at("count"));
+}
+}
+
+TEST(ImmutableSync, IdenticalSemanticReplay) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto entry = immutable_person("agent-1", "event-1");
+    ASSERT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {"testperson"}).size(), 1u);
+    entry.row_id = 999;
+    entry.timestamp = "2027-01-01T00:00:00Z";
+    std::reverse(entry.changed_fields_names.begin(), entry.changed_fields_names.end());
+    entry.changed_fields["age"] = lattice::any_property(int64_t(30));
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {"TESTPERSON"}).size(), 1u);
+    entry.global_id = "replay-new-event";
+    entry.changed_fields["age"] = lattice::any_property(30.0);
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}).size(), 1u);
+    EXPECT_EQ(immutable_count(db), 1);
+}
+
+TEST(ImmutableSync, ChangedInsertAndReusedAuditIdentityRejected) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto entry = immutable_person("agent-1", "event-1");
+    lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"});
+    entry.changed_fields["name"] = lattice::any_property("Fable");
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}), std::runtime_error);
+    entry.global_id = "event-2";
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}), std::runtime_error);
+    entry = immutable_person("different-row", "event-1");
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}), std::runtime_error);
+    EXPECT_EQ(immutable_count(db), 1);
+    EXPECT_EQ(std::get<std::string>(db.db().query("SELECT name FROM TestPerson")[0].at("name")), "Astra");
+}
+
+TEST(ImmutableSync, SameFrameConflictRollsBackWholeLargeFrame) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    std::vector<lattice::audit_log_entry> entries;
+    for (int i = 0; i < 75; ++i) entries.push_back(immutable_person("row-" + std::to_string(i), "event-" + std::to_string(i)));
+    entries.push_back(immutable_person("row-0", "conflict", "Fable"));
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, entries, {"TestPerson"}), std::runtime_error);
+    EXPECT_EQ(immutable_count(db), 0);
+    EXPECT_TRUE(db.db().query("SELECT id FROM AuditLog WHERE tableName = 'TestPerson'").empty());
+    // A retry must not encounter policy receipts from the rolled-back frame.
+    entries.pop_back();
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, entries, {"TestPerson"}).size(), 75u);
+    EXPECT_EQ(immutable_count(db), 75);
+}
+
+TEST(ImmutableSync, MixedMutableAndImmutableFrameRollsBack) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto seed = immutable_person("seed", "seed-event");
+    lattice::apply_remote_changes_immutable(db, {seed}, {"TestPerson"});
+    (void) db.objects<TestTrip>();
+    auto first = immutable_person("trip", "trip-event");
+    first.table_name = "TestTrip";
+    first.changed_fields_names = {"name", "days", "notes"};
+    first.changed_fields = {{"name", "Trip"}, {"days", 1}, {"notes", nullptr}};
+    auto conflict = immutable_person("seed", "new-event", "Changed");
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {first, conflict}, {"TestPerson"}), std::runtime_error);
+    EXPECT_TRUE(db.db().query("SELECT id FROM TestTrip").empty());
+    EXPECT_EQ(immutable_count(db), 1);
+}
+
+TEST(ImmutableSync, UpdateDeleteAndIncompleteSnapshotsRejected) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    for (const auto& operation : {"UPDATE", "DELETE"}) {
+        auto entry = immutable_person("row", operation);
+        entry.operation = operation;
+        EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}), std::runtime_error);
+    }
+    auto incomplete = immutable_person("row", "incomplete");
+    incomplete.changed_fields.erase("email");
+    incomplete.changed_fields_names.pop_back();
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {incomplete}, {"TestPerson"}), std::runtime_error);
+    EXPECT_EQ(immutable_count(db), 0);
+}
+
+TEST(ImmutableSync, IdentitySurvivesAuditCompactionAndLocalDeletion) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto entry = immutable_person("row", "event");
+    lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"});
+    db.db().execute("DELETE FROM AuditLog");
+    db.db().execute("DELETE FROM TestPerson");
+    entry.global_id = "new-event";
+    entry.changed_fields["name"] = lattice::any_property("Changed");
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}), std::runtime_error);
+    EXPECT_EQ(immutable_count(db), 0);
+}
+
+TEST(ImmutableSync, ConcurrentConflictingInsertsHaveOneWinner) {
+    TempDB file{"immutable-race"};
+    lattice::lattice_db first{lattice::configuration(file.str())};
+    lattice::lattice_db second{lattice::configuration(file.str())};
+    immutable_schema(first); immutable_schema(second);
+    std::atomic<int> ready{0}, successes{0}, conflicts{0};
+    auto insert = [&](lattice::lattice_db& db, const std::string& name) {
+        ready.fetch_add(1);
+        while (ready.load() < 2) std::this_thread::yield();
+        try {
+            auto ids = lattice::apply_remote_changes_immutable(db, {immutable_person("row", name, name)}, {"TestPerson"});
+            if (ids.size() == 1) successes.fetch_add(1);
+        } catch (const std::runtime_error&) { conflicts.fetch_add(1); }
+    };
+    std::thread a(insert, std::ref(first), "Astra");
+    std::thread b(insert, std::ref(second), "Fable");
+    a.join(); b.join();
+    EXPECT_EQ(successes.load(), 1);
+    EXPECT_EQ(conflicts.load(), 1);
+    EXPECT_EQ(immutable_count(first), 1);
+}
+
+TEST(ImmutableSync, DefaultMutableBehaviorUnchanged) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto entry = immutable_person("row", "event-1");
+    EXPECT_EQ(lattice::apply_remote_changes(db, {entry}).size(), 1u);
+    entry.global_id = "event-2";
+    entry.changed_fields["name"] = lattice::any_property("Changed");
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {}).size(), 1u);
+    EXPECT_EQ(std::get<std::string>(db.db().query("SELECT name FROM TestPerson")[0].at("name")), "Changed");
+}
+
+TEST(ImmutableSync, StrictParserRejectsMalformedEntries) {
+    lattice::server_sent_event event;
+    event.event_type = lattice::server_sent_event::type::audit_log;
+    event.audit_logs = {immutable_person("row", "event")};
+    EXPECT_TRUE(lattice::server_sent_event::from_json_immutable(event.to_json()).has_value());
+    auto malformed = event.to_json();
+    auto array = malformed.find("\"auditLog\":[");
+    ASSERT_NE(array, std::string::npos);
+    malformed.insert(array + std::string("\"auditLog\":[").size(), "0,");
+    EXPECT_FALSE(lattice::server_sent_event::from_json_immutable(malformed).has_value());
+}
+
+TEST(ImmutableSync, UnknownLaterTableRollsBackFrame) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto unknown = immutable_person("unknown", "unknown-event");
+    unknown.table_name = "DoesNotExist";
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db,
+        {immutable_person("row", "event"), unknown}, {"TestPerson"}), std::runtime_error);
+    EXPECT_EQ(immutable_count(db), 0);
+}
+
+TEST(ImmutableSync, ConcurrentIdenticalInsertsBothAcknowledge) {
+    TempDB file{"immutable-identical-race"};
+    lattice::lattice_db first{lattice::configuration(file.str())};
+    lattice::lattice_db second{lattice::configuration(file.str())};
+    immutable_schema(first); immutable_schema(second);
+    std::atomic<int> ready{0}, successes{0}, failures{0};
+    auto insert = [&](lattice::lattice_db& db) {
+        ready.fetch_add(1);
+        while (ready.load() < 2) std::this_thread::yield();
+        try {
+            if (lattice::apply_remote_changes_immutable(db,
+                {immutable_person("row", "event")}, {"TestPerson"}).size() == 1) successes.fetch_add(1);
+        } catch (...) { failures.fetch_add(1); }
+    };
+    std::thread a(insert, std::ref(first));
+    std::thread b(insert, std::ref(second));
+    a.join(); b.join();
+    EXPECT_EQ(successes.load(), 2);
+    EXPECT_EQ(failures.load(), 0);
+    EXPECT_EQ(immutable_count(first), 1);
+}
+
+TEST(ImmutableSync, BlobRepresentationsNormalizeAndChangedBytesReject) {
+    lattice::lattice_db db;
+    db.db().execute("CREATE TABLE ImmutableBlob (id INTEGER PRIMARY KEY AUTOINCREMENT, globalId TEXT UNIQUE NOT NULL, payload BLOB)");
+    auto entry = immutable_person("row", "event");
+    entry.table_name = "ImmutableBlob";
+    entry.changed_fields_names = {"payload"};
+    entry.changed_fields = {{"payload", std::string("0A00FF")}};
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {"ImmutableBlob"}).size(), 1u);
+    entry.global_id = "replay";
+    entry.changed_fields["payload"] = lattice::any_property(std::vector<uint8_t>{10, 0, 255});
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {"ImmutableBlob"}).size(), 1u);
+    entry.global_id = "changed";
+    entry.changed_fields["payload"] = lattice::any_property(std::vector<uint8_t>{10, 0, 254});
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"ImmutableBlob"}), std::runtime_error);
+}
+
+
+
+TEST(ImmutableSync, AuthorizationAtCommitRollsBackWholeFrameAndRecovers) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto entry = immutable_person("owner-row", "owner-event");
+    int checks = 0;
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {}, [&] {
+        ++checks;
+        if (checks == 2) EXPECT_EQ(immutable_count(db), 1);
+        return checks == 1;
+    }), std::runtime_error);
+    EXPECT_EQ(checks, 2);
+    EXPECT_EQ(immutable_count(db), 0);
+    EXPECT_TRUE(db.db().query("SELECT id FROM AuditLog WHERE tableName='TestPerson'").empty());
+    EXPECT_FALSE(db.db().is_in_transaction());
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {}, [] { return true; }).size(), 1u);
+}
+
+TEST(ImmutableSync, RejectionDoesNotJoinOrRollbackCallersTransaction) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    db.begin_transaction();
+    db.db().execute("INSERT INTO TestPerson(globalId,name,age) VALUES ('local','local',1)");
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db,
+        {immutable_person("remote", "event")}, {"TestPerson"}), std::runtime_error);
+    EXPECT_TRUE(db.db().is_in_transaction());
+    EXPECT_EQ(immutable_count(db), 1);
+    db.rollback();
+    EXPECT_EQ(immutable_count(db), 0);
+}
+
+TEST(ImmutableSync, CommitFailureHasNoReceiptsOrModelEffects) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto entry = immutable_person("commit-row", "commit-event");
+    sqlite3_set_authorizer(db.db().handle(), [](void*, int action, const char* verb,
+        const char*, const char*, const char*) -> int {
+        return action == SQLITE_TRANSACTION && verb && std::string(verb) == "COMMIT"
+            ? SQLITE_DENY : SQLITE_OK;
+    }, nullptr);
+    EXPECT_THROW(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}), std::runtime_error);
+    sqlite3_set_authorizer(db.db().handle(), nullptr, nullptr);
+    EXPECT_FALSE(db.db().is_in_transaction());
+    EXPECT_EQ(immutable_count(db), 0);
+    EXPECT_TRUE(db.db().query("SELECT id FROM AuditLog WHERE tableName='TestPerson'").empty());
+    EXPECT_EQ(lattice::apply_remote_changes_immutable(db, {entry}, {"TestPerson"}).size(), 1u);
+}
+
+TEST(ImmutableSync, AuthorizedAckRollsBackWhenOwnerRevokes) {
+    lattice::lattice_db db;
+    immutable_schema(db);
+    auto object = db.add(TestPerson{"Pending", 1, std::nullopt});
+    auto rows = db.db().query("SELECT globalId FROM AuditLog WHERE globalRowId=?", {object.global_id()});
+    ASSERT_EQ(rows.size(), 1u);
+    const auto event = std::get<std::string>(rows[0].at("globalId"));
+    int checks = 0;
+    EXPECT_THROW(lattice::mark_audit_entries_synced_authorized(db, {event}, [&] {
+        return ++checks == 1;
+    }), std::runtime_error);
+    EXPECT_EQ(checks, 2);
+    EXPECT_EQ(std::get<int64_t>(db.db().query("SELECT isSynchronized FROM AuditLog WHERE globalId=?", {event})[0].at("isSynchronized")), 0);
+    lattice::mark_audit_entries_synced_authorized(db, {event}, [] { return true; });
+    EXPECT_EQ(std::get<int64_t>(db.db().query("SELECT isSynchronized FROM AuditLog WHERE globalId=?", {event})[0].at("isSynchronized")), 1);
+}

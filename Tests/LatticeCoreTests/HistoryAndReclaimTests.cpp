@@ -2,6 +2,7 @@
 #include <lattice.hpp>          // swift_lattice, swift_lattice_ref (the bridge Swift uses)
 #include <lattice/sync.hpp>
 #include <filesystem>
+#include <thread>
 
 // ============================================================================
 // 1.5.0 — history regeneration covers link tables; disk space actually comes
@@ -229,4 +230,226 @@ TEST(Reclaim, VacuumReportsFailureInsteadOfPretending) {
 
     // checkpoint_bounded: -2 distinguishes "threw" from a legitimate 0.
     EXPECT_GE(ref->checkpoint_bounded(250), 0);
+}
+
+TEST(CurrentHistory, PrunedInsertTailBootstrapsTwoFreshPeersWithLinksAndPreservesHistory) {
+    TempDB source_tmp{"current_history"};
+    auto* source_ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(source_tmp.str()), band_schemas());
+    auto& source = *source_ref->get();
+    source.db().execute("INSERT INTO HxBand(globalId,name) VALUES('band-1','before')");
+    source.db().execute("INSERT INTO HxAlbum(globalId,title,year) VALUES('album-1','One',2001),('album-2','Two',2002),('deleted','Gone',2000)");
+    source.db().execute("INSERT INTO _HxBand_HxAlbum_albums(lhs,rhs) VALUES('band-1','album-1'),('band-1','album-2')");
+    source.ensure_virtual_link_table("_HxBand_favorites");
+    source.db().execute("INSERT INTO _HxBand_favorites(lhs,rhs,rhs_type) VALUES('band-1','album-2','HxAlbum')");
+    source.db().execute("UPDATE HxBand SET name='current' WHERE globalId='band-1'");
+    source.db().execute("DELETE FROM HxAlbum WHERE globalId='deleted'");
+    source.db().execute("DELETE FROM AuditLog WHERE operation='INSERT'");
+    source.db().execute("INSERT INTO _lattice_replication_slots(sync_id,confirmed_audit_id,upload_floor) VALUES('existing-peer',4,3)");
+    const auto retained = source.db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto slots = source.db().query("SELECT * FROM _lattice_replication_slots ORDER BY sync_id");
+    ASSERT_EQ(retained.size(), 2u); // UPDATE of a live row + DELETE of a removed row.
+    const auto old_max = count(source.db(), "SELECT MAX(id) FROM AuditLog");
+    EXPECT_THROW(source.ensure_current_history(), std::runtime_error);
+
+    for (int peer_number = 0; peer_number < 2; ++peer_number) {
+        source.begin_transaction();
+        EXPECT_EQ(source.ensure_current_history(), 6); // 3 models + 2 list links + 1 virtual link.
+        EXPECT_EQ(source.ensure_current_history(), 0);
+        source.commit();
+        EXPECT_EQ(source.db().query("SELECT * FROM AuditLog WHERE id<=? ORDER BY id", {old_max}), retained);
+        EXPECT_EQ(source.db().query("SELECT * FROM _lattice_replication_slots ORDER BY sync_id"), slots);
+        EXPECT_EQ(count(source.db(), "SELECT COUNT(*) FROM AuditLog WHERE operation='INSERT' AND synthesized=0 AND isFromRemote=0"), 6);
+        EXPECT_GT(count(source.db(), "SELECT MIN(id) FROM AuditLog WHERE operation='INSERT'"), old_max);
+        EXPECT_EQ(count(source.db(), "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_lattice_current_history_baseline'"), 0);
+
+        TempDB peer_tmp{"current_history_peer"};
+        auto* peer_ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(peer_tmp.str()), band_schemas());
+        auto& peer = *peer_ref->get();
+        peer.ensure_virtual_link_table("_HxBand_favorites");
+        const auto events = lattice::events_after(source.db(), std::nullopt);
+        ASSERT_EQ(events.size(), 8u);
+        EXPECT_NO_THROW(lattice::apply_remote_changes(peer, events));
+        EXPECT_EQ(std::get<std::string>(peer.db().query("SELECT name FROM HxBand")[0].at("name")), "current");
+        EXPECT_EQ(count(peer.db(), "SELECT COUNT(*) FROM HxAlbum"), 2);
+        EXPECT_EQ(count(peer.db(), "SELECT COUNT(*) FROM HxAlbum WHERE globalId='deleted'"), 0);
+        EXPECT_EQ(peer.db().query("SELECT * FROM _HxBand_HxAlbum_albums ORDER BY rhs"), source.db().query("SELECT * FROM _HxBand_HxAlbum_albums ORDER BY rhs"));
+        EXPECT_EQ(peer.db().query("SELECT * FROM _HxBand_favorites"), source.db().query("SELECT * FROM _HxBand_favorites"));
+        source.begin_transaction();
+        const auto source_identity = source.current_identity_snapshot();
+        source.commit();
+        peer.begin_transaction();
+        EXPECT_EQ(peer.current_identity_snapshot(), source_identity);
+        peer.commit();
+        // A later fresh device needs another baseline after retention runs again.
+        if (peer_number == 0) source.db().execute("DELETE FROM AuditLog WHERE operation='INSERT'");
+    }
+}
+
+TEST(CurrentHistory, RollbackAndLinkInsertFailureCannotCommitPartialRepair) {
+    TempDB tmp{"current_history_atomic"};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), band_schemas());
+    auto& db = *ref->get();
+    db.db().execute("INSERT INTO HxBand(globalId,name) VALUES('band','Band')");
+    db.db().execute("INSERT INTO HxAlbum(globalId,title,year) VALUES('album','Album',2000)");
+    db.db().execute("INSERT INTO _HxBand_HxAlbum_albums(lhs,rhs) VALUES('band','album')");
+    db.db().execute("DELETE FROM AuditLog");
+    db.begin_transaction();
+    EXPECT_EQ(db.ensure_current_history(), 3);
+    db.rollback();
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 0);
+
+    db.db().execute("CREATE TRIGGER reject_history_link BEFORE INSERT ON AuditLog WHEN NEW.tableName='_HxBand_HxAlbum_albums' BEGIN SELECT RAISE(ABORT,'blocked link baseline'); END");
+    db.begin_transaction();
+    EXPECT_THROW(db.ensure_current_history(), lattice::db_error);
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 2); // The caller still owns the transaction.
+    db.rollback();
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 0);
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_lattice_current_history_baseline'"), 0);
+    db.db().execute("DROP TRIGGER reject_history_link");
+    db.begin_transaction();
+    EXPECT_EQ(db.ensure_current_history(), 3);
+    db.commit();
+}
+
+TEST(CurrentHistory, CompleteScalarPayloadKeepsRealPrecisionAndNullableBlob) {
+    TempDB tmp{"current_history_scalars"};
+    auto real = text_prop("exact"); real.type = lattice::column_type::real;
+    auto blob = text_prop("bytes"); blob.type = lattice::column_type::blob; blob.nullable = true;
+    auto schemas = lattice::SchemaVector{make_schema("HxScalar", {{"exact", real}, {"bytes", blob}})};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    const double precise = 1788921763.083822;
+    db.db().execute("INSERT INTO HxScalar(globalId,exact,bytes) VALUES('one',?,X'000AFF'),('two',?,NULL)", {precise, precise});
+    db.db().execute("DELETE FROM AuditLog");
+    db.db().execute("CREATE TABLE _unrelated(k TEXT,v TEXT)");
+    db.begin_transaction();
+    EXPECT_EQ(db.ensure_current_history(), 2);
+    db.commit();
+    auto entries = lattice::events_after(db.db(), std::nullopt);
+    ASSERT_EQ(entries.size(), 2u);
+    EXPECT_EQ(std::get<double>(entries[0].changed_fields.at("exact").to_column_value()), precise);
+    EXPECT_EQ(std::get<std::string>(entries[0].changed_fields.at("bytes").to_column_value()), "000AFF");
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(entries[1].changed_fields.at("bytes").to_column_value()));
+}
+
+TEST(CurrentHistory, IdentitySnapshotDetectsEqualCountReplacementAndAllLinkKindsWithoutText) {
+    TempDB tmp{"current_history_identity"};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), band_schemas());
+    auto& db = *ref->get();
+    db.db().execute("INSERT INTO HxBand(globalId,name) VALUES('band','PRIVATE BAND TEXT')");
+    db.db().execute("INSERT INTO HxAlbum(globalId,title,year) VALUES('album','PRIVATE ALBUM TEXT',2000)");
+    db.db().execute("INSERT INTO _HxBand_HxAlbum_albums(lhs,rhs) VALUES('band','album')");
+    db.ensure_virtual_link_table("_HxBand_favorites");
+    db.db().execute("INSERT INTO _HxBand_favorites(lhs,rhs,rhs_type) VALUES('band','album','HxAlbum')");
+    EXPECT_THROW(db.current_identity_snapshot(), std::runtime_error);
+    db.begin_transaction();
+    const auto original = db.current_identity_snapshot();
+    EXPECT_EQ(original.find("PRIVATE"), std::string::npos);
+    EXPECT_EQ(original.find("AuditLog"), std::string::npos);
+    EXPECT_NE(original.find("\"album\",\"HxAlbum\""), std::string::npos); // Polymorphic type is represented positionally.
+    db.db().execute("UPDATE HxBand SET name='changed text'");
+    EXPECT_EQ(db.current_identity_snapshot(), original);
+    db.rollback();
+
+    db.begin_transaction();
+    db.db().execute("UPDATE HxAlbum SET globalId='replacement' WHERE globalId='album'");
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM HxAlbum"), 1);
+    EXPECT_NE(db.current_identity_snapshot(), original);
+    db.rollback();
+    db.begin_transaction();
+    db.db().execute("DELETE FROM _HxBand_HxAlbum_albums");
+    EXPECT_NE(db.current_identity_snapshot(), original);
+    db.rollback();
+    db.begin_transaction();
+    db.db().execute("DELETE FROM _HxBand_favorites");
+    EXPECT_NE(db.current_identity_snapshot(), original);
+    db.rollback();
+    db.begin_transaction();
+    db.db().execute("UPDATE _HxBand_favorites SET rhs_type='DifferentModel'");
+    EXPECT_NE(db.current_identity_snapshot(), original);
+    db.rollback();
+    db.begin_transaction();
+    EXPECT_EQ(db.current_identity_snapshot(), original);
+    db.commit();
+}
+
+TEST(CurrentHistory, OwnedUnionLiveAndPrunedBaselineSyncKeepCasePayloadAndIdentity) {
+    auto schemas = lattice::SchemaVector{make_schema("HxUnionOwner", {{"state", text_prop("state")}})};
+    lattice::union_descriptor descriptor{"_HxSyncState", {
+        {"none", {}}, {"waiting", {{"reason", lattice::column_type::text}}}}};
+    TempDB source_tmp{"history_union_source"}, peer_tmp{"history_union_peer"}, fresh_tmp{"history_union_fresh"};
+    auto* source_ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(source_tmp.str()), schemas);
+    auto* peer_ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(peer_tmp.str()), schemas);
+    auto* fresh_ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(fresh_tmp.str()), schemas);
+    auto& source = *source_ref->get(); auto& peer = *peer_ref->get(); auto& fresh = *fresh_ref->get();
+    for (auto* store : {&source, &peer, &fresh}) store->ensure_union_table("_HxSyncState", descriptor, "HxUnionOwner", "state");
+    source.db().execute("INSERT INTO _HxSyncState(globalId,\"case\",waiting__reason) VALUES('state','waiting','First reason')");
+    source.db().execute("INSERT INTO HxUnionOwner(globalId,state) VALUES('owner','state')");
+    auto events = lattice::events_after(source.db(), std::nullopt);
+    EXPECT_EQ(lattice::apply_remote_changes(peer, events).size(), events.size());
+    ASSERT_EQ(count(peer.db(), "SELECT COUNT(*) FROM _HxSyncState"), 1);
+    EXPECT_EQ(std::get<std::string>(peer.db().query("SELECT waiting__reason FROM _HxSyncState")[0].at("waiting__reason")), "First reason");
+
+    source.db().execute("UPDATE _HxSyncState SET \"case\"='none',waiting__reason=NULL WHERE globalId='state'");
+    events = lattice::events_after(source.db(), std::nullopt);
+    EXPECT_EQ(lattice::apply_remote_changes(peer, events).size(), events.size());
+    EXPECT_EQ(std::get<std::string>(peer.db().query("SELECT \"case\" FROM _HxSyncState")[0].at("case")), "none");
+
+    source.db().execute("UPDATE _HxSyncState SET \"case\"='waiting',waiting__reason='Retained reason' WHERE globalId='state'");
+    source.db().execute("DELETE FROM AuditLog WHERE operation='INSERT'");
+    source.begin_transaction();
+    EXPECT_EQ(source.ensure_current_history(), 2);
+    const auto identity = source.current_identity_snapshot();
+    source.commit();
+    events = lattice::events_after(source.db(), std::nullopt);
+    EXPECT_EQ(lattice::apply_remote_changes(fresh, events).size(), events.size());
+    ASSERT_EQ(count(fresh.db(), "SELECT COUNT(*) FROM _HxSyncState"), 1);
+    EXPECT_EQ(std::get<std::string>(fresh.db().query("SELECT waiting__reason FROM _HxSyncState")[0].at("waiting__reason")), "Retained reason");
+    fresh.begin_transaction();
+    EXPECT_EQ(fresh.current_identity_snapshot(), identity);
+    fresh.commit();
+
+    // Existing private tables with the same physical shape are not union
+    // storage unless configured ownership metadata establishes that role.
+    peer.db().execute("CREATE TABLE _PrivateState(id INTEGER PRIMARY KEY,globalId TEXT UNIQUE,\"case\" TEXT)");
+    lattice::audit_log_entry private_entry;
+    private_entry.global_id = "private-event"; private_entry.global_row_id = "private-row";
+    private_entry.table_name = "_PrivateState"; private_entry.operation = "INSERT";
+    private_entry.changed_fields_names = {"case"}; private_entry.changed_fields = {{"case", std::string("forged")}};
+    EXPECT_TRUE(lattice::apply_remote_changes(peer, {private_entry}).empty());
+    EXPECT_EQ(count(peer.db(), "SELECT COUNT(*) FROM _PrivateState"), 0);
+}
+
+TEST(CurrentHistory, RejectsUncheckedAndOtherThreadTransactionsBeforeAnyWork) {
+    TempDB tmp{"history_checked_owner"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.add(TestPerson{"owned", 1, std::nullopt});
+    db.db().execute("DELETE FROM AuditLog");
+    EXPECT_THROW(db.ensure_current_history(), std::runtime_error);
+    EXPECT_THROW(db.current_identity_snapshot(), std::runtime_error);
+    EXPECT_THROW(db.append_current_snapshots({"TestPerson"}, "unchecked"), std::runtime_error);
+    // A raw SQLite transaction is not an admitted Lattice transaction owner.
+    db.db().execute("BEGIN");
+    EXPECT_THROW(db.ensure_current_history(), std::runtime_error);
+    EXPECT_THROW(db.current_identity_snapshot(), std::runtime_error);
+    EXPECT_THROW(db.append_current_snapshots({"TestPerson"}, "unchecked"), std::runtime_error);
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 0);
+    db.db().execute("ROLLBACK");
+    db.begin_transaction();
+    int refused = 0;
+    std::thread other([&] {
+        try { (void)db.ensure_current_history(); } catch (const std::runtime_error&) { ++refused; }
+        try { (void)db.current_identity_snapshot(); } catch (const std::runtime_error&) { ++refused; }
+        try { (void)db.append_current_snapshots({"TestPerson"}, "other-thread"); } catch (const std::runtime_error&) { ++refused; }
+    });
+    other.join();
+    EXPECT_EQ(refused, 3);
+    EXPECT_TRUE(db.db().is_in_transaction());
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 0);
+    // Positive control: the original owner can still perform and roll back.
+    EXPECT_EQ(db.ensure_current_history(), 1);
+    EXPECT_FALSE(db.current_identity_snapshot().empty());
+    EXPECT_EQ(db.append_current_snapshots({"TestPerson"}, "owner"), 1);
+    db.rollback();
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 0);
 }

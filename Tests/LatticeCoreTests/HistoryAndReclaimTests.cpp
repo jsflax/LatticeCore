@@ -420,6 +420,80 @@ TEST(CurrentHistory, OwnedUnionLiveAndPrunedBaselineSyncKeepCasePayloadAndIdenti
     EXPECT_EQ(count(peer.db(), "SELECT COUNT(*) FROM _PrivateState"), 0);
 }
 
+TEST(CurrentHistory, OwnedUnionRejectsAmbiguousDiscriminatorBeforeDedupAndEffects) {
+    auto schemas = lattice::SchemaVector{make_schema("HxAmbiguousOwner", {{"state", text_prop("state")}})};
+    lattice::union_descriptor descriptor{"_HxAmbiguousState", {
+        {"none", {}}, {"waiting", {{"reason", lattice::column_type::text}}}}};
+    TempDB tmp{"history_union_ambiguous"};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    db.ensure_union_table("_HxAmbiguousState", descriptor, "HxAmbiguousOwner", "state");
+    lattice::audit_log_entry accepted;
+    accepted.global_id = "accepted-union-event"; accepted.global_row_id = "state";
+    accepted.table_name = "_HxAmbiguousState"; accepted.operation = "INSERT";
+    accepted.changed_fields_names = {"case", "waiting__reason"};
+    accepted.changed_fields = {{"case", std::string("waiting")}, {"waiting__reason", std::string("Kept")}};
+    ASSERT_EQ(lattice::apply_remote_changes(db, {accepted}), std::vector<std::string>{accepted.global_id});
+    const auto audits_before = count(db.db(), "SELECT COUNT(*) FROM AuditLog");
+    const auto receipts_before = count(db.db(), "SELECT COUNT(*) FROM _lattice_applied_receipts");
+
+    // Both the names and value map participate in ambiguity detection. Reject
+    // even equal values, and reject before the already-applied ACK shortcut.
+    for (int spelling = 0; spelling < 3; ++spelling) {
+        for (bool retained_identity : {false, true}) {
+            auto ambiguous = accepted;
+            if (!retained_identity) {
+                ambiguous.global_id = "new-ambiguous-" + std::to_string(spelling);
+                ambiguous.global_row_id = "new-state-" + std::to_string(spelling);
+            }
+            if (spelling != 1) ambiguous.changed_fields_names.push_back("\"case\"");
+            if (spelling != 2) ambiguous.changed_fields["\"case\""] = std::string("waiting");
+            EXPECT_TRUE(lattice::apply_remote_changes(db, {ambiguous}).empty());
+            EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM _HxAmbiguousState"), 1);
+            EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), audits_before);
+            EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM _lattice_applied_receipts"), receipts_before);
+        }
+    }
+    EXPECT_EQ(std::get<std::string>(db.db().query("SELECT waiting__reason FROM _HxAmbiguousState")[0].at("waiting__reason")), "Kept");
+}
+
+TEST(CurrentHistory, OwnedUnionPendingImportAcceptsCanonicalAndLegacyNamesWithoutChangingWireHistory) {
+    auto schemas = lattice::SchemaVector{make_schema("HxPendingOwner", {{"state", text_prop("state")}})};
+    lattice::union_descriptor descriptor{"_HxPendingState", {{"waiting", {{"reason", lattice::column_type::text}}}}};
+    TempDB tmp{"history_union_pending"};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    db.ensure_union_table("_HxPendingState", descriptor, "HxPendingOwner", "state");
+    for (bool legacy : {false, true}) {
+        const std::string field = legacy ? "\"case\"" : "case";
+        lattice::audit_log_entry entry;
+        entry.global_id = legacy ? "pending-legacy" : "pending-canonical";
+        entry.global_row_id = legacy ? "legacy-row" : "canonical-row";
+        entry.table_name = "_HxPendingState"; entry.operation = "INSERT";
+        entry.changed_fields_names = {field, "waiting__reason"};
+        entry.changed_fields = {{field, std::string("waiting")}, {"waiting__reason", std::string("Pending value")}};
+        const auto outcome = lattice::apply_pending_changes(db, {entry});
+        EXPECT_EQ(outcome.imported_ids, std::vector<std::string>{entry.global_id});
+        EXPECT_TRUE(outcome.rejected_ids.empty());
+        EXPECT_TRUE(outcome.already_present_ids.empty());
+        const auto rows = db.db().query("SELECT \"case\",waiting__reason FROM _HxPendingState WHERE globalId=?", {entry.global_row_id});
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("case")), "waiting");
+        EXPECT_EQ(std::get<std::string>(rows[0].at("waiting__reason")), "Pending value");
+        const auto events = lattice::events_after(db.db(), std::nullopt);
+        const auto found = std::find_if(events.begin(), events.end(), [&](const auto& event) { return event.global_id == entry.global_id; });
+        ASSERT_NE(found, events.end());
+        EXPECT_EQ(found->changed_fields_names, entry.changed_fields_names);
+        EXPECT_TRUE(found->changed_fields.count(field));
+        EXPECT_FALSE(found->changed_fields.count(legacy ? "case" : "\"case\""));
+        const auto replay = lattice::apply_pending_changes(db, {entry});
+        EXPECT_EQ(replay.already_present_ids, std::vector<std::string>{entry.global_id});
+        EXPECT_TRUE(replay.imported_ids.empty());
+        EXPECT_TRUE(replay.rejected_ids.empty());
+    }
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM _HxPendingState"), 2);
+}
+
 TEST(CurrentHistory, RejectsUncheckedAndOtherThreadTransactionsBeforeAnyWork) {
     TempDB tmp{"history_checked_owner"};
     lattice::lattice_db db{lattice::configuration(tmp.str())};

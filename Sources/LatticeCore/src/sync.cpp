@@ -3,6 +3,7 @@
 #include "lattice/lattice.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <cmath>
 #include <iomanip>
@@ -375,6 +376,18 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
         const std::unordered_map<std::string, column_type>& schema) const {
     std::vector<column_value_t> params;
 
+    // Union storage has a discriminator named `case`, a SQL keyword. Quote
+    // keywords and unusual identifiers while retaining the ordinary statement
+    // shape for existing callers. Values are still bound separately below.
+    auto identifier = [](const std::string& name) {
+        bool plain = !name.empty() && (std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_');
+        for (char c : name) plain = plain && (std::isalnum(static_cast<unsigned char>(c)) || c == '_');
+        if (plain && !sqlite3_keyword_check(name.data(), static_cast<int>(name.size()))) return name;
+        std::string quoted = "\"";
+        for (char c : name) { quoted += c; if (c == '"') quoted += c; }
+        return quoted + "\"";
+    };
+
     // Helper to check if a column is a BLOB type
     auto is_blob = [&schema](const std::string& col) {
         auto it = schema.find(col);
@@ -412,7 +425,7 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
         std::string col_names = cols[0];
         std::string placeholders = "?";  // globalId is never a blob
         for (size_t i = 1; i < cols.size(); ++i) {
-            col_names += ", " + cols[i];
+            col_names += ", " + identifier(cols[i]);
             placeholders += ", " + placeholder(cols[i]);
         }
 
@@ -420,10 +433,10 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
         std::string update_set;
         for (size_t i = 1; i < cols.size(); ++i) {
             if (i > 1) update_set += ", ";
-            update_set += cols[i] + "=excluded." + cols[i];
+            update_set += identifier(cols[i]) + "=excluded." + identifier(cols[i]);
         }
 
-        std::string sql = "INSERT INTO " + table_name + "(" + col_names + ") VALUES (" + placeholders + ")";
+        std::string sql = "INSERT INTO " + identifier(table_name) + "(" + col_names + ") VALUES (" + placeholders + ")";
         if (!update_set.empty()) {
             // Value-guarded upsert: the DO UPDATE arm fires only when some
             // incoming value actually differs (IS NOT is NULL-safe; excluded.*
@@ -437,7 +450,7 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
             std::string change_pred;
             for (size_t i = 1; i < cols.size(); ++i) {
                 if (i > 1) change_pred += " OR ";
-                change_pred += cols[i] + " IS NOT excluded." + cols[i];
+                change_pred += identifier(cols[i]) + " IS NOT excluded." + identifier(cols[i]);
             }
             sql += " ON CONFLICT(globalId) DO UPDATE SET " + update_set +
                    " WHERE " + change_pred;
@@ -466,9 +479,9 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
             return {"", {}};  // Nothing to update
         }
 
-        std::string set_clause = changed_fields_names[0] + " = " + placeholder(changed_fields_names[0]);
+        std::string set_clause = identifier(changed_fields_names[0]) + " = " + placeholder(changed_fields_names[0]);
         for (size_t i = 1; i < changed_fields_names.size(); ++i) {
-            set_clause += ", " + changed_fields_names[i] + " = " + placeholder(changed_fields_names[i]);
+            set_clause += ", " + identifier(changed_fields_names[i]) + " = " + placeholder(changed_fields_names[i]);
         }
 
         // Value-guarded update: only fire when some value actually differs,
@@ -480,10 +493,10 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
         std::string change_pred;
         for (size_t i = 0; i < changed_fields_names.size(); ++i) {
             if (i > 0) change_pred += " OR ";
-            change_pred += changed_fields_names[i] + " IS NOT " +
+            change_pred += identifier(changed_fields_names[i]) + " IS NOT " +
                            placeholder(changed_fields_names[i]);
         }
-        std::string sql = "UPDATE " + table_name + " SET " + set_clause +
+        std::string sql = "UPDATE " + identifier(table_name) + " SET " + set_clause +
                           " WHERE globalId = ? AND (" + change_pred + ")";
 
         // Params in SQL order: SET values, globalId, then the guard's
@@ -509,7 +522,7 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
         return {sql, params};
 
     } else if (operation == "DELETE") {
-        std::string sql = "DELETE FROM " + table_name + " WHERE globalId = ?";
+        std::string sql = "DELETE FROM " + identifier(table_name) + " WHERE globalId = ?";
         params.push_back(global_row_id);
         return {sql, params};
     }
@@ -4741,6 +4754,7 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::unordered_set<std::string> tables_ensured;
     std::unordered_set<std::string> vec0_ensured;
     std::unordered_map<std::string, std::unordered_map<std::string, column_type>> schema_cache;
+    std::unordered_set<std::string> owned_union_tables;
     std::unordered_map<std::string, std::unordered_set<std::string>> nullable_cache;
 
     bool chunk_retried = false;
@@ -4792,6 +4806,31 @@ static std::vector<std::string> apply_remote_changes_impl(
                         LOG_WARN("apply_remote", "invalid entry envelope at position %zu; not ACKing", i);
                         continue;
                     }
+                    // Classify from local schema and ownership metadata before
+                    // dedup. A malformed discriminator must not be ACKed merely
+                    // because its event identity was accepted previously.
+                    auto schema_it = schema_cache.find(entry.table_name);
+                    if (schema_it == schema_cache.end()) {
+                        schema_it = schema_cache.emplace(
+                            entry.table_name, db.get_table_schema(entry.table_name)).first;
+                        const auto& columns = schema_it->second;
+                        if (entry.table_name[0] == '_' && columns.count("id") &&
+                            columns.count("globalId") && columns.count("case") &&
+                            !db.db().query("SELECT 1 FROM _lattice_meta WHERE key = ? AND value <> ''",
+                                {std::string("internal_table:") + entry.table_name}).empty()) {
+                            owned_union_tables.insert(entry.table_name);
+                        }
+                    }
+                    const bool is_owned_union = owned_union_tables.count(entry.table_name) != 0;
+                    const auto has_field_name = [&](const char* name) {
+                        return entry.changed_fields.count(name) ||
+                            std::find(entry.changed_fields_names.begin(),
+                                      entry.changed_fields_names.end(), name) != entry.changed_fields_names.end();
+                    };
+                    const bool legacy_discriminator = is_owned_union && has_field_name("\"case\"");
+                    if (legacy_discriminator && has_field_name("case")) {
+                        throw std::runtime_error("Duplicate union discriminator in sync entry");
+                    }
                     if (atomic_frame) enforce_immutable_entry(db, entry, immutable);
                     // Re-check inside transaction (entry may have been inserted
                     // concurrently). A hit in EITHER AuditLog or the receipts
@@ -4818,17 +4857,11 @@ static std::vector<std::string> apply_remote_changes_impl(
                         pending_savepoint = true;
                     }
 
-                    // A leading underscore also names union side tables, not
-                    // just links. Memoize the physical schema before deciding
-                    // whether link DDL is appropriate; union case names may
-                    // themselves be lhs/rhs/rhs_type.
-                    auto schema_it = schema_cache.find(entry.table_name);
-                    if (schema_it == schema_cache.end()) {
-                        schema_it = schema_cache.emplace(
-                            entry.table_name, db.get_table_schema(entry.table_name)).first;
-                    }
+                    // An underscore alone grants no internal-table authority.
+                    // Retain current physical/wire link classification and retry
+                    // behavior; an owned union is a model, never a link.
                     if (!entry.table_name.empty() && entry.table_name[0] == '_' &&
-                        !schema_registry::instance().get_schema(entry.table_name)) {
+                        !is_owned_union && !schema_registry::instance().get_schema(entry.table_name)) {
                         const auto& columns = schema_it->second;
                         const bool missing = columns.empty();
                         auto wire_has = [&](const char* name) {
@@ -4854,6 +4887,8 @@ static std::vector<std::string> apply_remote_changes_impl(
                                 if (missing) schema_it->second = db.get_table_schema(entry.table_name);
                                 tables_ensured.insert(key);
                             }
+                        } else {
+                            throw std::runtime_error("Unrecognized internal table in sync entry");
                         }
                     }
 
@@ -4897,7 +4932,25 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // Existing tables use one schema read per delivery. The
                     // on-demand link path refreshes it after successful creation.
                     const auto& schema = schema_it->second;
-                    bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
+                    bool is_model_table = entry.table_name[0] != '_' || is_owned_union;
+                    // Live union triggers historically wrote the quoted name;
+                    // PRAGMA-based snapshots write the canonical raw name. Copy
+                    // only this legacy case, retaining original wire bytes for
+                    // the audit/relay record and all ordinary entries by reference.
+                    std::optional<audit_log_entry> union_normalized;
+                    const audit_log_entry* normalized_entry = &entry;
+                    if (legacy_discriminator) {
+                        union_normalized.emplace(entry);
+                        auto discriminator = union_normalized->changed_fields.extract("\"case\"");
+                        if (!discriminator.empty()) {
+                            discriminator.key() = "case";
+                            union_normalized->changed_fields.insert(std::move(discriminator));
+                        }
+                        for (auto& name : union_normalized->changed_fields_names) {
+                            if (name == "\"case\"") name = "case";
+                        }
+                        normalized_entry = &*union_normalized;
+                    }
 
                     // A3 — schema-skew tolerance. A NEWER peer's entries may
                     // reference a table or columns this build doesn't have.
@@ -4923,12 +4976,12 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
 
                     if (pending_import) {
-                        for (const auto& name : entry.changed_fields_names) {
+                        for (const auto& name : normalized_entry->changed_fields_names) {
                             if (name == "__lattice_filter_removal" && entry.operation == "DELETE") continue;
                             if (!schema.count(name))
                                 throw std::invalid_argument("Pending entry has an unsupported column");
                         }
-                        for (const auto& [name, value] : entry.changed_fields) {
+                        for (const auto& [name, value] : normalized_entry->changed_fields) {
                             (void)value;
                             if (!schema.count(name))
                                 throw std::invalid_argument("Pending entry has an unsupported value column");
@@ -4940,16 +4993,16 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // no-op — the accepted skew semantic (e.g. a v2 client
                     // never sees v3 tombstone fields until it upgrades).
                     audit_log_entry skew_filtered;
-                    const audit_log_entry* apply_entry = &entry;
+                    const audit_log_entry* apply_entry = normalized_entry;
                     if (is_model_table &&
                         (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
                         bool has_unknown = false;
-                        for (const auto& name : entry.changed_fields_names) {
+                        for (const auto& name : normalized_entry->changed_fields_names) {
                             if (schema.find(name) == schema.end()) { has_unknown = true; break; }
                         }
                         if (has_unknown) {
                             if (atomic_frame) throw std::runtime_error("immutable sync violation: unknown column");
-                            skew_filtered = entry;
+                            skew_filtered = *normalized_entry;
                             auto& names = skew_filtered.changed_fields_names;
                             for (auto it = names.begin(); it != names.end();) {
                                 if (schema.find(*it) == schema.end()) {
@@ -4998,7 +5051,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                             }
                         }
                         if (!drop.empty()) {
-                            if (apply_entry != &skew_filtered) skew_filtered = entry;
+                            if (apply_entry != &skew_filtered) skew_filtered = *normalized_entry;
                             for (const auto& col : drop) {
                                 skew_filtered.changed_fields.erase(col);
                                 auto& names = skew_filtered.changed_fields_names;
@@ -5180,7 +5233,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                         db.restore_pending_change_buffer(pending_change_checkpoint);
                         db.db().execute("RELEASE SAVEPOINT lattice_pending_entry");
                         tables_ensured.clear(); vec0_ensured.clear();
-                        schema_cache.clear(); nullable_cache.clear();
+                        schema_cache.clear(); nullable_cache.clear(); owned_union_tables.clear();
                     }
                     LOG_ERROR("apply_remote", "entry[%zu] skipped (table=%s, op=%s): %s",
                               i, entry.table_name.c_str(), entry.operation.c_str(), e.what());
@@ -5245,6 +5298,7 @@ static std::vector<std::string> apply_remote_changes_impl(
             vec0_ensured.clear();
             schema_cache.clear();
             nullable_cache.clear();
+            owned_union_tables.clear();
             if (!chunk_retried) {
                 chunk_retried = true;
                 LOG_WARN("apply_remote", "chunk [%zu,%zu) failed (%s) — retrying once",
@@ -5269,6 +5323,7 @@ static std::vector<std::string> apply_remote_changes_impl(
             vec0_ensured.clear();
             schema_cache.clear();
             nullable_cache.clear();
+            owned_union_tables.clear();
             LOG_WARN("apply_remote",
                      "chunk [%zu,%zu) failed (non-std exception) — stopping this delivery; "
                      "%zu already-committed entries will be acked",

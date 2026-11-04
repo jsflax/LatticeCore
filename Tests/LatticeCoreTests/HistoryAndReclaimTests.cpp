@@ -618,6 +618,10 @@ TEST(AuditPrecision, ExistingFingerprintUpgradesRealTriggersOnceWithoutChangingW
     auto config = lattice::swift_configuration(tmp.str()); config.target_schema_version = 1;
     const double precise = 1788921763.083822;
     int64_t audit_before = 0;
+    // The raw fixture writer's destructor runs PRAGMA optimize, which can
+    // change the schema cookie. Keep it alive, with no further SQL after
+    // stamping, until the old-cookie admission and both reopen checks finish.
+    std::unique_ptr<lattice::database> fixture_writer;
     {
         auto* ref = lattice::swift_lattice_ref::create(config, schemas);
         auto& db = *ref->get();
@@ -628,7 +632,8 @@ TEST(AuditPrecision, ExistingFingerprintUpgradesRealTriggersOnceWithoutChangingW
     {
         // Stamp after close's possible PRAGMA optimize DDL. This is an owned
         // current writer constructing the old trigger/fingerprint fixture.
-        lattice::database raw(tmp.str());
+        fixture_writer = std::make_unique<lattice::database>(tmp.str());
+        auto& raw = *fixture_writer;
         lattice::detail::register_sync_storage_writer(raw);
         const auto receipt = raw.query("SELECT value FROM _lattice_meta WHERE key LIKE 'schema_structure:%' LIMIT 1");
         ASSERT_EQ(receipt.size(), 1u);

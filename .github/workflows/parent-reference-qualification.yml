@@ -1,0 +1,16 @@
+name: Parent-reference qualification
+
+on:
+  push:
+    branches: [codex/hud-parent-reference-qualification-20261104]
+
+permissions:
+  contents: read
+
+jobs:
+  test-macos:
+    uses: ./.github/workflows/macos.yml
+  test-linux:
+    uses: ./.github/workflows/linux.yml
+  test-capi:
+    uses: ./.github/workflows/capi.yml

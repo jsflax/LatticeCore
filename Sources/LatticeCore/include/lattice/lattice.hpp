@@ -7170,6 +7170,25 @@ private:
                col.compare(col.size() - suffix.size(), suffix.size(), suffix) == 0;
     }
 
+    // A parent column stores scalar references as well as primitive values.
+    // Keep fresh creation, trigger replacement and health checks on the same
+    // physical column set; only lists live solely in their separate tables.
+    static std::vector<std::pair<std::string, column_type>> model_audit_columns(
+        const model_schema& schema) {
+        std::vector<std::pair<std::string, column_type>> columns;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::list) continue;
+            if (prop.is_geo_bounds) {
+                for (const char* suffix : {"_minLat", "_maxLat", "_minLon", "_maxLon"}) {
+                    columns.emplace_back(prop.name + suffix, column_type::real);
+                }
+            } else {
+                columns.emplace_back(prop.name, prop.type);
+            }
+        }
+        return columns;
+    }
+
     void create_model_table(const model_schema& schema) {
         // Create table with SQL-generated UUID default for globalId
         // This matches Lattice.swift's table creation
@@ -7186,7 +7205,7 @@ private:
                ")";
 
         // Collect column names and types for triggers
-        std::vector<std::pair<std::string, column_type>> columns;
+        const auto columns = model_audit_columns(schema);
 
         for (const auto& prop : schema.properties) {
             // Skip list properties - they use separate tables (link_list, geo_bounds_list)
@@ -7199,11 +7218,6 @@ private:
                 sql << ", " << prop.name << "_maxLat REAL";
                 sql << ", " << prop.name << "_minLon REAL";
                 sql << ", " << prop.name << "_maxLon REAL";
-                // Add all 4 columns to trigger list
-                columns.push_back({prop.name + "_minLat", column_type::real});
-                columns.push_back({prop.name + "_maxLat", column_type::real});
-                columns.push_back({prop.name + "_minLon", column_type::real});
-                columns.push_back({prop.name + "_maxLon", column_type::real});
             } else {
                 sql << ", " << prop.name << " ";
                 switch (prop.type) {
@@ -7215,7 +7229,6 @@ private:
                 if (!prop.nullable) {
                     sql << " NOT NULL";
                 }
-                columns.push_back({prop.name, prop.type});
             }
         }
         sql << ")";
@@ -7502,13 +7515,9 @@ private:
             healthy = false;
         }
         if (healthy) {
-            std::vector<std::pair<std::string, column_type>> columns;
-            for (const auto& prop : schema.properties) {
-                if (prop.kind == property_kind::primitive) {
-                    columns.emplace_back(prop.name, prop.is_geo_bounds ? column_type::real : prop.type);
-                }
-            }
-            healthy = !audit_real_precision_stale(schema.table_name, columns);
+            const auto columns = model_audit_columns(schema);
+            healthy = !audit_real_precision_stale(schema.table_name, columns) &&
+                      !audit_column_coverage_stale(schema.table_name, columns);
         }
         if (!healthy) {
             recreate_model_table_triggers(schema);
@@ -7530,25 +7539,49 @@ private:
             std::get<std::string>(rows[0].at("sql")).find("json(printf('%!.17g', ") == std::string::npos;
     }
 
+    // Version-1 precision refresh could retain precise REAL expressions while
+    // dropping scalar reference columns. Those triggers are not healthy: a
+    // parent-only reference change must still create its own audit event.
+    bool audit_column_coverage_stale(
+        const std::string& table_name,
+        const std::vector<std::pair<std::string, column_type>>& columns) {
+        if (columns.empty()) return false;
+        const auto rows = db_->query(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (?,?,?)",
+            {"Audit" + table_name + "Insert", "AuditLog_Update_" + table_name,
+             "Audit" + table_name + "Delete"});
+        if (rows.size() != 3) return true;
+        for (const auto& row : rows) {
+            const auto* name = std::get_if<std::string>(&row.at("name"));
+            const auto* sql = std::get_if<std::string>(&row.at("sql"));
+            if (!name || !sql) return true;
+            const bool update = *name == "AuditLog_Update_" + table_name;
+            const char* prefix = *name == "Audit" + table_name + "Delete" ? "OLD." : "NEW.";
+            for (const auto& column_info : columns) {
+                const auto& column = column_info.first;
+                if (sql->find("'" + column + "', ") == std::string::npos) return true;
+                if (update) {
+                    const auto changed = "OLD." + column + " IS NOT NEW." + column;
+                    const auto body = sql->find(" BEGIN");
+                    if (body == std::string::npos || sql->substr(0, body).find(changed) == std::string::npos ||
+                        sql->find("CASE WHEN " + changed + " THEN '" + column + "' ELSE NULL END") == std::string::npos) return true;
+                } else if (sql->find(std::string(prefix) + column) == std::string::npos) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     void recreate_model_table_triggers(const model_schema& schema) {
         // Drop existing triggers
         drop_model_table_triggers(schema.table_name);
 
-        // Build column list for triggers
-        // geo_bounds properties expand to 4 columns
-        std::vector<std::pair<std::string, column_type>> columns;
+        const auto columns = model_audit_columns(schema);
         std::set<std::string> no_history;
         for (const auto& prop : schema.properties) {
-            if (prop.kind == property_kind::primitive) {
-                if (prop.is_geo_bounds) {
-                    columns.emplace_back(prop.name + "_minLat", column_type::real);
-                    columns.emplace_back(prop.name + "_maxLat", column_type::real);
-                    columns.emplace_back(prop.name + "_minLon", column_type::real);
-                    columns.emplace_back(prop.name + "_maxLon", column_type::real);
-                } else {
-                    columns.emplace_back(prop.name, prop.type);
-                    if (prop.no_history) no_history.insert(prop.name);
-                }
+            if (prop.kind == property_kind::primitive && !prop.is_geo_bounds && prop.no_history) {
+                no_history.insert(prop.name);
             }
         }
 
@@ -8100,7 +8133,8 @@ protected:
 
     // Trigger-only revision: force normal owner activation for existing stores
     // without changing the epoch-9 storage writer capability or table format.
-    static constexpr int kAuditRealPrecisionTemplateVersion = 1;
+    // Version 2 also repairs version-1 refreshes that omitted parent references.
+    static constexpr int kAuditRealPrecisionTemplateVersion = 2;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as

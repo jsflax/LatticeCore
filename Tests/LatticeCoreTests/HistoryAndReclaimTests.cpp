@@ -710,3 +710,200 @@ TEST(AuditPrecision, ExistingOwnedUnionRefreshesRealTriggersWithoutRebuildingRow
     EXPECT_EQ(std::get<double>(events.back().changed_fields.at("value__amount").to_column_value()), precise);
     db.close();
 }
+
+
+namespace {
+
+// Exercise the real bridge schema kind. A primitive TEXT stand-in would hide
+// the predecessor's primitive-only trigger-recreation defect.
+lattice::swift_schema_entry reference_audit_schema() {
+    auto exact = text_prop("exact"); exact.type = lattice::column_type::real;
+    auto body = text_prop("body"); body.no_history = true;
+    auto state = text_prop("state");
+    state.kind = lattice::property_kind::union_type;
+    state.nullable = true; state.is_union = true;
+    state.target_table = "_HxReferenceState";
+    state.union_desc = {"_HxReferenceState", {{"value", {{"text", lattice::column_type::text}}}}};
+    return make_schema("HxReferenceOwner", {{"exact", exact}, {"body", body}, {"state", state}});
+}
+
+struct ReferenceAuditFixture : lattice::swift_lattice {
+    using lattice::swift_lattice::swift_lattice;
+
+    // This is the exact e678 recreation column selection for this model,
+    // including its otherwise-current REAL/no_history expressions.
+    void install_incomplete_version_one() {
+        drop_model_table_triggers("HxReferenceOwner");
+        create_model_table_triggers("HxReferenceOwner",
+            {{"body", lattice::column_type::text}, {"exact", lattice::column_type::real}}, {"body"});
+    }
+    void stamp(const std::string& key) {
+        begin_transaction();
+        store_fingerprint_marker(key);
+        commit();
+    }
+    static std::string version_one_key(const lattice::swift_schema_entry& entry) {
+        std::ostringstream out;
+        out << "swift\nepoch:9\naudit_real_precision:1\ntarget_schema_version:1\ntable:" << entry.table_name << '\n';
+        std::vector<std::string> names;
+        for (const auto& item : entry.properties) names.push_back(item.first);
+        std::sort(names.begin(), names.end());
+        for (const auto& name : names) {
+            out << "prop:" << name << '\x01';
+            serialize_property_for_fingerprint(out, entry.properties.at(name));
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
+        return "schema_fingerprint:" + hex.str();
+    }
+};
+
+auto reference_owner_triggers(lattice::database& db) {
+    return db.query("SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                    "AND tbl_name='HxReferenceOwner' AND name LIKE 'Audit%' ORDER BY name");
+}
+
+void exercise_reference_audit_upgrade(bool incomplete_version_one) {
+    TempDB tmp{incomplete_version_one ? "reference_audit_v1" : "reference_audit_legacy"};
+    TempDB peer_tmp{"reference_audit_peer"};
+    const auto entry = reference_audit_schema();
+    const lattice::SchemaVector schemas{entry};
+    auto config = lattice::swift_configuration(tmp.str()); config.target_schema_version = 1;
+    const double precise = 1788921763.083822;
+    const auto old_key = incomplete_version_one ? ReferenceAuditFixture::version_one_key(entry)
+                                                : LegacyRealAuditFingerprint::key(entry);
+    std::vector<lattice::database::row_t> owners_before, unions_before, audits_before;
+    std::unique_ptr<lattice::database> fixture_writer;
+    {
+        ReferenceAuditFixture old(config, schemas);
+        old.db().execute("INSERT INTO _HxReferenceState(globalId,\"case\",value__text) VALUES('first','value','first payload')");
+        old.db().execute("INSERT INTO HxReferenceOwner(globalId,exact,body,state) VALUES('owner',?,'original','first')", {precise});
+        owners_before = old.db().query("SELECT * FROM HxReferenceOwner ORDER BY id");
+        unions_before = old.db().query("SELECT * FROM _HxReferenceState ORDER BY id");
+        audits_before = old.db().query("SELECT * FROM AuditLog ORDER BY id");
+        if (incomplete_version_one) old.install_incomplete_version_one();
+        else install_legacy_real_audit_templates(old.db(), "HxReferenceOwner", {"exact"});
+        old.stamp(old_key);
+        old.close();
+    }
+    {
+        // Stamp only the cookie after the old owner's possible optimize DDL.
+        // Its exact generated structural receipt remains intact (statistics
+        // tables are excluded by that existing receipt contract). As in the
+        // qualified legacy fixture above, retain this raw writer without
+        // further SQL so its own optimize cannot invalidate the admission.
+        fixture_writer = std::make_unique<lattice::database>(tmp.str());
+        auto& raw = *fixture_writer;
+        lattice::detail::register_sync_storage_writer(raw);
+        raw.execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' AND key<>?", {old_key});
+        raw.execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_structure:%' AND key<>?", {"schema_structure:" + old_key});
+        raw.execute("UPDATE _lattice_meta SET value=? WHERE key=?",
+                    {std::to_string(count(raw, "PRAGMA schema_version")), old_key});
+    }
+    {
+        lattice::database read(tmp.str(), lattice::database::open_mode::read_only);
+        const auto marker = read.query("SELECT value FROM _lattice_meta WHERE key=?", {old_key});
+        ASSERT_EQ(marker.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(marker[0].at("value")), std::to_string(count(read, "PRAGMA schema_version")));
+        ASSERT_EQ(read.query("SELECT value FROM _lattice_meta WHERE key=?", {"schema_structure:" + old_key}).size(), 1u);
+        const auto triggers = reference_owner_triggers(read);
+        ASSERT_EQ(triggers.size(), 3u);
+        for (const auto& row : triggers) {
+            const auto& sql = std::get<std::string>(row.at("sql"));
+            EXPECT_EQ(sql.find("'state'") == std::string::npos, incomplete_version_one);
+            EXPECT_EQ(sql.find("json(printf('%!.17g', ") != std::string::npos, incomplete_version_one);
+        }
+    }
+    std::vector<lattice::database::row_t> repaired_triggers;
+    int64_t repaired_cookie = 0;
+    {
+        lattice::swift_lattice db(config, schemas);
+        EXPECT_EQ(lattice::lattice_db::schema_format_epoch(), 9);
+        EXPECT_EQ(count(db.db(), "SELECT CAST(value AS INTEGER) FROM _lattice_meta WHERE key='schema_version'"), 1);
+        EXPECT_EQ(db.db().query("SELECT * FROM HxReferenceOwner ORDER BY id"), owners_before);
+        EXPECT_EQ(db.db().query("SELECT * FROM _HxReferenceState ORDER BY id"), unions_before);
+        EXPECT_EQ(db.db().query("SELECT * FROM AuditLog ORDER BY id"), audits_before);
+        repaired_triggers = reference_owner_triggers(db.db());
+        ASSERT_EQ(repaired_triggers.size(), 3u);
+        for (const auto& row : repaired_triggers) {
+            const auto& sql = std::get<std::string>(row.at("sql"));
+            EXPECT_NE(sql.find("'state'"), std::string::npos);
+            EXPECT_NE(sql.find("json(printf('%!.17g', "), std::string::npos);
+        }
+        db.close();
+    }
+    {
+        // Finish the first owner's actual destructor before taking the cookie:
+        // optional SQLite statistics DDL is not a trigger-repair repeat.
+        lattice::database read(tmp.str(), lattice::database::open_mode::read_only);
+        repaired_cookie = count(read, "PRAGMA schema_version");
+        EXPECT_EQ(reference_owner_triggers(read), repaired_triggers);
+    }
+    {
+        lattice::swift_lattice db(config, schemas);
+        // A healthy second open must leave all repaired DDL and history alone.
+        EXPECT_EQ(count(db.db(), "PRAGMA schema_version"), repaired_cookie);
+        EXPECT_EQ(reference_owner_triggers(db.db()), repaired_triggers);
+        EXPECT_EQ(db.db().query("SELECT * FROM AuditLog ORDER BY id"), audits_before);
+        lattice::swift_lattice peer(lattice::swift_configuration(peer_tmp.str()), schemas);
+        auto events = lattice::events_after(db.db(), std::nullopt);
+        ASSERT_EQ(lattice::apply_remote_changes(peer, events).size(), events.size());
+        ASSERT_EQ(std::get<std::string>(peer.db().query("SELECT state FROM HxReferenceOwner")[0].at("state")), "first");
+
+        db.db().execute("INSERT INTO _HxReferenceState(globalId,\"case\",value__text) VALUES('second','value','replacement payload')");
+        const auto prior = count(db.db(), "SELECT COUNT(*) FROM AuditLog WHERE tableName='HxReferenceOwner' AND operation='UPDATE'");
+        // Only the parent reference changes; the REAL and no_history fields do
+        // not. The primitive-only predecessor silently misses this event.
+        db.db().execute("UPDATE HxReferenceOwner SET state='second' WHERE globalId='owner'");
+        EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog WHERE tableName='HxReferenceOwner' AND operation='UPDATE'"), prior + 1);
+        auto update = db.db().query("SELECT changedFields,changedFieldsNames FROM AuditLog WHERE tableName='HxReferenceOwner' AND operation='UPDATE' ORDER BY id DESC LIMIT 1");
+        ASSERT_EQ(update.size(), 1u);
+        EXPECT_NE(std::get<std::string>(update[0].at("changedFields")).find("\"state\":\"second\""), std::string::npos);
+        EXPECT_NE(std::get<std::string>(update[0].at("changedFieldsNames")).find("\"state\""), std::string::npos);
+        events = lattice::events_after(db.db(), std::nullopt);
+        ASSERT_EQ(lattice::apply_remote_changes(peer, events).size(), events.size());
+        EXPECT_EQ(std::get<std::string>(peer.db().query("SELECT state FROM HxReferenceOwner")[0].at("state")), "second");
+        EXPECT_EQ(std::get<std::string>(peer.db().query("SELECT value__text FROM _HxReferenceState WHERE globalId='second'")[0].at("value__text")), "replacement payload");
+
+        // Match the optional union setter: delete its owned row, then clear
+        // the parent reference without changing any primitive field.
+        db.db().execute("DELETE FROM _HxReferenceState WHERE globalId='second'");
+        db.db().execute("UPDATE HxReferenceOwner SET state='' WHERE globalId='owner'");
+        events = lattice::events_after(db.db(), std::nullopt);
+        ASSERT_EQ(lattice::apply_remote_changes(peer, events).size(), events.size());
+        EXPECT_EQ(std::get<std::string>(peer.db().query("SELECT state FROM HxReferenceOwner")[0].at("state")), "");
+
+        EXPECT_EQ(count(peer.db(), "SELECT COUNT(*) FROM _HxReferenceState WHERE globalId='second'"), 0);
+
+        // Give this separate parent its own child; deleting it exercises the
+        // existing owned-union cascade rather than sharing a prior child.
+        db.db().execute("INSERT INTO _HxReferenceState(globalId,\"case\",value__text) VALUES('third','value','other payload')");
+        db.db().execute("INSERT INTO HxReferenceOwner(globalId,exact,body,state) VALUES('other',?,'body','third')", {precise});
+        auto inserted = db.db().query("SELECT changedFields FROM AuditLog WHERE tableName='HxReferenceOwner' AND operation='INSERT' AND globalRowId='other'");
+        ASSERT_EQ(inserted.size(), 1u);
+        EXPECT_NE(std::get<std::string>(inserted[0].at("changedFields")).find("\"state\":\"third\""), std::string::npos);
+        db.db().execute("DELETE FROM HxReferenceOwner WHERE globalId='other'");
+        auto deleted = db.db().query("SELECT changedFields FROM AuditLog WHERE tableName='HxReferenceOwner' AND operation='DELETE' AND globalRowId='other'");
+        ASSERT_EQ(deleted.size(), 1u);
+        EXPECT_NE(std::get<std::string>(deleted[0].at("changedFields")).find("\"state\":\"third\""), std::string::npos);
+        EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM _HxReferenceState WHERE globalId='third'"), 0);
+        db.db().execute("UPDATE HxReferenceOwner SET body='new private body' WHERE globalId='owner'");
+        const auto hidden = db.db().query("SELECT changedFields,changedFieldsNames FROM AuditLog WHERE tableName='HxReferenceOwner' AND operation='UPDATE' ORDER BY id DESC LIMIT 1");
+        ASSERT_EQ(hidden.size(), 1u);
+        EXPECT_NE(std::get<std::string>(hidden[0].at("changedFields")).find("\"body\":null"), std::string::npos);
+        EXPECT_EQ(std::get<std::string>(hidden[0].at("changedFields")).find("new private body"), std::string::npos);
+        EXPECT_NE(std::get<std::string>(hidden[0].at("changedFieldsNames")).find("\"body\""), std::string::npos);
+        EXPECT_EQ(std::get<double>(db.db().query("SELECT exact FROM HxReferenceOwner")[0].at("exact")), precise);
+        db.close(); peer.close();
+    }
+}
+
+} // namespace
+
+TEST(AuditPrecision, LegacyUpgradePreservesOwnedParentReferenceAudits) {
+    exercise_reference_audit_upgrade(false);
+}
+
+TEST(AuditPrecision, IncompleteVersionOneParentTriggersRepairOnce) {
+    exercise_reference_audit_upgrade(true);
+}

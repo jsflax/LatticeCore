@@ -1184,6 +1184,7 @@ std::string swift_lattice::compute_swift_fingerprint_key(const SchemaVector& sch
     std::ostringstream out;
     out << "swift\n"
         << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
+        << "audit_real_precision:" << kAuditRealPrecisionTemplateVersion << '\n'
         << "target_schema_version:" << swift_config_.target_schema_version << '\n';
     // Sort tables and property names: SchemaVector order follows the Swift
     // call site and SwiftSchema is an unordered_map — neither is stable.

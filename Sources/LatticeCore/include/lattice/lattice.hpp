@@ -5219,6 +5219,16 @@ private:
                                            const std::string& property_name) {
         register_union_internal_table(union_table_name, parent_table, property_name);
 
+        // The same descriptor drives both a new table and trigger-only upgrades.
+        std::vector<std::pair<std::string, column_type>> columns{{"\"case\"", column_type::text}};
+        for (const auto& c : desc.cases) {
+            for (const auto& value : c.values) {
+                const auto name = c.values.size() == 1 && value.param_name.empty()
+                    ? c.case_name : c.case_name + "__" + value.param_name;
+                columns.emplace_back(name, value.type);
+            }
+        }
+
         // Check if table exists and needs migration (new cases added)
         std::vector<std::string> old_col_names;
         std::vector<database::row_t> original_triggers;
@@ -5238,7 +5248,13 @@ private:
                 }
                 if (needs_rebuild) break;
             }
-            if (!needs_rebuild) return;
+            if (!needs_rebuild) {
+                if (audit_real_precision_stale(union_table_name, columns)) {
+                    drop_model_table_triggers(union_table_name);
+                    create_model_table_triggers(union_table_name, columns);
+                }
+                return;
+            }
 
             // Collect old column names for data copy
             for (const auto& [col, _] : existing_cols) old_col_names.push_back(col);
@@ -5274,8 +5290,6 @@ private:
         }
 
         // Build column info from descriptor
-        std::vector<std::pair<std::string, column_type>> columns;
-        columns.push_back({"\"case\"", column_type::text});
         std::map<std::string, std::vector<std::string>> case_to_cols;
         std::vector<std::string> all_case_cols;
 
@@ -5301,13 +5315,11 @@ private:
             if (c.values.size() == 1 && c.values[0].param_name.empty()) {
                 std::string col = c.case_name;
                 sql << ", " << col << " " << sql_type_string(c.values[0].type);
-                columns.push_back({col, c.values[0].type});
                 cols.push_back(col);
             } else {
                 for (const auto& val : c.values) {
                     std::string col = c.case_name + "__" + val.param_name;
                     sql << ", " << col << " " << sql_type_string(val.type);
-                    columns.push_back({col, val.type});
                     cols.push_back(col);
                 }
             }
@@ -7489,9 +7501,33 @@ private:
                      schema.table_name.c_str());
             healthy = false;
         }
+        if (healthy) {
+            std::vector<std::pair<std::string, column_type>> columns;
+            for (const auto& prop : schema.properties) {
+                if (prop.kind == property_kind::primitive) {
+                    columns.emplace_back(prop.name, prop.is_geo_bounds ? column_type::real : prop.type);
+                }
+            }
+            healthy = !audit_real_precision_stale(schema.table_name, columns);
+        }
         if (!healthy) {
             recreate_model_table_triggers(schema);
         }
+    }
+
+    // Pre-precision templates all passed REAL values straight into json_object.
+    // The INSERT template always includes REAL fields, even no_history ones.
+    bool audit_real_precision_stale(
+        const std::string& table_name,
+        const std::vector<std::pair<std::string, column_type>>& columns) {
+        if (std::none_of(columns.begin(), columns.end(), [](const auto& col) {
+                return col.second == column_type::real;
+            })) return false;
+        const auto rows = db_->query(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            {"Audit" + table_name + "Insert"});
+        return rows.size() != 1 || !std::holds_alternative<std::string>(rows[0].at("sql")) ||
+            std::get<std::string>(rows[0].at("sql")).find("json(printf('%!.17g', ") == std::string::npos;
     }
 
     void recreate_model_table_triggers(const model_schema& schema) {
@@ -8062,6 +8098,10 @@ protected:
     /// together; pre-cutover writer handles cannot mutate guarded tables.
     static constexpr int kLatticeSchemaFormatEpoch = 9;
 
+    // Trigger-only revision: force normal owner activation for existing stores
+    // without changing the epoch-9 storage writer capability or table format.
+    static constexpr int kAuditRealPrecisionTemplateVersion = 1;
+
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as
     /// lattice_schema_format_epoch()). The constant itself stays protected
@@ -8119,6 +8159,7 @@ protected:
     std::string compute_core_fingerprint_key() const {
         std::ostringstream out;
         out << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
+            << "audit_real_precision:" << kAuditRealPrecisionTemplateVersion << '\n'
             << "target_schema_version:" << config_.target_schema_version << '\n';
         auto schemas = schema_registry::instance().all_schemas();
         std::sort(schemas.begin(), schemas.end(),
@@ -8390,10 +8431,14 @@ protected:
         // Skip if no columns to track
         if (columns.empty()) return;
 
-        // Helper to wrap BLOB columns with hex() for JSON compatibility
+        // Preserve BLOB encoding and exact finite REAL values in audit JSON.
         auto value_expr = [](const std::string& prefix, const std::string& col, column_type type) {
             if (type == column_type::blob) {
                 return "hex(" + prefix + "." + col + ")";
+            }
+            if (type == column_type::real) {
+                const auto value = prefix + "." + col;
+                return "CASE WHEN " + value + " IS NULL THEN NULL ELSE json(printf('%!.17g', " + value + ")) END";
             }
             return prefix + "." + col;
         };

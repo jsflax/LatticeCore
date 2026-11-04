@@ -527,3 +527,181 @@ TEST(CurrentHistory, RejectsUncheckedAndOtherThreadTransactionsBeforeAnyWork) {
     db.rollback();
     EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), 0);
 }
+
+
+namespace {
+
+// Reinstall the exact pre-precision value expressions while preserving the
+// trigger gates and all other generated SQL. This models a real existing store.
+void install_legacy_real_audit_templates(lattice::database& db, const std::string& table,
+                                        const std::vector<std::string>& real_columns) {
+    const auto triggers = db.query(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (?,?,?)",
+        {"Audit" + table + "Insert", "AuditLog_Update_" + table, "Audit" + table + "Delete"});
+    ASSERT_EQ(triggers.size(), 3u);
+    for (const auto& row : triggers) {
+        auto sql = std::get<std::string>(row.at("sql"));
+        size_t replacements = 0;
+        for (const auto& column : real_columns) {
+            for (const char* prefix : {"NEW", "OLD"}) {
+                const auto value = std::string(prefix) + "." + column;
+                const auto precise = "CASE WHEN " + value + " IS NULL THEN NULL ELSE json(printf('%!.17g', " + value + ")) END";
+                size_t offset = 0;
+                while ((offset = sql.find(precise, offset)) != std::string::npos) {
+                    sql.replace(offset, precise.size(), value);
+                    offset += value.size();
+                    ++replacements;
+                }
+            }
+        }
+        ASSERT_GT(replacements, 0u);
+        db.execute("DROP TRIGGER " + std::get<std::string>(row.at("name")));
+        db.execute(sql);
+    }
+}
+
+// Serialize this one-table fixture using the published ffb84 Swift fingerprint
+// format. The property serializer is unchanged; the old format had no audit
+// template revision. A current schema cookie must not admit these old triggers.
+struct LegacyRealAuditFingerprint : lattice::lattice_db {
+    static std::string key(const lattice::swift_schema_entry& entry) {
+        std::ostringstream out;
+        out << "swift\nepoch:9\ntarget_schema_version:1\ntable:" << entry.table_name << '\n';
+        std::vector<std::string> names;
+        for (const auto& item : entry.properties) names.push_back(item.first);
+        std::sort(names.begin(), names.end());
+        for (const auto& name : names) {
+            out << "prop:" << name << '\x01';
+            serialize_property_for_fingerprint(out, entry.properties.at(name));
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
+        return "schema_fingerprint:" + hex.str();
+    }
+};
+
+} // namespace
+
+TEST(AuditPrecision, LiveRealInsertUpdateDeletePreserveExactValuesAndNull) {
+    TempDB tmp{"live_audit_real"};
+    auto exact = text_prop("exact"); exact.type = lattice::column_type::real;
+    auto optional = exact; optional.name = "optional"; optional.nullable = true;
+    const auto schemas = lattice::SchemaVector{make_schema("HxLiveReal", {{"exact", exact}, {"optional", optional}})};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    const double first = 1788921763.083822;
+    const double next = 1788921763.083823;
+    db.db().execute("INSERT INTO HxLiveReal(globalId,exact,optional) VALUES('one',?,NULL)", {first});
+    db.db().execute("UPDATE HxLiveReal SET exact=?,optional=? WHERE globalId='one'", {next, first});
+    db.db().execute("UPDATE HxLiveReal SET optional=NULL WHERE globalId='one'");
+    db.db().execute("DELETE FROM HxLiveReal WHERE globalId='one'");
+    const auto events = lattice::events_after(db.db(), std::nullopt);
+    ASSERT_EQ(events.size(), 4u);
+    EXPECT_EQ(events[0].operation, "INSERT");
+    EXPECT_EQ(std::get<double>(events[0].changed_fields.at("exact").to_column_value()), first);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(events[0].changed_fields.at("optional").to_column_value()));
+    EXPECT_EQ(events[1].operation, "UPDATE");
+    EXPECT_EQ(std::get<double>(events[1].changed_fields.at("exact").to_column_value()), next);
+    EXPECT_EQ(std::get<double>(events[1].changed_fields.at("optional").to_column_value()), first);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(events[2].changed_fields.at("optional").to_column_value()));
+    EXPECT_EQ(events[3].operation, "DELETE");
+    EXPECT_EQ(std::get<double>(events[3].changed_fields.at("exact").to_column_value()), next);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(events[3].changed_fields.at("optional").to_column_value()));
+    db.close();
+}
+
+TEST(AuditPrecision, ExistingFingerprintUpgradesRealTriggersOnceWithoutChangingWriterEpoch) {
+    TempDB tmp{"audit_real_upgrade"};
+    auto exact = text_prop("exact"); exact.type = lattice::column_type::real;
+    const auto entry = make_schema("HxUpgradeReal", {{"exact", exact}});
+    const auto schemas = lattice::SchemaVector{entry};
+    auto config = lattice::swift_configuration(tmp.str()); config.target_schema_version = 1;
+    const double precise = 1788921763.083822;
+    int64_t audit_before = 0;
+    {
+        auto* ref = lattice::swift_lattice_ref::create(config, schemas);
+        auto& db = *ref->get();
+        db.db().execute("INSERT INTO HxUpgradeReal(globalId,exact) VALUES('one',?)", {precise});
+        audit_before = count(db.db(), "SELECT COUNT(*) FROM AuditLog");
+        db.close();
+    }
+    {
+        // Stamp after close's possible PRAGMA optimize DDL. This is an owned
+        // current writer constructing the old trigger/fingerprint fixture.
+        lattice::database raw(tmp.str());
+        lattice::detail::register_sync_storage_writer(raw);
+        const auto receipt = raw.query("SELECT value FROM _lattice_meta WHERE key LIKE 'schema_structure:%' LIMIT 1");
+        ASSERT_EQ(receipt.size(), 1u);
+        install_legacy_real_audit_templates(raw, "HxUpgradeReal", {"exact"});
+        const auto cookie = std::to_string(count(raw, "PRAGMA schema_version"));
+        raw.execute("DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' OR key LIKE 'schema_structure:%'");
+        const auto old_key = LegacyRealAuditFingerprint::key(entry);
+        raw.execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)", {old_key, cookie});
+        raw.execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)",
+                    {"schema_structure:" + old_key, std::get<std::string>(receipt[0].at("value"))});
+    }
+    {
+        lattice::database observer(tmp.str(), lattice::database::open_mode::read_only);
+        const auto markers = observer.query("SELECT value FROM _lattice_meta WHERE key=?", {LegacyRealAuditFingerprint::key(entry)});
+        ASSERT_EQ(markers.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(markers[0].at("value")), std::to_string(count(observer, "PRAGMA schema_version")));
+        const auto old_sql = observer.query("SELECT sql FROM sqlite_master WHERE name='AuditHxUpgradeRealInsert'");
+        ASSERT_EQ(old_sql.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(old_sql[0].at("sql")).find("json(printf('%!.17g', "), std::string::npos);
+    }
+    int64_t upgraded_cookie = 0;
+    std::vector<lattice::database::row_t> upgraded_triggers;
+    {
+        auto* ref = lattice::swift_lattice_ref::create(config, schemas);
+        auto& db = *ref->get();
+        EXPECT_EQ(lattice::lattice_db::schema_format_epoch(), 9);
+        EXPECT_EQ(count(db.db(), "SELECT CAST(value AS INTEGER) FROM _lattice_meta WHERE key='schema_version'"), 1);
+        EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), audit_before);
+        EXPECT_EQ(std::get<double>(db.db().query("SELECT exact FROM HxUpgradeReal")[0].at("exact")), precise);
+        upgraded_triggers = db.db().query(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='HxUpgradeReal' AND name LIKE 'Audit%' ORDER BY name");
+        ASSERT_EQ(upgraded_triggers.size(), 3u);
+        for (const auto& row : upgraded_triggers) {
+            EXPECT_NE(std::get<std::string>(row.at("sql")).find("json(printf('%!.17g', "), std::string::npos);
+        }
+        db.db().execute("INSERT INTO HxUpgradeReal(globalId,exact) VALUES('two',?)", {precise});
+        const auto events = lattice::events_after(db.db(), std::nullopt);
+        ASSERT_FALSE(events.empty());
+        EXPECT_EQ(std::get<double>(events.back().changed_fields.at("exact").to_column_value()), precise);
+        upgraded_cookie = count(db.db(), "PRAGMA schema_version");
+        db.close();
+    }
+    {
+        auto* ref = lattice::swift_lattice_ref::create(config, schemas);
+        auto& db = *ref->get();
+        EXPECT_EQ(count(db.db(), "PRAGMA schema_version"), upgraded_cookie);
+        EXPECT_EQ(db.db().query(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='HxUpgradeReal' AND name LIKE 'Audit%' ORDER BY name"), upgraded_triggers);
+        db.close();
+    }
+}
+
+TEST(AuditPrecision, ExistingOwnedUnionRefreshesRealTriggersWithoutRebuildingRows) {
+    TempDB tmp{"audit_union_real_upgrade"};
+    const auto schemas = lattice::SchemaVector{make_schema("HxRealOwner", {{"state", text_prop("state")}})};
+    const lattice::union_descriptor descriptor{"_HxRealState", {{"none", {}}, {"value", {{"amount", lattice::column_type::real}}}}};
+    auto* ref = lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    db.ensure_union_table("_HxRealState", descriptor, "HxRealOwner", "state");
+    const double precise = 1788921763.083822;
+    db.db().execute("INSERT INTO _HxRealState(globalId,\"case\",value__amount) VALUES('state','value',?)", {precise});
+    const auto rows = db.db().query("SELECT * FROM _HxRealState");
+    const auto audits = count(db.db(), "SELECT COUNT(*) FROM AuditLog");
+    install_legacy_real_audit_templates(db.db(), "_HxRealState", {"value__amount"});
+    db.ensure_union_table("_HxRealState", descriptor, "HxRealOwner", "state");
+    EXPECT_EQ(db.db().query("SELECT * FROM _HxRealState"), rows);
+    EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog"), audits);
+    const auto cookie = count(db.db(), "PRAGMA schema_version");
+    db.ensure_union_table("_HxRealState", descriptor, "HxRealOwner", "state");
+    EXPECT_EQ(count(db.db(), "PRAGMA schema_version"), cookie);
+    db.db().execute("INSERT INTO _HxRealState(globalId,\"case\",value__amount) VALUES('new','value',?)", {precise});
+    const auto events = lattice::events_after(db.db(), std::nullopt);
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(std::get<double>(events.back().changed_fields.at("value__amount").to_column_value()), precise);
+    db.close();
+}

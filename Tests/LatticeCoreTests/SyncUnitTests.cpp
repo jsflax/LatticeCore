@@ -3474,44 +3474,80 @@ TEST(SyncDelivery, CurrentSnapshotProjectionRefusesBeforeHydrationAndSupportsLin
 
 TEST(SyncDelivery, VectorFilterEnableAndReenableDrainPastSnapshotWindowWithRegisteredLinks) {
     bounded_mock_case([] {
+        // Test-local stderr breadcrumbs survive the unchanged SIGALRM watchdog.
+        // No per-row logging: the existing finite drain loops bound this output.
+        struct phase_trace {
+            std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+            void emit(const char* phase, int pass = -1, size_t count = 0) const {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                std::fprintf(stderr, "vector_filter_phase phase=%s pass=%d count=%zu elapsed_ms=%lld\n",
+                             phase, pass, count, static_cast<long long>(elapsed));
+                std::fflush(stderr);
+            }
+        } trace;
+        struct scope_marker {
+            const phase_trace& trace;
+            const char* phase;
+            ~scope_marker() { trace.emit(phase); }
+        };
+        const scope_marker fixture_exit{trace, "fixture_teardown_done"};
+        trace.emit("setup_begin");
         auto factory=std::make_shared<lattice::mock_network_factory>();lattice::set_network_factory(factory);
         auto scheduler=std::make_shared<outbox_queue>();TempDB tmp{"vectorfilterreconcile"};
         lattice::configuration config(tmp.str());config.sched=scheduler;
         auto db=std::make_unique<lattice::lattice_db>(config);auto* owned=db.get();
+        trace.emit("database_ready");
         auto schema=lattice::managed<FilterVectorRow>::schema();
         schema.properties.back().is_vector=true;
         const auto embedding=pack_floats({1.0f,2.0f});
         std::vector<FilterVectorRow> rows;
         for(int i=0;i<257;++i) rows.push_back({"selected-"+std::to_string(i),1,embedding});
         rows.push_back({"excluded",2,embedding});
+        trace.emit("initial_bulk_begin");
         db->add_bulk_with_schema(std::move(rows),schema);
+        trace.emit("initial_bulk_done");
         ASSERT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _FilterVectorRow_embedding_vec"),258);
         ASSERT_GT(outbox_number(*owned,"SELECT COUNT(*) AS n FROM pragma_table_list "
             "WHERE schema='main' AND type='shadow' AND name LIKE '_FilterVectorRow_embedding_vec%'"),0);
         const auto parent=std::get<std::string>(owned->db().query(
             "SELECT globalId FROM FilterVectorRow WHERE name='selected-0'")[0].at("globalId"));
         // Use the real registration APIs, including an empty-parent legacy-compatible registration.
+        trace.emit("registered_links_begin");
         owned->ensure_link_table("_FilterVectorRow_links");
         owned->ensure_virtual_link_table("_FilterVectorRow_polymorphic","FilterVectorRow");
         owned->ensure_geo_bounds_list_table("FilterVectorRow","zones");
         owned->db().execute("INSERT INTO _FilterVectorRow_links(lhs,rhs) VALUES(?,?)",{parent,parent});
         owned->db().execute("INSERT INTO _FilterVectorRow_polymorphic(lhs,rhs,rhs_type) VALUES(?,?,'FilterVectorRow')",{parent,parent});
         owned->db().execute("INSERT INTO _FilterVectorRow_zones(parent_id,minLat,maxLat,minLon,maxLon) VALUES(?,0,1,0,1)",{parent});
+        trace.emit("registered_links_done");
         auto cfg=outbox_config("ipc:vector-filter");cfg.chunk_size=64;
         cfg.sync_filter=std::vector<lattice::sync_filter_entry>{};
         std::vector<std::string> errors;
+        const scope_marker sync_teardown_done{trace, "sync_teardown_done"};
+        trace.emit("sync_construct_begin");
         outbox_probe sync(std::move(db),cfg);
+        const scope_marker sync_teardown_begin{trace, "sync_teardown_begin"};
+        trace.emit("sync_construct_done");
         sync.set_on_error([&](const std::string& error){errors.push_back(error);});
-        sync.connect();scheduler->drain();
+        trace.emit("connect_begin");
+        sync.connect();
+        trace.emit("initial_drain_begin");
+        scheduler->drain();
+        trace.emit("initial_drain_done");
         auto* transport=factory->last_websocket();
         ASSERT_TRUE(outbox_sent(*transport).empty());
         transport->clear_sent_messages();
         std::vector<lattice::audit_log_entry> received;
         auto drain=[&](const std::string& operation) {
+            trace.emit("drain_enter");
             received.clear();std::set<std::string> seen;
             for(int pass=0;pass<16;++pass) {
+                trace.emit("drain_pass_begin", pass);
                 scheduler->drain();
+                trace.emit("scheduler_drained", pass);
                 const auto batch=outbox_sent(*transport);transport->clear_sent_messages();
+                trace.emit("batch_read", pass, batch.size());
                 if(batch.empty()) break;
                 std::vector<std::string> acks;
                 for(const auto& entry:batch) {
@@ -3526,27 +3562,40 @@ TEST(SyncDelivery, VectorFilterEnableAndReenableDrainPastSnapshotWindowWithRegis
                     received.push_back(entry);acks.push_back(entry.global_id);
                 }
                 outbox_ack(*transport,acks);
+                trace.emit("ack_returned", pass, acks.size());
             }
             EXPECT_TRUE(errors.empty())<<(errors.empty()?"":errors.front());
             EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
             EXPECT_EQ(sync.get_progress().pending_upload,0);
+            trace.emit("drain_return", -1, received.size());
         };
         const std::vector<lattice::sync_filter_entry> enabled={{"FilterVectorRow",std::string("age=1")}};
+        trace.emit("enable_begin");
         sync.update_sync_filter(enabled);drain("INSERT");
+        trace.emit("enable_done", -1, received.size());
         ASSERT_EQ(received.size(),260u); // 257 vector rows plus all three registered internal rows.
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),260);
         // Exercise the same OFF->ON state transition, with new rows admitted while OFF.
+        trace.emit("disable_begin");
         sync.update_sync_filter({});drain("DELETE");
+        trace.emit("disable_done", -1, received.size());
         ASSERT_EQ(received.size(),260u);
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
         std::vector<FilterVectorRow> later;
         for(int i=0;i<20;++i) later.push_back({"while-off-"+std::to_string(i),1,embedding});
-        owned->add_bulk_with_schema(std::move(later),schema);sync.sync_now();scheduler->drain();
+        trace.emit("while_off_bulk_begin");
+        owned->add_bulk_with_schema(std::move(later),schema);sync.sync_now();
+        trace.emit("while_off_drain_begin");
+        scheduler->drain();
+        trace.emit("while_off_drain_done");
         ASSERT_TRUE(outbox_sent(*transport).empty());
+        trace.emit("reenable_begin");
         sync.update_sync_filter(enabled);drain("INSERT");
+        trace.emit("reenable_done", -1, received.size());
         ASSERT_EQ(received.size(),280u);
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),280);
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _FilterVectorRow_embedding_vec"),278);
+        trace.emit("body_return");
     });
 }
 

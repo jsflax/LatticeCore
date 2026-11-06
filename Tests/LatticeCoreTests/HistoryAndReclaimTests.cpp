@@ -136,6 +136,85 @@ TEST(HistoryRegeneration, ShadowAndInternalTablesAreSkippedByShape) {
     EXPECT_EQ(count(db.db(), "SELECT COUNT(*) FROM AuditLog WHERE tableName = 'TestPerson'"), 1);
 }
 
+namespace {
+void verify_owned_union_history_regeneration(bool force) {
+    TempDB tmp{force ? "history_union_force" : "history_union_generate"};
+    auto schemas = band_schemas();
+    schemas[0].properties["state"] = text_prop("state");
+    std::unique_ptr<lattice::swift_lattice_ref> ref(
+        lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), schemas));
+    auto& owner = *ref->get();
+    auto& core = static_cast<lattice::lattice_db&>(owner);
+    auto& db = owner.db();
+    const lattice::union_descriptor descriptor{"_HxRegeneratedState", {
+        {"none", {}}, {"waiting", {{"reason", lattice::column_type::text},
+                                  {"payload", lattice::column_type::blob}}}}};
+    owner.ensure_union_table("_HxRegeneratedState", descriptor, "HxBand", "state");
+    db.execute("INSERT INTO _HxRegeneratedState(globalId,\"case\",waiting__reason,waiting__payload) "
+               "VALUES('state','waiting','Saved reason',x'0041FF')");
+    db.execute("INSERT INTO HxBand(globalId,name,state) VALUES('band','Saved band','state')");
+    db.execute("INSERT INTO HxAlbum(globalId,title,year) VALUES('album','Saved album',1971)");
+    db.execute("INSERT INTO _HxBand_HxAlbum_albums(lhs,rhs) VALUES('band','album')");
+    const auto bands = db.query("SELECT id,globalId,name,state FROM HxBand");
+    const auto albums = db.query("SELECT id,globalId,title,year FROM HxAlbum");
+    const auto states = db.query("SELECT id,globalId,\"case\",waiting__reason,waiting__payload FROM _HxRegeneratedState");
+    const auto links = db.query("SELECT rowid,globalId,lhs,rhs FROM _HxBand_HxAlbum_albums");
+    const auto before = core.read_audit_read_fence();
+    ASSERT_GT(before.cursor.head, 0);
+    ASSERT_FALSE(before.has_history_generation);
+
+    int64_t generated = -1;
+    if (force) {
+        // Exercise the sealed Swift-facing entry: a SQL failure must not look
+        // like a successful empty reset, nor be cleared by the next query.
+        generated = ref->force_compact_audit_log();
+        const auto error = ref->last_query_error();
+        ASSERT_FALSE(error.has_value()) << error.value_or("");
+    } else {
+        // Ordinary history generation must also quote the union's `case`
+        // column when reconstructing missing INSERT snapshots.
+        db.execute("DELETE FROM AuditLog");
+        ASSERT_NO_THROW(generated = owner.generate_history());
+    }
+    ASSERT_EQ(generated, 4) << "band, album, owned union and link all have snapshots";
+    ASSERT_EQ(count(db, "SELECT COUNT(*) FROM AuditLog"), 4);
+    EXPECT_EQ(count(db, "SELECT COUNT(*) FROM AuditLog WHERE operation='INSERT' AND synthesized=1"), 4);
+    EXPECT_EQ(count(db, "SELECT COUNT(*) FROM AuditLog WHERE tableName='_HxRegeneratedState' "
+                       "AND globalRowId='state' AND json_valid(changedFields) "
+                       "AND json_extract(changedFields,'$.case')='waiting' "
+                       "AND json_extract(changedFields,'$.waiting__reason')='Saved reason' "
+                       "AND json_extract(changedFields,'$.waiting__payload')='0041FF'"), 1);
+    EXPECT_EQ(count(db, "SELECT COUNT(*) FROM AuditLog WHERE tableName='HxBand' "
+                       "AND globalRowId='band' AND json_extract(changedFields,'$.state')='state'"), 1);
+    EXPECT_EQ(count(db, "SELECT COUNT(*) FROM AuditLog WHERE tableName='_HxBand_HxAlbum_albums' "
+                       "AND rowId=0 AND json_extract(changedFields,'$.lhs')='band' "
+                       "AND json_extract(changedFields,'$.rhs')='album'"), 1);
+    EXPECT_EQ(db.query("SELECT id,globalId,name,state FROM HxBand"), bands);
+    EXPECT_EQ(db.query("SELECT id,globalId,title,year FROM HxAlbum"), albums);
+    EXPECT_EQ(db.query("SELECT id,globalId,\"case\",waiting__reason,waiting__payload FROM _HxRegeneratedState"), states);
+    EXPECT_EQ(db.query("SELECT rowid,globalId,lhs,rhs FROM _HxBand_HxAlbum_albums"), links);
+    const auto after = core.read_audit_read_fence();
+    EXPECT_GT(after.cursor.floor, before.cursor.head);
+    EXPECT_GT(after.cursor.head, before.cursor.head);
+    EXPECT_EQ(after.has_history_generation, force);
+    if (force) {
+        EXPECT_EQ(after.history_generation.size(), 36u);
+        EXPECT_NE(after.history_generation, before.history_generation);
+    } else {
+        EXPECT_EQ(after.history_generation, before.history_generation);
+    }
+    owner.close();
+}
+} // namespace
+
+TEST(HistoryRegeneration, GenerateHistoryPreservesOwnedUnionPayloadsAndLinks) {
+    verify_owned_union_history_regeneration(false);
+}
+
+TEST(HistoryRegeneration, ForceCompactPreservesOwnedUnionPayloadsLinksAndResetFence) {
+    verify_owned_union_history_regeneration(true);
+}
+
 // ---------------------------------------------------------------------------
 // reclaim_space: the file shrinks in ONE pass; the old order did not shrink it.
 // ---------------------------------------------------------------------------

@@ -4696,9 +4696,9 @@ private:
 
                         // Wrap BLOB columns with hex() for JSON compatibility
                         if (col_type == "BLOB") {
-                            json_cols << "'" << col_name << "', hex(" << col_name << ")";
+                            json_cols << "'" << col_name << "', hex(" << history_quote_identifier_(col_name) << ")";
                         } else {
-                            json_cols << "'" << col_name << "', " << col_name;
+                            json_cols << "'" << col_name << "', " << history_quote_identifier_(col_name);
                         }
                         json_names << "'" << col_name << "'";
                     }

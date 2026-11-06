@@ -198,7 +198,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         flags |= SQLITE_OPEN_URI;
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     } else {
-        flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+        flags |= SQLITE_OPEN_READWRITE;
+        if (mode == open_mode::read_write) flags |= SQLITE_OPEN_CREATE;
         flags |= SQLITE_OPEN_URI;  // see read-only branch note
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
@@ -221,6 +222,24 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     // are common rather than exceptional.
     if (cancellation) bind_cancellation_token(std::move(cancellation));
     else configure_busy_timeout(busy_timeout_ms_);
+
+    // Register virtual-table modules before any statement can load sqlite_schema.
+    // SQLite classifies their shadow tables while loading the schema; registering
+    // vec0 afterward can leave them classified as ordinary tables on this handle.
+    // Storage writer guards must never be installed on virtual-table shadows.
+    int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
+    if (vec_rc != SQLITE_OK) {
+        db_ = nullptr;
+        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
+        throw db_error("Failed to initialize sqlite-vec extension");
+    }
+
+    // Even without an explicit checkpoint, SQLite can checkpoint the last WAL writer on close.
+    // Strict existing opens must remain byte-preserving when later admission rejects the handle.
+    if (mode == open_mode::read_write_existing) {
+        const int configured = sqlite3_db_config(db_, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, nullptr);
+        if (configured != SQLITE_OK) throw db_error("Cannot disable checkpoint-on-close for existing open");
+    }
 
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
@@ -278,13 +297,6 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     sqlite3_db_config(db_, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, nullptr);
 #endif
 
-    // Initialize sqlite-vec extension for vector search
-    int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
-    if (vec_rc != SQLITE_OK) {
-        db_ = nullptr;
-        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
-        throw db_error("Failed to initialize sqlite-vec extension");
-    }
     opening.release();  // Fully initialized: ~database() now owns the connection.
 }
 
@@ -372,6 +384,31 @@ void database::close() {
     // maintenance scope likewise settles its complete transaction on its
     // owning thread; logical close never strands that transaction halfway.
     closed_.store(true, std::memory_order_release);
+}
+
+void database::require_main_file_unmoved(const std::string& expected_path) {
+    if (expected_path.empty() || expected_path.size() > 4096 || expected_path.find('\0') != std::string::npos)
+        throw db_error("Main file currentness expected path is invalid");
+    if (!db_ || is_closed()) throw db_error("Main file connection is closed");
+    // FULLMUTEX serializes access to SQLite's actual open-file/VFS state. Unlike
+    // statement_scope, this probe must not seal/deliver unrelated transaction work.
+    auto* mutex = sqlite3_db_mutex(db_);
+    sqlite3_mutex_enter(mutex);
+    struct unlock { sqlite3_mutex* value; ~unlock() { sqlite3_mutex_leave(value); } } held{mutex};
+    if (is_closed()) throw db_error("Main file connection is closed");
+    const char* filename = sqlite3_db_filename(db_, "main");
+    if (!filename || !*filename) throw db_error("Main file currentness requires a file database");
+    // Compare SQLite's opened filename, not the configured URL or a newly resolved alias.
+    if (expected_path != filename) throw db_error("Main file currentness expected path does not match the open database");
+#ifdef SQLITE_FCNTL_HAS_MOVED
+    int moved = -1; // A successful opcode that fails to fill its output is not admission.
+    const int result = sqlite3_file_control(db_, "main", SQLITE_FCNTL_HAS_MOVED, &moved);
+    if (result != SQLITE_OK) throw db_error("Main file currentness is unsupported or failed (SQLite " + std::to_string(result) + ")");
+    if (moved != 0) throw db_error("The open main file no longer matches its pathname");
+#else
+    throw db_error("Main file currentness is unsupported by SQLite");
+#endif
+    if (is_closed()) throw db_error("Main file connection closed during currentness check");
 }
 
 void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back) {

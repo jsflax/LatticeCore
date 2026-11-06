@@ -395,6 +395,13 @@ public:
         }
     }
 
+    // Borrowed from this object's schema; callers must copy before releasing it.
+    const property_descriptor* get_property_descriptor(const std::string& name) const {
+        const auto& properties = lattice ? managed_.properties_ : unmanaged_.properties;
+        auto found = properties.find(name);
+        return found == properties.end() ? nullptr : &found->second;
+    }
+
 private:
     // to_json internals (dynamic_object.cpp). out_json is a nlohmann::json*
     // passed as void* to keep the JSON dependency out of this header;

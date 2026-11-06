@@ -10,6 +10,7 @@
 
 #if GTEST_HAS_DEATH_TEST && (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include <csignal>
+#include <pthread.h>
 #include <unistd.h>
 
 namespace {
@@ -152,6 +153,111 @@ int concurrent_registration_case() {
     return 0;
 }
 
+struct LateRegistryCleanup {
+    std::unique_ptr<lattice::lattice_db> retiring;
+    lattice::lattice_db* survivor = nullptr;
+    std::string path;
+    bool cpp_tls_retired = false;
+    int earlier_visits = 0;
+    int late_visits = 0;
+    int cleanup_calls = 0;
+    int failure = 0;
+};
+
+void late_registry_cleanup(void* value) {
+    auto& state = *static_cast<LateRegistryCleanup*>(value);
+    ++state.cleanup_calls;
+    if (!state.cpp_tls_retired) { state.failure = 20; return; }
+    try {
+        // Match Foundation's Thread/closure release at pthread-key cleanup:
+        // real store destruction invokes the ordinary sibling-handoff walk.
+        state.retiring.reset();
+        lattice::instance_registry::instance().for_each_alive(state.path,
+            [&](lattice::lattice_db* owner) {
+                if (owner != state.survivor || owner->is_closed()) state.failure = 21;
+                ++state.late_visits;
+            });
+    } catch (...) { state.failure = 22; }
+}
+
+int late_thread_exit_case() {
+    lattice::lattice_db survivor;
+    LateRegistryCleanup state;
+    state.survivor = &survivor;
+    state.path = survivor.config().path;
+    pthread_key_t key;
+    if (pthread_key_create(&key, late_registry_cleanup) != 0) return 23;
+    std::thread worker([&] {
+        struct InstallLateCleanup {
+            pthread_key_t key;
+            LateRegistryCleanup* state;
+            ~InstallLateCleanup() {
+                state->cpp_tls_retired = true;
+                if (pthread_setspecific(key, state) != 0) state->failure = 24;
+            }
+        };
+        // Initialize this BEFORE the first registry visit. Any C++ TLS depth
+        // container initialized by that visit is destroyed before this marker.
+        // Install the pthread value during marker destruction so the actual
+        // key callback follows it even on platforms interleaving TLS cleanup.
+        thread_local InstallLateCleanup install{key, &state};
+        (void)install;
+        state.retiring = std::make_unique<lattice::lattice_db>();
+        lattice::instance_registry::instance().for_each_alive(state.path,
+            [&](lattice::lattice_db*) { ++state.earlier_visits; });
+    });
+    worker.join();
+    const auto deleted = pthread_key_delete(key);
+    if (state.failure) return state.failure;
+    if (deleted != 0 || !state.cpp_tls_retired || state.earlier_visits != 2 ||
+        state.cleanup_calls != 1 || state.late_visits != 1 || state.retiring) return 25;
+    std::fputs("late_registry_cleanup_complete earlier=2 late=1 cleanup=1\n", stderr);
+    return 0;
+}
+
+int nested_registry_depth_case() {
+    auto& registry = lattice::instance_registry::instance();
+    lattice::lattice_db first, second;
+    auto a = std::make_shared<lattice::instance_guard>();
+    auto b = std::make_shared<lattice::instance_guard>();
+    const std::string path_a = "registry-depth-a", path_b = "registry-depth-b";
+    registry.register_instance(path_a, &first, a);
+    registry.register_instance(path_b, &second, b);
+    bool exact = true;
+    registry.for_each_alive(path_a, [&](lattice::lattice_db*) {
+        exact &= lattice::instance_guard::tls_depth(a.get()) == 1 && a->notify_refcount == 1;
+        try {
+            registry.for_each_alive(path_b, [&](lattice::lattice_db*) {
+                exact &= lattice::instance_guard::tls_depth(a.get()) == 1 &&
+                         lattice::instance_guard::tls_depth(b.get()) == 1;
+                registry.for_each_alive(path_a, [&](lattice::lattice_db*) {
+                    exact &= lattice::instance_guard::tls_depth(a.get()) == 2 && a->notify_refcount == 2;
+                    throw 26;
+                });
+            });
+            exact = false;
+        } catch (int code) { exact &= code == 26; }
+        exact &= lattice::instance_guard::tls_depth(a.get()) == 1 && a->notify_refcount == 1 &&
+                 lattice::instance_guard::tls_depth(b.get()) == 0 && b->notify_refcount == 0;
+    });
+    exact &= lattice::instance_guard::tls_depth(a.get()) == 0 && a->notify_refcount == 0 &&
+             lattice::instance_guard::tls_depth(b.get()) == 0 && b->notify_refcount == 0;
+    registry.unregister_instance(path_a, &first);
+    registry.unregister_instance(path_b, &second);
+    // Exercise the real owner's same-thread drain escape, not only counters
+    // on the two registry aliases above. No use of the raw owner after reset.
+    auto dying = std::make_unique<lattice::lattice_db>();
+    const auto* identity = dying.get();
+    const auto path = dying->config().path;
+    bool destroyed = false;
+    registry.for_each_alive(path, [&](lattice::lattice_db* owner) {
+        if (owner == identity) { dying.reset(); destroyed = true; }
+    });
+    if (!exact || !destroyed || dying) return 27;
+    std::fputs("registry_depth_complete nested=2 unwind=0 self_destroyed=1\n", stderr);
+    return 0;
+}
+
 void require_bounded_removal(RemovalKind kind, bool retained_control) {
     // Exec a fresh child even in a suite that has background threads. The
     // child's alarm makes an old under-lock destruction fail in five seconds
@@ -208,6 +314,28 @@ TEST(ObserverTokenRegistration, ConcurrentKindsRemainUniqueAndIndependentlyCance
         const auto result = concurrent_registration_case();
         _exit(result);
     }, ::testing::ExitedWithCode(0), "registration_complete unique=4096 subset_cancelled survivors_delivered final_silence");
+}
+
+TEST(InstanceRegistryLifetime, PthreadCleanupAfterEarlierRegistryVisitRemainsValid) {
+    const auto previous = ::testing::FLAGS_gtest_death_test_style;
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    EXPECT_EXIT({
+        std::signal(SIGALRM, SIG_DFL);
+        alarm(5);
+        _exit(late_thread_exit_case());
+    }, ::testing::ExitedWithCode(0), "late_registry_cleanup_complete earlier=2 late=1 cleanup=1");
+    ::testing::FLAGS_gtest_death_test_style = previous;
+}
+
+TEST(InstanceRegistryLifetime, NestedGuardsUnwindAndSameThreadDestructionDrains) {
+    const auto previous = ::testing::FLAGS_gtest_death_test_style;
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    EXPECT_EXIT({
+        std::signal(SIGALRM, SIG_DFL);
+        alarm(5);
+        _exit(nested_registry_depth_case());
+    }, ::testing::ExitedWithCode(0), "registry_depth_complete nested=2 unwind=0 self_destroyed=1");
+    ::testing::FLAGS_gtest_death_test_style = previous;
 }
 
 #else

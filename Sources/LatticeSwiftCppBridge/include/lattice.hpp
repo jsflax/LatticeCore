@@ -45,6 +45,10 @@ void _lattice_post_cross_process_notification(const std::string& db_path);
 
 namespace lattice {
 
+inline int64_t sync_max_encoded_message_bytes_value() {
+    return static_cast<int64_t>(sync_max_encoded_message_bytes);
+}
+
 // ============================================================================
 // swift_dynamic_object - A type-erased model for Swift interop
 // Swift models map to this, with schema/properties set dynamically
@@ -492,6 +496,16 @@ struct swift_configuration : public configuration {
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
 
+    void set_websocket_sync_identity(const std::string& identity) { websocket_sync_identity = identity; }
+    std::string get_websocket_sync_identity() const { return websocket_sync_identity; }
+
+    void set_certificate_pin(const std::string& fingerprint) { pinned_server_certificate_sha256 = fingerprint; }
+
+    // Return an owned value across the Swift boundary, not an inherited-field projection.
+    std::string get_certificate_pin() const { return pinned_server_certificate_sha256; }
+
+    void set_uploads_enabled(bool enabled) { uploads_enabled = enabled; }
+
     void set_sync_filter(const SyncFilterVector& filter) {
         sync_filter = std::vector<sync_filter_entry>(filter.begin(), filter.end());
     }
@@ -532,6 +546,11 @@ private:
 };
 
 // Internal implementation - inherits from lattice_db
+struct swift_sync_receive_result {
+    std::vector<std::string> ids;
+    OptionalString error;
+};
+
 class swift_lattice : public lattice_db {
 public:
     // Construct with full configuration (including optional sync)
@@ -796,7 +815,7 @@ public:
         // empty on failure, e.g. transient SQLITE_NOMEM under memory pressure.
         last_bridge_error().clear();
         try {
-        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
+        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params, true);
         return hydrate_swift_rows(rows, table_name);
         } catch (const std::exception& e) {
             last_bridge_error() = e.what();
@@ -817,7 +836,7 @@ public:
         // terminated the process at the interop boundary).
         last_bridge_error().clear();
         try {
-        auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset, params);
+        auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset, params, true);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
 
@@ -874,6 +893,8 @@ public:
         }
     }
 
+
+
     // Strict metadata query: zero is only a sealed failure sentinel.
     int32_t stored_schema_version() SWIFT_NAME(storedSchemaVersion()) {
         last_bridge_error().clear();
@@ -884,6 +905,33 @@ public:
         }
     }
 
+    audit_cursor read_audit_cursor() SWIFT_NAME(auditCursor()) {
+        last_bridge_error().clear();
+        try { return lattice_db::read_audit_cursor(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
+    bool require_main_file_unmoved(const std::string& expected_path) SWIFT_NAME(requireMainFileUnmoved(_:)) {
+        last_bridge_error().clear();
+        try { lattice_db::require_main_file_unmoved(expected_path); return true; }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return false;
+        }
+    }
+
+    audit_read_fence read_audit_read_fence() SWIFT_NAME(auditReadFence()) {
+        last_bridge_error().clear();
+        try { return lattice_db::read_audit_read_fence(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
     // count overloads: never throw into Swift — 0 on failure.
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
@@ -891,7 +939,7 @@ public:
                  OptionalString distinct_by,
                  const ColumnValueVector& params = {}) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, group_by, distinct_by, params); }
+        try { return lattice_db::count(table_name, where_clause, group_by, distinct_by, params, true); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
@@ -899,19 +947,19 @@ public:
                  OptionalString where_clause,
                  OptionalString group_by) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, group_by); }
+        try { return lattice_db::count(table_name, where_clause, group_by, std::nullopt, {}, true); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name,
                  OptionalString where_clause) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, std::nullopt); }
+        try { return lattice_db::count(table_name, where_clause, std::nullopt, std::nullopt, {}, true); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name) {
-        return lattice_db::count(table_name, std::nullopt, std::nullopt);
+        return count(table_name, std::nullopt, std::nullopt, std::nullopt, {});
     }
 
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause,
@@ -1103,8 +1151,16 @@ public:
     void clear_sync_filter_for_channel(const std::string& channel);
     /// A6 — permanently retire a dead sync channel (state + set + slot).
     /// For channels that will reconnect, use reset via the daemon instead.
+    bool remove_sync_channel_state_checked(const std::string& sync_id) {
+        last_bridge_error().clear();
+        try { lattice_db::remove_sync_channel_state(sync_id); return true; }
+        catch (const std::exception& error) { last_bridge_error() = error.what(); return false; }
+        catch (...) { last_bridge_error() = "Sync channel retirement failed"; return false; }
+    }
+    // Preserve the old signature, but never let a native refusal escape into Swift.
+    // Callers needing a completion guarantee use the checked API/error slot.
     void remove_sync_channel_state(const std::string& sync_id) {
-        lattice_db::remove_sync_channel_state(sync_id);
+        (void)remove_sync_channel_state_checked(sync_id);
     }
 
     /// Register a callback for cross-process idle hints (no new AuditLog entries).
@@ -1299,6 +1355,15 @@ public:
     }
     
     void commit() { lattice_db::commit(); }
+    // Internal memory read-gate cleanup must not erase the query's outcome.
+    // A real COMMIT failure wins and is reported separately by the Swift caller.
+    bool commit_read_gate() {
+        auto query_error = last_bridge_error();
+        sealed([&] { lattice_db::commit(); });
+        if (!last_bridge_error().empty()) return false;
+        last_bridge_error() = std::move(query_error);
+        return true;
+    }
     void rollback() { lattice_db::rollback(); }
     void write(void (*fn)()) {
         begin_transaction();
@@ -1733,6 +1798,8 @@ public:
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt,
         const ColumnValueVector& params = {}) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         try {
             auto rows = query_at_generation(
@@ -1761,6 +1828,8 @@ public:
                      OptionalString group_by = std::nullopt,
                      OptionalString distinct_by = std::nullopt,
                      const ColumnValueVector& params = {}) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         try {
             auto rows = query_at_generation(
@@ -1799,6 +1868,8 @@ public:
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         try {
             bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
@@ -1832,6 +1903,8 @@ public:
                                       OptionalString where_clause = std::nullopt,
                                       OptionalString order_by = std::nullopt,
                                       const ColumnValueVector& params = {}) {
+        // A stale generation uses its retry flag, never an unrelated live-query error.
+        last_bridge_error().clear();
         generation_read_stale_tl() = false;
         const auto sql = build_query_rows_sql(table_name, where_clause, order_by,
                                               std::nullopt, std::nullopt,
@@ -2945,6 +3018,36 @@ public:
         }
     }
 
+    /// Caller-local ids/error; no shared last-error race across aliased handles.
+    swift_sync_receive_result receive_sync_data_authorized(const ByteVector& data,
+        const std::vector<std::string>& tables, void* context, bool (*authorize)(void*)) {
+        swift_sync_receive_result result;
+        try {
+            auto event = server_sent_event::from_json_immutable(std::string(data.begin(), data.end()));
+            if (!event) throw std::runtime_error("immutable sync violation: malformed frame");
+            std::function<bool()> checked;
+            if (authorize) checked = [=] { return authorize(context); };
+            if (event->event_type == server_sent_event::type::audit_log) {
+                result.ids = ::lattice::apply_remote_changes_immutable(*this, event->audit_logs, tables, checked);
+            } else if (event->event_type == server_sent_event::type::ack) {
+                ::lattice::mark_audit_entries_synced_authorized(*this, event->acked_ids, checked);
+                // ACK bookkeeping applies no entries; never start ACK-of-ACK ping-pong.
+            } else if (event->event_type == server_sent_event::type::nack) {
+                throw std::runtime_error("Sync upload rejected: " + event->nack_reason);
+            }
+        } catch (const std::exception& error) {
+            result.error = std::string(error.what());
+        } catch (...) {
+            result.error = std::string("unknown immutable sync receive failure");
+        }
+        return result;
+    }
+
+    swift_sync_receive_result receive_sync_data_immutable(const ByteVector& data,
+        const std::vector<std::string>& tables) {
+        return receive_sync_data_authorized(data, tables, nullptr, nullptr);
+    }
+
     /// Returns the error from the last receive_sync_data call, or nullopt if none.
     OptionalString last_receive_error() const { return last_receive_error_; }
 } SWIFT_UNSAFE_REFERENCE;
@@ -3012,7 +3115,9 @@ public:
         const std::string& table_name,
         void(^callback)(int64_t row_id, const std::unordered_map<std::string, column_value_t>& old_row)
     ) const SWIFT_NAME(enumerateObjects(table:callback:)) {
-        state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+        // This callback exposes only old values. Reading them must not queue
+        // unchanged rows that could overwrite later migration transformations.
+        for (const auto& old_row : state_->ctx->query_sql("SELECT * FROM " + table_name)) {
             // Get row_id
             int64_t row_id = 0;
             auto id_it = old_row.find("id");
@@ -3022,7 +3127,7 @@ public:
 
             // Call Swift callback with old row data
             callback(row_id, old_row);
-        });
+        }
     }
 #else
     /// Enumerate all objects in a table for migration.
@@ -3032,7 +3137,8 @@ public:
         const std::string& table_name,
         std::function<void(int64_t row_id, const std::unordered_map<std::string, column_value_t>& old_row)> callback
     ) const SWIFT_NAME(enumerateObjects(table:callback:)) {
-        state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+        // Match the block-based wrapper: only set_row_value queues writes.
+        for (const auto& old_row : state_->ctx->query_sql("SELECT * FROM " + table_name)) {
             // Get row_id
             int64_t row_id = 0;
             auto id_it = old_row.find("id");
@@ -3042,7 +3148,7 @@ public:
 
             // Call Swift callback with old row data
             callback(row_id, old_row);
-        });
+        }
     }
 #endif
     /// Set a value for a row during migration
@@ -3087,21 +3193,13 @@ public:
     // Called internally before migration context goes out of scope
     void apply_row_updates() const {
         for (const auto& [table_name, rows] : state_->pending_row_updates) {
-            state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
-                int64_t row_id = 0;
-                auto id_it = old_row.find("id");
-                if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
-                    row_id = std::get<int64_t>(id_it->second);
+            for (const auto& [row_id, columns] : rows) {
+                for (const auto& [column, value] : columns) {
+                    state_->ctx->queue_row_value(table_name, row_id, column, value);
                 }
-
-                auto row_it = rows.find(row_id);
-                if (row_it != rows.end()) {
-                    for (const auto& [col, val] : row_it->second) {
-                        new_row[col] = val;
-                    }
-                }
-            });
+            }
         }
+        state_->pending_row_updates.clear();
     }
 
 private:
@@ -3177,11 +3275,16 @@ namespace detail {
     inline std::string connection_fingerprint(const configuration& config) {
         std::string fp = config.read_only ? "R" : "W";
         fp += config.sync_is_observer ? 'O' : 'P';
+        fp += config.uploads_enabled ? 'U' : 'D';
         fp += config.sync_autostart ? 'A' : 'D';
         fp += config.background_sync_managed ? 'M' : 'U';
+        fp += std::to_string(config.required_existing_schema_version); fp += '|';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';
+        fp += std::to_string(static_cast<int>(config.sync_authentication_mode)); fp += '|';
         append_cache_string(fp, config.authorization_token);
+        append_cache_string(fp, config.websocket_sync_identity);
+        append_cache_string(fp, config.pinned_server_certificate_sha256);
         append_cache_filter(fp, config.sync_filter);
         return fp;
     }
@@ -3273,6 +3376,13 @@ template <typename ConfigT>
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
+            if (config.required_existing_schema_version != 0) {
+                // Disk admission can wait for a writer. Never hold the global cache mutex across it,
+                // and never key-cache a strict handle: each call must admit the currently opened file.
+                auto instance = std::make_shared<swift_lattice>(config, schemas);
+                register_pointer(instance);
+                return instance;
+            }
 
             // Build schema hash from table names and properties (sorted for
             // consistency). Pure computation over `schemas` — done before locking
@@ -3618,17 +3728,19 @@ public:
             // Wrap the C++ migration_context in a Swift-friendly ref
             auto* swift_ctx = new swift_migration_context_ref(&ctx);
             swift_ctx->retain();  // Keep alive during callback
+            const auto release_context = [](swift_migration_context_ref* ref) {
+                if (ref->release()) delete ref;
+            };
+            // Release on both success and exception; Swift may retain its own
+            // reference, so only delete when this callback's retain was last.
+            std::unique_ptr<swift_migration_context_ref, decltype(release_context)>
+                context_guard(swift_ctx, release_context);
 
             // Call the Swift migration block
             migration_block(swift_ctx);
 
             // Apply any row updates that were queued during enumeration
             swift_ctx->apply_row_updates();
-
-            // Release (Swift may have retained, so check before delete)
-            if (swift_ctx->release()) {
-                delete swift_ctx;
-            }
 #else
             // Value-type path: the ref is a plain stack value; no retain/release.
             swift_migration_context_ref swift_ctx(&ctx);
@@ -3771,8 +3883,22 @@ public:
         return impl().grouped_counts(table_name, group_by, where_clause, distinct_by, params);
     }
 
+
+
     int32_t stored_schema_version() const SWIFT_NAME(storedSchemaVersion()) {
         return impl().stored_schema_version();
+    }
+
+    audit_cursor read_audit_cursor() const SWIFT_NAME(auditCursor()) {
+        return impl().read_audit_cursor();
+    }
+
+    bool require_main_file_unmoved(const std::string& expected_path) const SWIFT_NAME(requireMainFileUnmoved(_:)) {
+        return impl().require_main_file_unmoved(expected_path);
+    }
+
+    audit_read_fence read_audit_read_fence() const SWIFT_NAME(auditReadFence()) {
+        return impl().read_audit_read_fence();
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema
@@ -3828,6 +3954,11 @@ public:
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
         return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
     }
+    /// Explicit audited-writer admission. false also represents a sealed
+    /// failure; callers must check last_bridge_error() before using the result.
+    bool prepare_for_audited_writes() const {
+        return sealed([&] { return impl().prepare_for_audited_writes(); });
+    }
     /// Age-based, cursor-safe history prune (see lattice_db::prune_audit_log).
     int64_t prune_audit_log(int64_t retention_seconds) const
         SWIFT_NAME(pruneAuditLog(retentionSeconds:)) {
@@ -3864,6 +3995,19 @@ public:
         SWIFT_NAME(normalizeAuditTimestamps()) {
         return sealed([&] { return impl().normalize_audit_timestamps(); });
     }
+    int64_t append_current_snapshots(const std::vector<std::string>& tables, const std::string& key) const {
+        return sealed([&] { return impl().lattice_db::append_current_snapshots(tables, key); });
+    }
+    int64_t ensure_current_history() const {
+        return sealed([&] { return impl().lattice_db::ensure_current_history(); });
+    }
+    std::string current_identity_snapshot() const {
+        return sealed([&] { return impl().lattice_db::current_identity_snapshot(); });
+    }
+    bool has_applied_sync_event(const std::string& global_id) const {
+        return sealed([&] { return impl().lattice_db::has_applied_sync_event(global_id); });
+    }
+
     int64_t force_compact_audit_log() const {
         return sealed([&] { return impl().force_compact_audit_log(); });
     }
@@ -3879,6 +4023,14 @@ public:
     }
     void optimize() const { impl().optimize(); }
 
+    OptionalString local_metadata(const std::string& name_space, const std::string& key) const {
+        return sealed([&] { return impl().local_metadata(name_space, key); });
+    }
+    bool insert_local_metadata_if_absent(const std::string& name_space, const std::string& key,
+                                          const std::string& value) const {
+        return sealed([&] { return impl().insert_local_metadata_if_absent(name_space, key, value); });
+    }
+
     // Transactions — begin_transaction throws db_error when the busy
     // timeout lapses or an allocation fails under memory pressure; that
     // escaped into Swift and killed the Engram MCP server twice on
@@ -3889,6 +4041,7 @@ public:
     // the same slot instead of trapping.
     void begin_transaction() const { sealed([&] { impl().begin_transaction(); }); }
     void commit() const { sealed([&] { impl().commit(); }); }
+    bool commit_read_gate() const { return impl().commit_read_gate(); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
 
@@ -4017,6 +4170,13 @@ public:
 
     // Sync data ingestion
     std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }
+    swift_sync_receive_result receive_sync_data_immutable(const ByteVector& data, const std::vector<std::string>& tables) const {
+        return impl().receive_sync_data_immutable(data, tables);
+    }
+    swift_sync_receive_result receive_sync_data_authorized(const ByteVector& data, const std::vector<std::string>& tables,
+        void* context, bool (*authorize)(void*)) const {
+        return impl().receive_sync_data_authorized(data, tables, context, authorize);
+    }
     OptionalString last_receive_error() const { return impl().last_receive_error(); }
 
     /// The sealed query surface's error slot (see error.hpp): nullopt if
@@ -4037,8 +4197,14 @@ public:
     void clear_sync_filter_for_channel(const std::string& channel) const {
         sealed([&] { impl().clear_sync_filter_for_channel(channel); });
     }
+    bool remove_sync_channel_state_checked(const std::string& sync_id) const {
+        last_bridge_error().clear();
+        try { return impl().remove_sync_channel_state_checked(sync_id); }
+        catch (const std::exception& error) { last_bridge_error() = error.what(); return false; }
+        catch (...) { last_bridge_error() = "Sync channel retirement failed"; return false; }
+    }
     void remove_sync_channel_state(const std::string& sync_id) const {
-        sealed([&] { impl().remove_sync_channel_state(sync_id); });
+        (void)remove_sync_channel_state_checked(sync_id);
     }
     /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
     /// see lattice_db::delete_rows_no_relay for why a normal delete is
@@ -4226,6 +4392,8 @@ private:
     swift_lattice_ref() = default;
 
     static std::shared_ptr<swift_lattice> create_dynamic_shared(const swift_configuration& config) {
+        if (config.required_existing_schema_version != 0)
+            throw db_error("Existing schema admission requires a complete typed schema");
         swift_configuration cfg = config;
         cfg.read_only = true;
         auto impl = std::make_shared<swift_lattice>(std::move(cfg));

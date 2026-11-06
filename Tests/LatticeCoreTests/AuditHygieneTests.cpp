@@ -692,18 +692,28 @@ void expect_apply_preamble_denial(ApplyPreambleDenial::Point point) {
         "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized) "
         "SELECT id, 'chan-a', 0 FROM AuditLog ORDER BY id LIMIT 1", {});
 
+    if (point == ApplyPreambleDenial::Point::receipts_create) {
+        // Current startup precreates this guarded table. Remove only its empty
+        // fixture instance to exercise the retained cold CREATE failure path.
+        ASSERT_TRUE(db.db().query("SELECT * FROM _lattice_applied_receipts", {}).empty());
+        db.db().execute("DROP TABLE _lattice_applied_receipts", {});
+    }
     auto receipts_schema = db.db().query(
         "SELECT name FROM sqlite_master WHERE type = 'table' "
         "AND name = '_lattice_applied_receipts'", {});
-    ASSERT_TRUE(receipts_schema.empty()) << "cold fixture must reach actual CREATE";
-    if (point == ApplyPreambleDenial::Point::cursor_probe) {
+    if (point == ApplyPreambleDenial::Point::receipts_create) {
+        ASSERT_TRUE(receipts_schema.empty()) << "cold fixture must reach actual CREATE";
+    } else {
         // Isolate the later PRAGMA denial: its preceding CREATE is already a
         // no-op, so this failure must leave all existing rows and DDL intact.
-        db.db().execute(
-            "CREATE TABLE _lattice_applied_receipts (globalId TEXT PRIMARY KEY)", {});
+        ASSERT_EQ(receipts_schema.size(), 1u);
         db.db().execute(
             "INSERT INTO _lattice_applied_receipts VALUES ('existing-receipt')", {});
     }
+    const auto receipt_schema_before = db.db().query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name='_lattice_applied_receipts' OR tbl_name='_lattice_applied_receipts' "
+        "ORDER BY type,name", {});
     const auto receipt_rows_before = point == ApplyPreambleDenial::Point::cursor_probe
         ? db.db().query("SELECT * FROM _lattice_applied_receipts ORDER BY globalId", {})
         : std::vector<lattice::database::row_t>{};
@@ -737,6 +747,10 @@ void expect_apply_preamble_denial(ApplyPreambleDenial::Point point) {
     EXPECT_EQ(after.sync_state, before.sync_state);
     EXPECT_EQ(after.slots, before.slots) << "including the exact sentinel download cursor";
     EXPECT_EQ(after.sync_control, before.sync_control);
+    EXPECT_EQ(db.db().query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name='_lattice_applied_receipts' OR tbl_name='_lattice_applied_receipts' "
+        "ORDER BY type,name", {}), receipt_schema_before);
     if (point == ApplyPreambleDenial::Point::receipts_create) {
         EXPECT_TRUE(db.db().query(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
@@ -1269,4 +1283,120 @@ TEST(AuditHygiene, InvalidTypedPositionCannotBorrowEarlierAckOfTheSameIdForCurso
     EXPECT_EQ(cursor(db), entries[0].global_id);
     EXPECT_TRUE(db.db().query("SELECT id FROM TestPerson WHERE globalId=?", {entries[1].global_row_id}).empty());
     EXPECT_TRUE(db.db().query("SELECT id FROM AuditLog WHERE operation='MERGE'").empty());
+}
+
+TEST(AuditHygiene, ExactAppliedCheckpointRecognizesReceiptAndEqualCursorReadOnly) {
+    TempDB tmp{"applied_checkpoint_receipt"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    lattice::ensure_cursor_column(db.db());
+    lattice::register_replication_slot(db.db(), "checkpoint-channel");
+    db.add(TestPerson{"Checkpoint", 41, std::nullopt});
+    const auto row = db.db().query("SELECT globalId FROM TestPerson LIMIT 1");
+    const auto row_id = std::get<std::string>(row[0].at("globalId"));
+    const std::string first = "1399248e-98b3-48e0-92ab-8b85b29397d1";
+    const std::string second = "986ef1f5-a75d-4dfe-8eef-df4f77753d47";
+    EXPECT_THROW(db.has_applied_sync_event(first), std::runtime_error);
+
+    // A database that has never received an event has no receipts table. A
+    // read-only lookup must neither create it nor migrate cursor metadata.
+    db.db().execute("DROP TABLE IF EXISTS _lattice_applied_receipts");
+    const auto schema_before = db.db().query("SELECT name,sql FROM sqlite_master ORDER BY name");
+    db.begin_transaction();
+    EXPECT_FALSE(db.has_applied_sync_event(first));
+    bool other_thread_rejected = false;
+    std::thread other([&] {
+        try { (void)db.has_applied_sync_event(first); }
+        catch (const std::runtime_error&) { other_thread_rejected = true; }
+    });
+    other.join();
+    EXPECT_TRUE(other_thread_rejected);
+    db.commit();
+    EXPECT_EQ(db.db().query("SELECT name,sql FROM sqlite_master ORDER BY name"), schema_before);
+
+    lattice::audit_log_entry noop;
+    noop.global_id = first; noop.table_name = "TestPerson"; noop.operation = "UPDATE";
+    noop.global_row_id = row_id;
+    noop.changed_fields = {{"name", lattice::any_property(std::string("Checkpoint"))}};
+    noop.changed_fields_names = {"name"}; noop.timestamp = "2026-09-10T12:00:00Z";
+    ASSERT_EQ(lattice::apply_remote_changes_for(db, {noop}, "checkpoint-channel"), std::vector<std::string>{first});
+    EXPECT_TRUE(db.db().query("SELECT 1 FROM AuditLog WHERE globalId=?", {first}).empty());
+    EXPECT_FALSE(db.db().query("SELECT 1 FROM _lattice_applied_receipts WHERE globalId=?", {first}).empty());
+    EXPECT_EQ(std::get<std::string>(db.db().query(
+        "SELECT last_received_event_id AS value FROM _lattice_replication_slots WHERE sync_id='checkpoint-channel'")[0].at("value")), first);
+
+    lattice::configuration read_config(tmp.str()); read_config.read_only = true;
+    lattice::lattice_db reader(read_config);
+    reader.begin_transaction();
+    EXPECT_TRUE(reader.has_applied_sync_event(first));
+    EXPECT_FALSE(reader.has_applied_sync_event(second));
+    reader.commit();
+    reader.close();
+
+    // Model receipt retention directly on this owned fixture. Exact equality
+    // with the actual committed cursor remains evidence, but a later cursor
+    // must never certify an old UUID once all exact evidence is gone.
+    db.db().execute("DELETE FROM _lattice_applied_receipts WHERE globalId=?", {first});
+    db.begin_transaction(); EXPECT_TRUE(db.has_applied_sync_event(first)); db.commit();
+    noop.global_id = second;
+    ASSERT_EQ(lattice::apply_remote_changes_for(db, {noop}, "checkpoint-channel"), std::vector<std::string>{second});
+    db.begin_transaction();
+    EXPECT_FALSE(db.has_applied_sync_event(first));
+    EXPECT_TRUE(db.has_applied_sync_event(second));
+    db.commit();
+}
+
+TEST(AuditHygiene, RolledBackSuppressedCheckpointIsNotAdmitted) {
+    TempDB tmp{"applied_checkpoint_rollback"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    lattice::ensure_cursor_column(db.db());
+    lattice::register_replication_slot(db.db(), "checkpoint-channel");
+    db.add(TestPerson{"Rollback", 41, std::nullopt});
+    const auto row_id = std::get<std::string>(db.db().query("SELECT globalId FROM TestPerson LIMIT 1")[0].at("globalId"));
+    const std::string event = "06c23ea3-cac6-4c3b-83da-b214d67dfcb6";
+    lattice::audit_log_entry noop;
+    noop.global_id = event; noop.table_name = "TestPerson"; noop.operation = "UPDATE";
+    noop.global_row_id = row_id; noop.changed_fields = {{"name", lattice::any_property(std::string("Rollback"))}};
+    noop.changed_fields_names = {"name"}; noop.timestamp = "2026-09-10T12:00:00Z";
+    // Fail after the real no-op receipt and cursor UPDATE, during restoration
+    // of the trigger gate. Both bounded apply attempts must roll back.
+    db.db().execute("CREATE TRIGGER checkpoint_fail_restore BEFORE UPDATE ON _SyncControl "
+                    "WHEN NEW.disabled=0 BEGIN SELECT RAISE(ABORT,'fixture rollback'); END");
+    EXPECT_TRUE(lattice::apply_remote_changes_for(db, {noop}, "checkpoint-channel").empty());
+    db.db().execute("DROP TRIGGER checkpoint_fail_restore");
+    db.begin_transaction(); EXPECT_FALSE(db.has_applied_sync_event(event)); db.commit();
+    EXPECT_TRUE(db.db().query("SELECT 1 FROM AuditLog WHERE globalId=?", {event}).empty());
+    EXPECT_TRUE(db.db().query("SELECT 1 FROM _lattice_applied_receipts WHERE globalId=?", {event}).empty());
+    EXPECT_TRUE(db.db().query("SELECT 1 FROM _lattice_replication_slots WHERE last_received_event_id=?", {event}).empty());
+    ASSERT_EQ(lattice::apply_remote_changes_for(db, {noop}, "checkpoint-channel"), std::vector<std::string>{event});
+    db.begin_transaction(); EXPECT_TRUE(db.has_applied_sync_event(event)); db.commit();
+}
+
+TEST(AuditHygiene, MissingMiddleCheckpointIsNotProvedByAppliedSuffix) {
+    TempDB tmp{"applied_checkpoint_middle"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    lattice::ensure_cursor_column(db.db());
+    lattice::register_replication_slot(db.db(), "checkpoint-channel");
+    db.add(TestPerson{"Before", 41, std::nullopt});
+    const auto row_id = std::get<std::string>(db.db().query("SELECT globalId FROM TestPerson LIMIT 1")[0].at("globalId"));
+    lattice::audit_log_entry first;
+    first.global_id = "04821654-5530-4e2c-815a-5947cfef4576";
+    first.table_name = "TestPerson"; first.operation = "UPDATE"; first.global_row_id = row_id;
+    first.changed_fields = {{"name", lattice::any_property(std::string("Before"))}};
+    first.changed_fields_names = {"name"}; first.timestamp = "2026-09-10T12:00:00Z";
+    auto middle = first; middle.global_id = "77562932-423d-4fbd-8f9b-0c104a938439";
+    middle.changed_fields["name"] = lattice::any_property(std::string("Reject"));
+    auto last = first; last.global_id = "38957fe9-91d1-4c24-b84f-d9b2cfc2d204";
+    last.changed_fields["name"] = lattice::any_property(std::string("After"));
+    db.db().execute("CREATE TRIGGER checkpoint_reject_middle BEFORE UPDATE ON TestPerson "
+                    "WHEN NEW.name='Reject' BEGIN SELECT RAISE(ABORT,'fixture missing middle'); END");
+    const auto applied = lattice::apply_remote_changes_for(db, {first,middle,last}, "checkpoint-channel");
+    ASSERT_EQ(applied, (std::vector<std::string>{first.global_id,last.global_id}));
+    const auto cursor = db.db().query("SELECT last_received_event_id AS value FROM _lattice_replication_slots WHERE sync_id='checkpoint-channel'");
+    ASSERT_EQ(std::get<std::string>(cursor[0].at("value")), first.global_id);
+    db.begin_transaction();
+    EXPECT_TRUE(db.has_applied_sync_event(first.global_id));
+    EXPECT_FALSE(db.has_applied_sync_event(middle.global_id));
+    EXPECT_TRUE(db.has_applied_sync_event(last.global_id)); // Exact audit evidence only; not a contiguous-prefix certificate.
+    db.commit();
+    db.db().execute("DROP TRIGGER checkpoint_reject_middle");
 }

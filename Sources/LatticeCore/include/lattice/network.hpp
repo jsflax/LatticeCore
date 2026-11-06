@@ -121,6 +121,11 @@ public:
     /// replaced by a fresh transport on the next accept.
     virtual bool supports_reconnect() const { return true; }
 
+    /// Empty preserves ordinary trust. Unsupported transports fail closed for pins.
+    virtual bool configure_certificate_pin(const std::string& fingerprint) {
+        return fingerprint.empty();
+    }
+
     // Send message
     virtual void send(const transport_message& message) = 0;
 
@@ -149,6 +154,7 @@ public:
     using disconnect_fn_ptr = void (*)(void* user_data);
     using state_fn_ptr = transport_state (*)(void* user_data);
     using send_fn_ptr = void (*)(void* user_data, const void* message_ptr);
+    using certificate_pin_fn_ptr = bool (*)(void* user_data, const void* fingerprint_ptr);
 
     // Helpers: cast opaque pointers back to C++ types
     static const std::string& cast_url(const void* p) { return *static_cast<const std::string*>(p); }
@@ -162,6 +168,7 @@ private:
     state_fn_ptr state_;
     send_fn_ptr send_;
     disconnect_fn_ptr destroy_ = nullptr;
+    certificate_pin_fn_ptr certificate_pin_ = nullptr;
 
     on_open_handler on_open_;
     on_message_handler on_message_;
@@ -188,6 +195,11 @@ public:
     // this callback retires/releases the external context exactly at destruction.
     void set_destroy_callback(disconnect_fn_ptr callback) { destroy_ = callback; }
     ~generic_sync_transport() override { if (destroy_) destroy_(user_data_); }
+
+    void set_certificate_pin_callback(certificate_pin_fn_ptr callback) { certificate_pin_ = callback; }
+    bool configure_certificate_pin(const std::string& fingerprint) override {
+        return certificate_pin_ ? certificate_pin_(user_data_, &fingerprint) : fingerprint.empty();
+    }
 
     void connect(const std::string& url,
                  const std::map<std::string, std::string>& headers = {}) override {

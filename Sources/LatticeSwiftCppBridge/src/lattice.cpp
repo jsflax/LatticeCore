@@ -172,6 +172,19 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
     : lattice_db(config, /*defer_sync=*/true), swift_config_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
+    if (config.required_existing_schema_version != 0) {
+        try {
+            require_existing_schema_in_transaction();
+            require_existing_fingerprint_in_transaction(compute_swift_fingerprint_key(schemas));
+            populate_swift_in_memory_state(schemas);
+            finish_existing_schema_admission();
+        } catch (...) { abandon_existing_schema_admission(); throw; }
+        if (!config.read_only) {
+            lattice_db::setup_sync_if_configured();
+            lattice_db::setup_ipc_if_configured();
+        }
+        return;
+    }
     if (!config.read_only) {
         LOG_DEBUG("swift_lattice", "ensure_swift_tables");
         ensure_swift_tables(schemas);
@@ -190,19 +203,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
-    : lattice_db(config, /*defer_sync=*/true), swift_config_(std::move(config)) {
-    if (!swift_config_.read_only) {
-        ensure_swift_tables(schemas);
-        lattice_db::setup_sync_if_configured();
-        lattice_db::setup_ipc_if_configured();
-    } else {
-        // In read-only mode, just store schemas without creating tables
-        for (const auto& entry : schemas) {
-            schemas_[entry.table_name] = entry.properties;
-            constraints_[entry.table_name] = entry.constraints;
-        }
-    }
-}
+    : swift_lattice(static_cast<const swift_configuration&>(config), schemas) {}
 
 // A `@Unique(..., allowsUpsert: true)` whose conflict set includes a to-one link
 // uses the `<link>__link_gid` shadow column (Phase 8a). That column is normally
@@ -549,6 +550,16 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // NOTE: No unconditional defer{commit} — if an exception occurs during
     // migration, the transaction destructor will rollback, preventing
     // partial migration state (table rebuilt but version not bumped).
+    const int current_version = lattice_db::get_schema_version();
+    const int target_version = swift_config_.target_schema_version;
+    LOG_INFO("swift_lattice", "migration: current_version=%d, target_version=%d", current_version, target_version);
+    if (current_version > target_version) {
+        throw std::runtime_error(
+            "Database schema version (" + std::to_string(current_version) +
+            ") is newer than this binary supports (" + std::to_string(target_version) +
+            "). Update the application.");
+    }
+
     // Build model_schema list and identify new vs existing tables
     std::vector<model_schema> all_schemas;
     std::vector<std::string> new_tables;
@@ -579,6 +590,27 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             new_tables.push_back(entry.table_name);
         } else {
             existing_tables.push_back(entry.table_name);
+        }
+    }
+
+    // The base constructor only detects globally registered C++ schemas.
+    // Dynamic SchemaVector changes belong to this separate transaction. Call
+    // the generic block once before Swift DDL, while removed columns still
+    // exist, and keep its queued updates until the final columns are present.
+    // The per-version row callbacks below remain a separate migration path;
+    // if both hooks are configured, generic queued values are applied last.
+    migration_context dynamic_migration_ctx(db());
+    if (swift_config_.migration_block) {
+        for (const auto& schema : all_schemas) {
+            if (std::find(existing_tables.begin(), existing_tables.end(), schema.table_name) != existing_tables.end()) {
+                auto changes = lattice_db::detect_table_changes_public(schema);
+                if (changes.has_changes()) {
+                    dynamic_migration_ctx.add_table_changes(std::move(changes));
+                }
+            }
+        }
+        if (dynamic_migration_ctx.has_any_changes()) {
+            swift_config_.migration_block(dynamic_migration_ctx);
         }
     }
 
@@ -622,20 +654,6 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     };
     std::vector<pending_union_ref> pending_migration_union_refs;
 
-    int current_version = lattice_db::get_schema_version();
-    int target_version = swift_config_.target_schema_version;
-    LOG_INFO("swift_lattice", "migration: current_version=%d, target_version=%d", current_version, target_version);
-
-    if (current_version > target_version) {
-        LOG_ERROR("swift_lattice", "Database schema version (%d) is newer than this binary supports (%d). "
-                  "Update the application to a version that supports schema v%d.",
-                  current_version, target_version, current_version);
-        throw std::runtime_error(
-            "Database schema version (" + std::to_string(current_version) +
-            ") is newer than this binary supports (" + std::to_string(target_version) +
-            "). Update the application.");
-    }
-
     for (int version = current_version + 1; version <= target_version; version++) {
         LOG_INFO("swift_lattice", "migration: running version %d", version);
         migration_context migration_ctx(db());
@@ -643,6 +661,16 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         // Set migration lattice for Migration.lookup() calls from Swift
         g_migration_lattice = this;
         g_migration_current_version = version;
+        defer([] {
+            // Callbacks and queued SQL can throw. Never leave thread-local
+            // pointers to rows or an owner destroyed by a failed open.
+            g_migration_old_row = nullptr;
+            g_migration_new_row = nullptr;
+            g_migration_lattice = nullptr;
+            g_migration_lookup_result.reset();
+            g_migration_backlink_results.clear();
+            g_migration_current_version = 0;
+        });
 
         // For each existing table, check if it needs migration at this version
         for (const auto& table_name : existing_tables) {
@@ -882,12 +910,6 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         // Update version in _lattice_meta
         LOG_INFO("swift_lattice", "  setting schema version to %d", version);
         lattice_db::set_schema_version(version);
-
-        // Clear migration lattice pointer
-        g_migration_lattice = nullptr;
-        g_migration_lookup_result.reset();
-        g_migration_backlink_results.clear();
-        g_migration_current_version = 0;
     }
 
     // Finally, store all final schemas and handle any tables that didn't need migration
@@ -904,6 +926,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             }
         }
     }
+
+    dynamic_migration_ctx.apply_pending_updates();
 
     LOG_INFO("swift_lattice", "ensure_swift_tables: tables created/migrated, doing rtrees");
     // Phase 6: Ensure geo_bounds rtree tables exist with correct data
@@ -1132,6 +1156,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // DDL, so the captured schema cookie reflects this pass. The core-layer
     // marker is re-stamped because this pass's DDL bumped the cookie and would
     // otherwise leave it permanently one-open stale.
+    detail::ensure_sync_storage_guards(db());
     store_fingerprint_marker(fp_key);
     store_fingerprint_marker(compute_core_fingerprint_key());
 
@@ -1159,6 +1184,7 @@ std::string swift_lattice::compute_swift_fingerprint_key(const SchemaVector& sch
     std::ostringstream out;
     out << "swift\n"
         << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
+        << "audit_real_precision:" << kAuditRealPrecisionTemplateVersion << '\n'
         << "target_schema_version:" << swift_config_.target_schema_version << '\n';
     // Sort tables and property names: SchemaVector order follows the Swift
     // call site and SwiftSchema is an unordered_map — neither is stable.

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <LatticeCore.hpp>
+#include <lattice/sync_storage.hpp>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -83,6 +84,13 @@ protected:
         sqlite_ptr remote(raw, sqlite3_close);
         ASSERT_EQ(open_rc, SQLITE_OK);
         ASSERT_EQ(sqlite3_busy_timeout(remote.get(), 1000), SQLITE_OK);
+        // Current storage capability only: retain the independent raw connection,
+        // without Lattice update hooks or same-process notification fan-out.
+        ASSERT_EQ(sqlite3_create_function_v2(remote.get(), "lattice_storage_writer_epoch", 0,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS, nullptr,
+            [](sqlite3_context* context, int, sqlite3_value**) {
+                sqlite3_result_int(context, lattice::detail::sync_storage_writer_epoch);
+            }, nullptr, nullptr, nullptr), SQLITE_OK);
         ASSERT_EQ(sqlite3_create_function(remote.get(), "sync_disabled", 0,
             SQLITE_UTF8, nullptr, [](sqlite3_context* context, int, sqlite3_value**) {
                 sqlite3_result_int(context, 0);

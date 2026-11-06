@@ -11,6 +11,10 @@
 #include <chrono>
 
 namespace lattice {
+class lattice_db;
+namespace detail { bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&); }
+
+struct audit_log_entry;
 
 /// Default statement-level busy timeout. Headless/server processes tolerate long
 /// waits; interactive apps should pass a smaller value (e.g. 5000) via
@@ -23,8 +27,14 @@ public:
 };
 
 class database {
+    // Selected audit capture spans bounded reads on one snapshot and must not
+    // deliver previously sealed observers until its outer statement unlocks.
+    friend std::vector<audit_log_entry> query_audit_log_selected(database&,
+        const std::vector<std::pair<int64_t, std::string>>&, size_t);
     friend class lattice_db;
     friend class synchronizer_base;
+    friend struct detached_read_access;
+    friend bool detail::sync_delivery_transaction(lattice_db&, const std::function<bool()>&);
     // Test-only friend seam: install on the query's calling thread and clear
     // before that thread exits. No public setter, bridge API or instance field.
     friend struct database_query_test_access;
@@ -141,7 +151,8 @@ public:
     /// Open mode for database connections
     enum class open_mode {
         read_write,  ///< Full read/write access (default)
-        read_only    ///< Read-only; joins a concurrent writer's WAL (sees committed WAL rows)
+        read_only,   ///< Read-only; joins a concurrent writer's WAL (sees committed WAL rows)
+        read_write_existing ///< No CREATE, journal-mode changes, automatic optimize or checkpoint.
     };
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
@@ -277,6 +288,10 @@ public:
     /// Rollback clears only the current transaction, never sealed rows.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back,
                        std::function<void()> sealed);
+
+    /// Checked current-state probe of this exact open main file. No SQL, reopen or metadata writes.
+    /// Throws for a moved/unlinked file, closed/memory database or unsupported VFS.
+    void require_main_file_unmoved(const std::string& expected_path);
 
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }

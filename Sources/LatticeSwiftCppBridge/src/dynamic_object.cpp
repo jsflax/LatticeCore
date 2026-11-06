@@ -213,7 +213,9 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
         return std::move(m);
     } else {
         if (unmanaged_.link_values.count(name)) {
-            return std::move(*unmanaged_.link_values.at(name));
+            // Staged links share the target with its original owner. A read
+            // must copy the value, never move fields out of that shared target.
+            return *unmanaged_.link_values.at(name);
         }
     }
     // Unmanaged with no staged link value: no object.

@@ -105,6 +105,8 @@ TEST(BridgeCacheConfiguration, AuthorityFilterAndMaintenanceSettingsNeverAlias) 
     std::vector<lattice::swift_configuration> variants;
     auto token_a = base; token_a.authorization_token = "fixture-authority-A"; variants.push_back(token_a);
     auto token_b = base; token_b.authorization_token = "fixture-authority-B"; variants.push_back(token_b);
+    auto identity_a = base; identity_a.set_websocket_sync_identity("wss://fixture.test/sync?schema=5"); variants.push_back(identity_a);
+    auto identity_b = base; identity_b.set_websocket_sync_identity("wss://fixture.test/other?schema=5"); variants.push_back(identity_b);
     auto deferred = base; deferred.sync_autostart = false; variants.push_back(deferred);
     auto observer = base; observer.sync_is_observer = true; variants.push_back(observer);
     auto busy = base; busy.busy_timeout_ms = 111; variants.push_back(busy);
@@ -129,6 +131,7 @@ TEST(BridgeCacheConfiguration, AuthorityFilterAndMaintenanceSettingsNeverAlias) 
         EXPECT_EQ(opened->config().busy_timeout_ms, config.busy_timeout_ms);
         EXPECT_EQ(opened->config().audit_retention_seconds, config.audit_retention_seconds);
         EXPECT_TRUE(opened->config().authorization_token == config.authorization_token);
+        EXPECT_EQ(opened->config().websocket_sync_identity, config.get_websocket_sync_identity());
         EXPECT_EQ(opened->config().sync_filter.has_value(), config.sync_filter.has_value());
         stores.push_back(std::move(opened));
     }

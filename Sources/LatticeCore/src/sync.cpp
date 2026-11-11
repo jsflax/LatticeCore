@@ -1366,6 +1366,7 @@ void synchronizer_base::connect() {
     if (is_connecting_ || is_connected_) return;
     is_connecting_ = true;
     const auto generation = ++connection_generation_;
+    reconnect_pending_ = false;
     if (config_.finite_cycle) {
         std::lock_guard<std::mutex> lock(finite_cycle_mutex_);
         finite_cycle_status_ = {};
@@ -1437,6 +1438,8 @@ void synchronizer_base::disconnect() {
     std::lock_guard<std::recursive_mutex> lifecycle(connection_mutex_);
     cancel_finite_cycle();
     ++connection_generation_;
+    receive_halted_ = true;
+    reconnect_pending_ = false;
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
              log_id(), (void*)this, is_connected_ ? 1 : 0,
              db().config().path.c_str());
@@ -1534,6 +1537,7 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
 
 void synchronizer_base::on_websocket_open() {
     if (is_destroyed_) return;
+    receive_halted_ = false;
     // Publish the successor state before retiring the old one. connect() reads
     // connecting first, so these seq_cst flags never admit a duplicate attempt.
     is_connected_ = true;
@@ -1611,7 +1615,7 @@ void synchronizer_base::on_websocket_open() {
 void synchronizer_base::on_transport_message(const transport_message& msg) {
     // Guard against use-after-free: the NIO/IPC callback thread may deliver
     // a message after the destructor has started tearing down members.
-    if (is_destroyed_) return;
+    if (is_destroyed_ || receive_halted_) return;
     const auto generation = connection_generation_.load();
 
     // Wrap in try-catch: this is called from Swift via the WebSocket callback.
@@ -1624,11 +1628,14 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
         auto event = server_sent_event::from_json(json_str, &parse_error);
         if (!event) {
             invoke_on_scheduler([this, generation, parse_error = std::move(parse_error)] {
-                if (is_destroyed_ || connection_generation_ != generation) return;
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation) return;
                 // Late live traffic is outside a completed finite receipt.
-                if (!get_finite_cycle_status().catch_up_received)
-                    fail_finite_cycle(finite_cycle_failure::invalid_frame, generation);
-                fire_error("Failed to parse server message: " + parse_error);
+                if (config_.finite_cycle && get_finite_cycle_status().catch_up_received) {
+                    fire_error("Failed to parse server message: " + parse_error);
+                    return;
+                }
+                download_failed(generation, finite_cycle_failure::invalid_frame,
+                                "Download incomplete: failed to parse server message: " + parse_error);
             });
             return;
         }
@@ -1681,7 +1688,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             auto entry_count = entries.size();
             invoke_on_scheduler([this, generation, entries = std::move(entries), entry_count,
                                 skipped_filter_removals = std::move(skipped_filter_removals)] {
-                if (is_destroyed_ || connection_generation_ != generation ||
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation ||
                     !finite_cycle_accepts_work(generation, true)) {
                     LOG_INFO("synchronizer", "[%s] scheduler lambda: is_destroyed_, skipping apply of %zu entries",
                              log_id(), entry_count);
@@ -1691,8 +1698,14 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
                          log_id(), entries.size(), db().config().path.c_str());
                 auto applied_ids = apply_remote_changes(entries);
-                const bool partial = applied_ids.size() < entries.size();
-                if (partial) fail_finite_cycle(finite_cycle_failure::partial_apply, generation);
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation) return;
+                const auto applied_count = applied_ids.size();
+                const bool partial = applied_count < entry_count;
+                if (partial) {
+                    fail_finite_cycle(finite_cycle_failure::partial_apply, generation);
+                    // Fence before ACK send, which may re-enter transport callbacks.
+                    if (!config_.websocket_url.empty()) receive_halted_ = true;
+                }
                 // Ack skipped filter-removals as if applied (see above).
                 applied_ids.insert(applied_ids.end(),
                                    skipped_filter_removals.begin(),
@@ -1712,15 +1725,17 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     ws_client_->send(transport_message::from_binary({json_ack.begin(), json_ack.end()}));
                 }
 
-                // If some entries failed, schedule a retry so the sender re-uploads them
                 if (partial) {
-                    LOG_WARN("synchronizer", "Partial apply: %zu/%zu entries succeeded, %zu failed — sender will retry on next upload cycle",
-                             applied_ids.size(), entries.size(),
-                             entry_count - (applied_ids.size() - skipped_filter_removals.size()));
+                    download_failed(generation, finite_cycle_failure::partial_apply,
+                        "Download incomplete: applied " + std::to_string(applied_count) +
+                        " of " + std::to_string(entry_count) + " entries.");
                 }
+                } catch (const std::exception& error) {
+                    download_failed(generation, finite_cycle_failure::storage,
+                                    "Download incomplete: " + std::string(error.what()));
                 } catch (...) {
-                    fail_finite_cycle(finite_cycle_failure::storage, generation);
-                    throw;
+                    download_failed(generation, finite_cycle_failure::storage,
+                                    "Download incomplete: unknown apply error.");
                 }
             });
 
@@ -1728,7 +1743,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             // Dispatch to scheduler to serialize with upload_pending_changes.
             auto ids = std::move(event->acked_ids);
             invoke_on_scheduler([this, generation, ids = std::move(ids)] {
-                if (is_destroyed_ || connection_generation_ != generation ||
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation ||
                     !finite_cycle_accepts_work(generation)) return;
                 // A download-only owner makes no upload attempts. Even a late
                 // exact receipt stays pending for the next enabled owner; an
@@ -1754,7 +1769,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             // relay whose deterministic apply failure cannot be cured by retry.
             auto reason = std::move(event->nack_reason);
             invoke_on_scheduler([this, generation, reason = std::move(reason)] {
-                if (is_destroyed_ || connection_generation_ != generation) return;
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation) return;
                 fail_finite_cycle(finite_cycle_failure::partial_apply, generation);
                 fire_error("Sync upload rejected: " +
                               (reason.empty() ? std::string("no reason supplied") : reason));
@@ -1762,7 +1777,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 
         } else if (event->event_type == server_sent_event::type::catch_up_complete) {
             invoke_on_scheduler([this, generation] {
-                if (is_destroyed_ || connection_generation_ != generation || !config_.finite_cycle) return;
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation || !config_.finite_cycle) return;
                 {
                     std::lock_guard<std::mutex> lock(finite_cycle_mutex_);
                     if (finite_cycle_status_.phase != finite_cycle_phase::running ||
@@ -1778,7 +1793,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             // global, and an unfiltered sync has no synthesis path to re-send
             // from anyway (see reset_sync_state's documented limitation).
             invoke_on_scheduler([this, generation] {
-                if (is_destroyed_ || connection_generation_ != generation) return;
+                if (is_destroyed_ || receive_halted_ || connection_generation_ != generation) return;
                 if (config_.finite_cycle) {
                     fail_finite_cycle(finite_cycle_failure::invalid_frame, generation);
                     return;
@@ -1810,21 +1825,41 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             });
         }
     } catch (const std::exception& e) {
-        fail_finite_cycle(finite_cycle_failure::storage, generation);
-        LOG_ERROR("synchronizer", "on_transport_message failed: %s", e.what());
-        std::string error_msg = e.what();
-        invoke_on_scheduler([this, generation, error_msg] {
-            if (!is_destroyed_ && connection_generation_ == generation)
-                fire_error("WebSocket message handling failed: " + error_msg);
+        const std::string error = e.what();
+        invoke_on_scheduler([this, generation, error] {
+            download_failed(generation, finite_cycle_failure::storage,
+                            "Download incomplete: " + error);
         });
     } catch (...) {
-        fail_finite_cycle(finite_cycle_failure::storage, generation);
-        LOG_ERROR("synchronizer", "on_transport_message failed with unknown error");
+        invoke_on_scheduler([this, generation] {
+            download_failed(generation, finite_cycle_failure::storage,
+                            "Download incomplete: unknown message error.");
+        });
+    }
+}
+
+void synchronizer_base::download_failed(uint64_t generation, finite_cycle_failure failure,
+                                        const std::string& error) {
+    if (is_destroyed_ || connection_generation_ != generation) return;
+    fail_finite_cycle(failure, generation);
+    if (config_.finite_cycle) {
+        // Finite owners receive the failed receipt and decide when to retry.
+        fire_error(error);
+    } else if (config_.websocket_url.empty()) {
+        // Accepted IPC sockets cannot redial. Preserve their sender's ACK retry.
+        fire_error(error + " Waiting for sender retry.");
+    } else {
+        // A quiet download-only peer has no upload cycle to trigger recovery.
+        receive_halted_ = true;
+        auto diagnostic = error;
+        if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
+        on_websocket_error(diagnostic + "; reconnecting from the committed checkpoint.");
     }
 }
 
 void synchronizer_base::on_websocket_error(const std::string& error) {
     if (is_destroyed_) return;
+    receive_halted_ = true;
     fail_finite_cycle(finite_cycle_failure::transport, connection_generation_.load());
     const bool was_connecting = is_connecting_.exchange(false);
     LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
@@ -1879,6 +1914,7 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
 
 void synchronizer_base::on_websocket_close(int code, const std::string& reason) {
     if (is_destroyed_) return;
+    receive_halted_ = true;
     fail_finite_cycle(finite_cycle_failure::transport, connection_generation_.load());
     const bool was_connecting = is_connecting_.exchange(false);
     LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
@@ -3391,6 +3427,7 @@ void synchronizer_base::schedule_reconnect() {
                  log_id());
         return;
 #endif
+        if (reconnect_pending_.exchange(true)) return;
         double delay = std::min(
             std::pow(2.0, reconnect_attempts_) * config_.base_delay_seconds,
             config_.max_delay_seconds);
@@ -3413,26 +3450,27 @@ void synchronizer_base::schedule_reconnect() {
             std::lock_guard<std::recursive_mutex> lifecycle(connection_mutex_);
             if (is_destroyed_ || !should_reconnect_ ||
                 connection_generation_ != generation) return;
+            reconnect_pending_ = false;
             if (!is_connected_) connect();
         });
     }
 }
 
 std::optional<std::string> synchronizer_base::get_last_received_event_id() {
-    // Slot cursor first (written per applied chunk; survives no-op-suppressed
-    // deliveries and compaction). NULL slot → legacy newest-isFromRemote scan,
-    // self-seeding the slot so the fallback is only ever taken once per
-    // channel and repairs can eventually drop their cursor-row preservation.
+    // A present NULL cursor means no contiguous prefix committed. Later rows
+    // in a partial delivery cannot seed it past that gap. Only a channel with
+    // no slot may use the legacy remote-audit fallback.
     ensure_cursor_column(db().db());
     auto slot = db().db().query(
         "SELECT last_received_event_id FROM _lattice_replication_slots "
-        "WHERE sync_id = ? AND last_received_event_id IS NOT NULL",
+        "WHERE sync_id = ?",
         {config_.sync_id});
     if (!slot.empty()) {
         auto it = slot[0].find("last_received_event_id");
         if (it != slot[0].end() && std::holds_alternative<std::string>(it->second)) {
             return std::get<std::string>(it->second);
         }
+        return std::nullopt;
     }
     auto rows = db().db().query(
         "SELECT globalId FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1"

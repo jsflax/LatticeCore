@@ -4755,6 +4755,7 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::unordered_set<std::string> vec0_ensured;
     std::unordered_map<std::string, std::unordered_map<std::string, column_type>> schema_cache;
     std::unordered_set<std::string> owned_union_tables;
+    std::unordered_set<std::string> geo_list_tables;
     std::unordered_map<std::string, std::unordered_set<std::string>> nullable_cache;
 
     bool chunk_retried = false;
@@ -4820,6 +4821,14 @@ static std::vector<std::string> apply_remote_changes_impl(
                                 {std::string("internal_table:") + entry.table_name}).empty()) {
                             owned_union_tables.insert(entry.table_name);
                         }
+                        if (entry.table_name[0] == '_' && columns.count("id") &&
+                            columns.count("globalId") && columns.count("parent_id") &&
+                            columns.count("minLat") && columns.count("maxLat") &&
+                            columns.count("minLon") && columns.count("maxLon") &&
+                            !db.db().query("SELECT 1 FROM _lattice_meta WHERE key = ?",
+                                {std::string("internal_table:") + entry.table_name}).empty()) {
+                            geo_list_tables.insert(entry.table_name);
+                        }
                     }
                     const bool is_owned_union = owned_union_tables.count(entry.table_name) != 0;
                     const auto has_field_name = [&](const char* name) {
@@ -4859,9 +4868,11 @@ static std::vector<std::string> apply_remote_changes_impl(
 
                     // An underscore alone grants no internal-table authority.
                     // Retain current physical/wire link classification and retry
-                    // behavior; an owned union is a model, never a link.
+                    // behavior; an owned union is a model, never a link. Geo-list
+                    // tables must already have their local schema and registration.
                     if (!entry.table_name.empty() && entry.table_name[0] == '_' &&
-                        !is_owned_union && !schema_registry::instance().get_schema(entry.table_name)) {
+                        !is_owned_union && !geo_list_tables.count(entry.table_name) &&
+                        !schema_registry::instance().get_schema(entry.table_name)) {
                         const auto& columns = schema_it->second;
                         const bool missing = columns.empty();
                         auto wire_has = [&](const char* name) {

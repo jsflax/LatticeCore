@@ -1314,6 +1314,87 @@ TEST(Sync, ReplayAcknowledgesFirstUnionAndLinkEntries) {
                                  {std::string("idx__ReplayVirtualLinks_rhs_lhs")}).empty());
 }
 
+TEST(Sync, RegisteredGeoListInsertReceiveMaintainsSpatialIndex) {
+    lattice::lattice_db source;
+    lattice::lattice_db target;
+    for (auto* db : {&source, &target}) {
+        db->ensure_geo_bounds_list_table("TestRegion", "zones");
+    }
+    source.db().execute("DELETE FROM AuditLog");
+    source.db().execute(
+        "INSERT INTO _TestRegion_zones(globalId,parent_id,minLat,maxLat,minLon,maxLon) VALUES "
+        "('zone-1','region-1',32.5,42.0,-124.5,-114.0),"
+        "('zone-2','region-1',37.0,38.5,-123.0,-121.5)");
+
+    const auto entries = lattice::query_audit_log(source.db());
+    ASSERT_EQ(entries.size(), 2u);
+    ASSERT_EQ(entries[0].operation, "INSERT");
+    ASSERT_EQ(entries[1].operation, "INSERT");
+    const auto decoded = lattice::server_sent_event::from_json(
+        lattice::server_sent_event::make_audit_log(entries).to_json());
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->audit_logs.size(), 2u);
+    const auto applied = lattice::apply_remote_changes(target, decoded->audit_logs);
+    ASSERT_EQ(applied, (std::vector<std::string>{entries[0].global_id, entries[1].global_id}));
+    EXPECT_EQ(target.db().query("SELECT * FROM _TestRegion_zones ORDER BY globalId"),
+              source.db().query("SELECT * FROM _TestRegion_zones ORDER BY globalId"));
+    EXPECT_EQ(target.db().query("SELECT * FROM _TestRegion_zones_rtree ORDER BY id"),
+              source.db().query("SELECT * FROM _TestRegion_zones_rtree ORDER BY id"));
+    EXPECT_EQ(lattice::query_audit_log(target.db()).size(), 2u);
+}
+
+TEST(Sync, RegisteredGeoListDeleteReceiveMaintainsSpatialIndex) {
+    lattice::lattice_db source;
+    lattice::lattice_db target;
+    for (auto* db : {&source, &target}) {
+        db->ensure_geo_bounds_list_table("TestRegion", "zones");
+        db->db().execute(
+            "INSERT INTO _TestRegion_zones(globalId,parent_id,minLat,maxLat,minLon,maxLon) "
+            "VALUES ('zone-1','region-1',32.5,42.0,-124.5,-114.0)");
+        db->db().execute("DELETE FROM AuditLog");
+    }
+    ASSERT_EQ(target.db().query("SELECT * FROM _TestRegion_zones_rtree").size(), 1u);
+    source.db().execute("DELETE FROM _TestRegion_zones WHERE globalId='zone-1'");
+
+    const auto entries = lattice::query_audit_log(source.db());
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].operation, "DELETE");
+    const auto decoded = lattice::server_sent_event::from_json(
+        lattice::server_sent_event::make_audit_log(entries).to_json());
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->audit_logs.size(), 1u);
+    ASSERT_TRUE(decoded->audit_logs[0].changed_fields.empty());
+    const auto applied = lattice::apply_remote_changes(target, decoded->audit_logs);
+    EXPECT_EQ(applied, std::vector<std::string>{entries[0].global_id});
+    EXPECT_TRUE(target.db().query("SELECT * FROM _TestRegion_zones").empty());
+    EXPECT_TRUE(target.db().query("SELECT * FROM _TestRegion_zones_rtree").empty());
+    const auto received = lattice::query_audit_log(target.db());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].global_id, entries[0].global_id);
+}
+
+TEST(Sync, GeoListReceiveRequiresLocalRegistration) {
+    lattice::lattice_db source;
+    lattice::lattice_db target;
+    for (auto* db : {&source, &target}) {
+        db->ensure_geo_bounds_list_table("TestRegion", "zones");
+    }
+    target.db().execute("DELETE FROM _lattice_meta WHERE key='internal_table:_TestRegion_zones'");
+    source.db().execute("DELETE FROM AuditLog");
+    source.db().execute(
+        "INSERT INTO _TestRegion_zones(globalId,parent_id,minLat,maxLat,minLon,maxLon) "
+        "VALUES ('zone-1','region-1',32.5,42.0,-124.5,-114.0)");
+    const auto entries = lattice::query_audit_log(source.db());
+    ASSERT_EQ(entries.size(), 1u);
+    const auto decoded = lattice::server_sent_event::from_json(
+        lattice::server_sent_event::make_audit_log(entries).to_json());
+    ASSERT_TRUE(decoded.has_value());
+
+    EXPECT_TRUE(lattice::apply_remote_changes(target, decoded->audit_logs).empty());
+    EXPECT_TRUE(target.db().query("SELECT * FROM _TestRegion_zones").empty());
+    EXPECT_TRUE(lattice::query_audit_log(target.db()).empty());
+}
+
 TEST(Sync, FailedLinkEnsureIsNotMemoizedAsSuccess) {
     lattice::lattice_db db;
     db.db().execute("CREATE TABLE _ReplayEnsureRetry(lhs TEXT NOT NULL,rhs TEXT NOT NULL,"

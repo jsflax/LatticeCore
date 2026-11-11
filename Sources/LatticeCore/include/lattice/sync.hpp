@@ -161,13 +161,16 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack, replay_request, nack, catch_up_complete };
+    enum class type { audit_log, ack, replay_request, nack, catch_up_complete, floor_reset };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
     std::vector<std::string> acked_ids;       // For ack type (UUIDs)
     std::vector<std::string> nacked_ids;      // Rejected uploads; never acknowledgments
     std::string nack_reason;
+    // Informational replay boundary, never evidence that rows were applied.
+    std::optional<std::string> floor_reset_head;
+    std::string floor_reset_reason;
 
     // Serialize to JSON
     std::string to_json() const;

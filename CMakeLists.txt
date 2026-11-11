@@ -190,6 +190,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/SyncFloorResetTests.cpp
     Tests/LatticeCoreTests/SyncOversizedRowTests.cpp
     Tests/LatticeCoreTests/StartupSyncRepairTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp

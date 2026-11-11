@@ -925,6 +925,12 @@ std::optional<server_sent_event> server_sent_event::from_json(
             }
             return event;
 
+        } else if (j.contains("rejected")) {
+            if (!j["rejected"].is_string()) return reject("rejected is not a string");
+            // Relay policy refusals leave the socket open. Normalize them to
+            // the existing rejection path: no ACK, cursor advance or redial.
+            return make_nack({}, j["rejected"].get<std::string>());
+
         } else if (j.contains("catchUpComplete")) {
             if (!j["catchUpComplete"].is_boolean() || !j["catchUpComplete"].get<bool>())
                 return reject("invalid catchUpComplete marker");
@@ -1463,9 +1469,10 @@ void synchronizer_base::disconnect() {
             fire_state_change(false);
     });
 
-    // An observer's slot carries no upload state — evict it on a clean
-    // disconnect so it never lingers as a participant in anyone's floor.
-    if (config_.is_observer && !is_destroyed_) {
+    // A failed download must keep even a NULL cursor: deleting the slot would
+    // let the legacy fallback resume after later rows of the incomplete frame.
+    // A complete apply restores ordinary observer eviction on clean disconnect.
+    if (config_.is_observer && !is_destroyed_ && !download_failure_outstanding_) {
         try {
             remove_replication_slot(db().db(), config_.sync_id);
         } catch (const std::exception& e) {
@@ -1723,14 +1730,14 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if (partial) {
                     download_failed(generation, finite_cycle_failure::partial_apply,
                         "Download incomplete: applied " + std::to_string(applied_count) +
-                        " of " + std::to_string(entry_count) + " entries.");
+                        " of " + std::to_string(entry_count) + " entries");
                 }
                 } catch (const std::exception& error) {
                     download_failed(generation, finite_cycle_failure::storage,
                                     "Download incomplete: " + std::string(error.what()));
                 } catch (...) {
                     download_failed(generation, finite_cycle_failure::storage,
-                                    "Download incomplete: unknown apply error.");
+                                    "Download incomplete: unknown apply error");
                 }
             });
 
@@ -1828,7 +1835,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
     } catch (...) {
         invoke_on_scheduler([this, generation] {
             download_failed(generation, finite_cycle_failure::storage,
-                            "Download incomplete: unknown message error.");
+                            "Download incomplete: unknown message error");
         });
     }
 }
@@ -1836,18 +1843,19 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 void synchronizer_base::download_failed(uint64_t generation, finite_cycle_failure failure,
                                         const std::string& error) {
     if (is_destroyed_ || connection_generation_ != generation) return;
+    download_failure_outstanding_ = true;
     fail_finite_cycle(failure, generation);
+    auto diagnostic = error;
+    if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
     if (config_.finite_cycle) {
         // Finite owners receive the failed receipt and decide when to retry.
         fire_error(error);
     } else if (config_.websocket_url.empty()) {
         // Accepted IPC sockets cannot redial. Preserve their sender's ACK retry.
-        fire_error(error + " Waiting for sender retry.");
+        fire_error(diagnostic + "; waiting for sender retry.");
     } else {
         // A quiet download-only peer has no upload cycle to trigger recovery.
         receive_halted_ = true;
-        auto diagnostic = error;
-        if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
         on_websocket_error(diagnostic + "; reconnecting from the committed checkpoint.");
     }
 }
@@ -3226,7 +3234,11 @@ void synchronizer_base::upload_pending_changes_impl() {
 }
 
 std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
+    // Store/progress/ACK callbacks may disconnect before the caller reports a
+    // partial result. Retain the cursor while that outcome is still unknown.
+    if (!entries.empty()) download_failure_outstanding_ = true;
     auto applied = lattice::apply_remote_changes_for(db(), entries, config_.sync_id);
+    if (!entries.empty() && applied.size() == entries.size()) download_failure_outstanding_ = false;
     progress_received_.fetch_add(static_cast<int64_t>(applied.size()), std::memory_order_relaxed);
     fire_progress();
     return applied;

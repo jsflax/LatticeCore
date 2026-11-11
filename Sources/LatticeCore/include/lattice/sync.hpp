@@ -601,6 +601,8 @@ protected:
     std::atomic<uint64_t> connection_generation_{0};
     // A receive gap fences this connection's queued frames until a new open.
     std::atomic<bool> receive_halted_{true};
+    // Keep an observer's cursor until a receive attempt proves a complete apply.
+    std::atomic<bool> download_failure_outstanding_{false};
     // Error and close callbacks for one attempt share a single delayed retry.
     std::atomic<bool> reconnect_pending_{false};
     std::atomic<int> reconnect_attempts_{0};

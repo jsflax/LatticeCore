@@ -1,8 +1,9 @@
 #include "TestHelpers.hpp"
 #include <lattice/sync.hpp>
+#include <lattice.hpp>
 
 namespace {
-constexpr size_t hard_byte_limit = 2 * lattice::sync_max_encoded_message_bytes;
+constexpr size_t hard_byte_limit = lattice::sync_max_encoded_row_bytes;
 constexpr size_t frame_envelope = sizeof("{\"kind\":\"auditLog\",\"auditLog\":[") - 1 + 2;
 
 lattice::audit_log_entry text_entry(const std::string& identity, size_t payload_size = 0) {
@@ -141,4 +142,16 @@ TEST(SyncOversizedRow, HydrationPrefixesNeverSkipTheLargeMiddleRow) {
     }
     EXPECT_TRUE(lattice::query_audit_log_for_sync(db.db(), "prefix", std::nullopt,
         floor, 10, std::nullopt, hard_byte_limit).empty());
+}
+
+
+// API guard: these accessors expose separate batching and row-admission limits.
+// The new hard-limit accessor is absent before this change.
+TEST(SyncOversizedRow, BridgeExportsSeparateBatchAndSingleRowLimits) {
+    EXPECT_EQ(lattice::sync_max_encoded_message_bytes_value(), 4 * 1024 * 1024);
+    EXPECT_EQ(lattice::sync_max_encoded_row_bytes_value(), 8 * 1024 * 1024);
+    EXPECT_EQ(lattice::sync_max_encoded_row_bytes_value(),
+              static_cast<int64_t>(lattice::sync_max_encoded_row_bytes));
+    EXPECT_GT(lattice::sync_max_encoded_row_bytes_value(),
+              lattice::sync_max_encoded_message_bytes_value());
 }

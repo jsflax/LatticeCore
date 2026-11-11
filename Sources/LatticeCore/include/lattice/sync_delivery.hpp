@@ -6,7 +6,7 @@
 #include "sync_storage.hpp"
 
 namespace lattice::detail {
-inline constexpr size_t sync_outbox_bytes = 2 * sync_max_encoded_message_bytes;
+inline constexpr size_t sync_outbox_bytes = sync_max_encoded_row_bytes;
 inline constexpr size_t sync_outbox_rows = 4096;
 
 // The released sync owner already used this transaction boundary. Keep its

@@ -8,7 +8,7 @@ namespace lattice::detail {
 // Epoch 9 joins the released six-column outbox and the asset-reader ten-column
 // outbox. Receipt identity and legacy disposition never alter the wire payload.
 inline constexpr int sync_storage_writer_epoch = 9;
-inline constexpr size_t sync_storage_retained_bytes = 2 * sync_max_encoded_message_bytes;
+inline constexpr size_t sync_storage_retained_bytes = sync_max_encoded_row_bytes;
 inline constexpr size_t sync_storage_retained_rows = 4096;
 inline constexpr size_t sync_storage_envelope = sizeof("{\"kind\":\"auditLog\",\"auditLog\":[") - 1 + 2;
 

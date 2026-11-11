@@ -228,6 +228,8 @@ struct sync_filter_entry {
 // Audit JSON keeps the existing wire protocol. Ordinary batches use this bound.
 // One larger row may be sent alone, up to the byte-accounted 8 MiB upload window.
 inline constexpr size_t sync_max_encoded_message_bytes = 4 * 1024 * 1024;
+// Hard limit for one encoded row including its auditLog envelope.
+inline constexpr size_t sync_max_encoded_row_bytes = 8 * 1024 * 1024;
 
 struct encoded_audit_log_prefix {
     std::string json;
@@ -244,7 +246,7 @@ struct encoded_audit_log_prefix {
 encoded_audit_log_prefix encode_audit_log_prefix(
     const std::vector<audit_log_entry>& entries, size_t start, size_t max_count,
     size_t max_bytes = sync_max_encoded_message_bytes,
-    size_t available_window_bytes = 2 * sync_max_encoded_message_bytes);
+    size_t available_window_bytes = sync_max_encoded_row_bytes);
 
 namespace detail {
 // Recover the exact row bytes from a single-entry bounded encoder result.

@@ -2021,7 +2021,7 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
     }
     std::string sentinel="__lattice_snapshot_bytes";
     while(std::find(col_names.begin(),col_names.end(),sentinel)!=col_names.end()) sentinel+='_';
-    const auto allowed="("+budget+")<="+std::to_string(2*sync_max_encoded_message_bytes);
+    const auto allowed="("+budget+")<="+std::to_string(sync_max_encoded_row_bytes);
     // Every variable projected value is gated by the length sentinel in the SAME SQL statement.
     // This bounds C++ hydration, not SQLite page-cache/RSS or CPU; encoded JSON is bounded later.
     std::string sql="SELECT "+std::string(has_id ? "id" : "0 AS id")+", ("+budget+") AS "+quote(sentinel)+
@@ -2033,7 +2033,7 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
     if(!rows.empty()) {
         const auto& bytes=rows[0].at(sentinel);
         if(!std::holds_alternative<int64_t>(bytes) || std::get<int64_t>(bytes)<0 ||
-            std::get<int64_t>(bytes)>static_cast<int64_t>(2*sync_max_encoded_message_bytes))
+            std::get<int64_t>(bytes)>static_cast<int64_t>(sync_max_encoded_row_bytes))
             throw std::length_error("Sync audit row " + diagnostic_id + " in table " + table_name +
                 " (snapshot of row " + global_row_id + ") exceeds materialized byte limit");
     }
@@ -2385,7 +2385,7 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enum
     bool hit_byte_limit = false;
     auto entries = query_audit_log_for_sync(
         db().db(), config_.sync_id, config_.sync_filter, floor, limit, horizon,
-        2 * sync_max_encoded_message_bytes, &hit_byte_limit);
+        sync_max_encoded_row_bytes, &hit_byte_limit);
     enumeration_hit_limit = hit_byte_limit || (limit > 0 && entries.size() >= limit);
 
     // Filter out entries already in-flight (sent but not yet ACK'd), and
@@ -2680,7 +2680,7 @@ encoded_audit_log_prefix encode_audit_log_prefix(
         // The single-row encoder can allocate one row; this is an encoded-send
         // limit, not a claim of a pre-materialization or parser allocation bound.
         auto row = entries[index].to_json();
-        constexpr size_t hard_limit = 2 * sync_max_encoded_message_bytes;
+        constexpr size_t hard_limit = sync_max_encoded_row_bytes;
         if (row.size() > hard_limit - envelope) {
             if (result.count != 0) break;
             throw std::length_error("Sync audit row " + entries[index].global_id + " (id " +
@@ -2900,7 +2900,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries,
     if (entries.empty()) return;
 
     const size_t window_cap = config_.chunk_size * 2;
-    constexpr size_t byte_window_cap = 2 * sync_max_encoded_message_bytes;
+    constexpr size_t byte_window_cap = sync_max_encoded_row_bytes;
     constexpr std::string_view prefix = "{\"kind\":\"auditLog\",\"auditLog\":[";
     size_t sent = 0;
     while (sent < entries.size() && is_connected_) {

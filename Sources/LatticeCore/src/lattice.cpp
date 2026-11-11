@@ -1124,6 +1124,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     sync_db_config.busy_timeout_ms = config_.busy_timeout_ms;
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
+    sync_db_config.create_if_missing = config_.create_if_missing;
     sync_db_config.private_sync_cancellation = cancellation;
     auto sync_db = std::make_unique<lattice_db>(sync_db_config);
     {
@@ -1525,6 +1526,7 @@ void lattice_db::setup_ipc_if_configured() {
         database_config.busy_timeout_ms=config.busy_timeout_ms;
         database_config.target_schema_version=config.target_schema_version;
         database_config.migration_block=config.migration_block;
+        database_config.create_if_missing=config.create_if_missing;
         channel->publication=std::make_shared<detail::ipc_publication_state>(settings,
             [database_config,resources](std::unique_ptr<ipc_socket_client> transport,const sync_config& latest) {
                 auto owned_config=database_config;owned_config.sched=std::make_shared<std_thread_scheduler>();

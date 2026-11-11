@@ -386,6 +386,19 @@ void database::close() {
     closed_.store(true, std::memory_order_release);
 }
 
+std::string database::main_file_path() {
+    if (!db_ || is_closed()) throw db_error("Main file connection is closed");
+    auto* mutex = sqlite3_db_mutex(db_);
+    sqlite3_mutex_enter(mutex);
+    struct unlock { sqlite3_mutex* value; ~unlock() { sqlite3_mutex_leave(value); } } held{mutex};
+    if (is_closed()) throw db_error("Main file connection is closed");
+    const char* filename = sqlite3_db_filename(db_, "main");
+    if (!filename || !*filename) throw db_error("Main file path requires a file database");
+    std::string result(filename);
+    if (is_closed()) throw db_error("Main file connection closed during filename read");
+    return result;
+}
+
 void database::require_main_file_unmoved(const std::string& expected_path) {
     if (expected_path.empty() || expected_path.size() > 4096 || expected_path.find('\0') != std::string::npos)
         throw db_error("Main file currentness expected path is invalid");

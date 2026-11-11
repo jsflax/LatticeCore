@@ -283,7 +283,7 @@ target_link_libraries(LatticeTransportAuthenticationTests PRIVATE LatticeCore La
 
 # This exit-order oracle must run as its own process, outside the test runner.
 if(UNIX)
-    add_executable(LatticeCacheExitProbe Tests/Regression/LatticeCacheExitProbe.cpp)
+    add_executable(LatticeCacheExitProbe EXCLUDE_FROM_ALL Tests/Regression/LatticeCacheExitProbe.cpp)
     target_compile_definitions(LatticeCacheExitProbe PRIVATE SQLITE_CORE)
     target_link_libraries(LatticeCacheExitProbe PRIVATE LatticeSwiftCppBridge)
 endif()

@@ -65,6 +65,12 @@ sanitizer is not required for the allocator-based oracle. This proves the cache
 exit-lifetime contract; it does not establish the cause of the originally
 reported observer-delivery crash.
 
+For the exit-70 run at this head, temporarily restore the old body of
+`LatticeCache::instance()` in `Sources/LatticeSwiftCppBridge/src/lattice.cpp` to
+`static LatticeCache inst; return inst;`, rebuild the same `LatticeCacheExitProbe`
+target, run the unchanged probe in a fresh process to record exit 70, then restore
+the process-lived cache body.
+
 For a native macOS build, select the intended Xcode with `DEVELOPER_DIR` rather
 than changing global `xcode-select`. The libraries and probe must use the same
 C++20, deployment-target and foreign-reference ABI configuration. The following
@@ -83,6 +89,9 @@ cmake -S "$LATTICE_PROBE_CHECKOUT" -B "$LATTICE_PROBE_BUILD" \
 cmake --build "$LATTICE_PROBE_BUILD" --target LatticeCacheExitProbe --parallel 2
 "$LATTICE_PROBE_BUILD/LatticeCacheExitProbe" "$LATTICE_PROBE_RECEIPTS"
 ```
+
+On Linux, use the same CMake configure, build and run commands, omitting the
+`DEVELOPER_DIR` setup, the `xcrun` compiler options and all `CMAKE_OSX_*` options.
 
 If compiling the standalone source manually against those matching archives,
 include all three public header directories and retain the same target flags:

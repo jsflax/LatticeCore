@@ -5338,3 +5338,44 @@ TEST(SyncRecovery, InvalidControlStillFencesQueuedHistoryAndRecoversFromCommitte
         fixture.expect_complete(3);
     }
 }
+
+
+TEST(SyncRecovery, RejectedFrameDoesNotFenceQueuedPagesOrRedial) {
+    recovery_fixture fixture(4);
+    fixture.sync->connect();
+    fixture.wire->deliver({fixture.wire->history.begin(), fixture.wire->history.begin() + 2});
+    fixture.wire->deliver_json(R"({"kind":"rejected","rejected":"write policy refused"})");
+    fixture.wire->deliver({fixture.wire->history.begin() + 2, fixture.wire->history.end()});
+    ASSERT_TRUE(fixture.wait([&] { return fixture.sync->get_progress().received >= 4; }));
+    EXPECT_EQ(fixture.wire->connections, 1u);
+    fixture.expect_complete(4);
+    EXPECT_EQ(fixture.errors, 1);
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_EQ(fixture.last_error, "Sync upload rejected: write policy refused");
+    }
+}
+
+TEST(SyncRecovery, RejectedFramesRequireAStringAndASingleMatchingPayload) {
+    for (const auto* wire : {R"({"kind":"rejected","rejected":"policy refused"})",
+                             R"({"kind":"rejected","rejected":""})",
+                             R"({"rejected":"legacy refusal"})"}) {
+        SCOPED_TRACE(wire);
+        const auto event = lattice::server_sent_event::from_json(wire);
+        ASSERT_TRUE(event);
+        EXPECT_EQ(event->event_type, lattice::server_sent_event::type::nack);
+        EXPECT_TRUE(event->nacked_ids.empty());
+        EXPECT_TRUE(event->acked_ids.empty());
+        EXPECT_TRUE(event->audit_logs.empty());
+    }
+    for (const auto* wire : {R"({"kind":"rejected","rejected":null})",
+                             R"({"kind":"rejected","rejected":12})",
+                             R"({"kind":"rejected","rejected":[]})",
+                             R"({"kind":"rejected","rejected":"no","ack":[]})",
+                             R"({"kind":"nack","rejected":"no"})"}) {
+        SCOPED_TRACE(wire);
+        std::string diagnostic;
+        EXPECT_FALSE(lattice::server_sent_event::from_json(wire, &diagnostic));
+        EXPECT_FALSE(diagnostic.empty());
+    }
+}

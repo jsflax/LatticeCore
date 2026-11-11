@@ -925,6 +925,12 @@ std::optional<server_sent_event> server_sent_event::from_json(
             }
             return event;
 
+        } else if (j.contains("rejected")) {
+            if (!j["rejected"].is_string()) return reject("rejected is not a string");
+            // Relay policy refusals leave the socket open. Normalize them to
+            // the existing rejection path: no ACK, cursor advance or redial.
+            return make_nack({}, j["rejected"].get<std::string>());
+
         } else if (j.contains("catchUpComplete")) {
             if (!j["catchUpComplete"].is_boolean() || !j["catchUpComplete"].get<bool>())
                 return reject("invalid catchUpComplete marker");

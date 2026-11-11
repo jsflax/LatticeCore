@@ -169,8 +169,8 @@ TEST(SyncFloorReset, ParsesOnlyExplicitValidatedControlWithoutInventingAnAck) {
     }
 }
 
-// Green guard: malformed controls remain rejected; NACK and catch-up markers
-// are separate controls already supported by the current protocol.
+// Malformed controls remain rejected; relay refusals, NACK and catch-up
+// markers are separate controls rather than unknown floor-reset payloads.
 TEST(SyncFloorReset, MalformedMixedAndUnknownControlsRemainParseFailures) {
     for (const auto* wire : {
             R"({"kind":"floorReset"})",
@@ -190,13 +190,19 @@ TEST(SyncFloorReset, MalformedMixedAndUnknownControlsRemainParseFailures) {
             R"({"kind":"other","floorReason":"","floorReset":null})",
             R"({"kind":7,"floorReason":"","floorReset":null})",
             R"({"kind":"futureControl"})",
-            R"({"kind":"rejected","rejected":"not implemented"})"}) {
+            R"({"kind":"rejected","rejected":null})"}) {
         SCOPED_TRACE(wire);
         std::string diagnostic;
         EXPECT_FALSE(lattice::server_sent_event::from_json(wire, &diagnostic).has_value());
         EXPECT_FALSE(diagnostic.empty());
         EXPECT_FALSE(lattice::server_sent_event::from_json_immutable(wire).has_value());
     }
+    const auto refusal = lattice::server_sent_event::from_json(R"({"kind":"rejected","rejected":"policy refusal"})");
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->event_type, lattice::server_sent_event::type::nack);
+    EXPECT_EQ(refusal->nack_reason, "policy refusal");
+    EXPECT_TRUE(refusal->acked_ids.empty());
+    EXPECT_TRUE(lattice::server_sent_event::from_json_immutable(R"({"kind":"rejected","rejected":"policy refusal"})"));
     EXPECT_TRUE(lattice::server_sent_event::from_json(R"({"kind":"nack","nack":[],"nackReason":"retry"})"));
     EXPECT_TRUE(lattice::server_sent_event::from_json(R"({"kind":"catchUpComplete","catchUpComplete":true})"));
 }

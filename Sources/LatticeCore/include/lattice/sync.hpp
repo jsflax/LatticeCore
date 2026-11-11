@@ -599,6 +599,10 @@ protected:
     // A request revokes future admissions; an already-reserved bounded frame may finish enqueue.
     std::mutex policy_admission_mutex_;
     std::atomic<uint64_t> connection_generation_{0};
+    // A receive gap fences this connection's queued frames until a new open.
+    std::atomic<bool> receive_halted_{true};
+    // Error and close callbacks for one attempt share a single delayed retry.
+    std::atomic<bool> reconnect_pending_{false};
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -785,6 +789,9 @@ protected:
 
     // Reconciliation (called on filter change)
     void reconcile_sync_filter();
+
+    // Failed downloads preserve the durable cursor and the transport's retry policy.
+    void download_failed(uint64_t generation, finite_cycle_failure failure, const std::string& error);
 
     // Reconnection
     void schedule_reconnect();

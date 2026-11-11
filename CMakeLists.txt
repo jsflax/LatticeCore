@@ -300,6 +300,7 @@ set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 include(GoogleTest)
 gtest_discover_tests(LatticeCoreTests)
 gtest_discover_tests(LatticeExistingSchemaAccessTests TEST_PREFIX "Focused.")
+gtest_discover_tests(LatticePendingImportTests)
 
 # =============================================================================
 # LatticeCAPITests - behavioral tests against the C ABI (links the C surface)

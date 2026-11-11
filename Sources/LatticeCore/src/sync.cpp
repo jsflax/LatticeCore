@@ -266,8 +266,12 @@ static any_property json_to_any_property(const json& j) {
 
         const auto& v = j["value"];
         switch (kind) {
-            case any_property_kind::int_kind:
-                return any_property(static_cast<int>(v.get<int>()));
+            case any_property_kind::int_kind: {
+                any_property p;
+                p.kind = kind;
+                p.value = v.get<int64_t>();
+                return p;
+            }
             case any_property_kind::int64_kind:
                 return any_property(v.get<int64_t>());
             case any_property_kind::string_kind:

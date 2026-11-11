@@ -942,6 +942,7 @@ std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<
 
 /// Opt-in append-only model rows: complete INSERT snapshots, identical replays
 /// only. Validation and all entries share the existing owned write transaction.
+/// List rows and link rows of an append-only parent are outside the append-only guarantee.
 /// Empty tables and no authorization preserve ordinary receive semantics.
 std::vector<std::string> apply_remote_changes_immutable(lattice_db& db,
     const std::vector<audit_log_entry>& entries,

@@ -161,13 +161,16 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack, replay_request, nack, catch_up_complete };
+    enum class type { audit_log, ack, replay_request, nack, catch_up_complete, floor_reset };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
     std::vector<std::string> acked_ids;       // For ack type (UUIDs)
     std::vector<std::string> nacked_ids;      // Rejected uploads; never acknowledgments
     std::string nack_reason;
+    // Informational replay boundary, never evidence that rows were applied.
+    std::optional<std::string> floor_reset_head;
+    std::string floor_reset_reason;
 
     // Serialize to JSON
     std::string to_json() const;
@@ -595,6 +598,12 @@ protected:
     // A request revokes future admissions; an already-reserved bounded frame may finish enqueue.
     std::mutex policy_admission_mutex_;
     std::atomic<uint64_t> connection_generation_{0};
+    // A receive gap fences this connection's queued frames until a new open.
+    std::atomic<bool> receive_halted_{true};
+    // Keep an observer's cursor until a receive attempt proves a complete apply.
+    std::atomic<bool> download_failure_outstanding_{false};
+    // Error and close callbacks for one attempt share a single delayed retry.
+    std::atomic<bool> reconnect_pending_{false};
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -779,6 +788,9 @@ protected:
 
     // Reconciliation (called on filter change)
     void reconcile_sync_filter();
+
+    // Failed downloads preserve the durable cursor and the transport's retry policy.
+    void download_failed(uint64_t generation, finite_cycle_failure failure, const std::string& error);
 
     // Reconnection
     void schedule_reconnect();

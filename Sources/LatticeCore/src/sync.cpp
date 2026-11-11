@@ -1912,8 +1912,11 @@ bool synchronizer_base::row_matches_filter(const std::string& table_name, const 
 }
 
 std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_current_row(
-    const std::string& table_name, const std::string& global_row_id) {
+    const std::string& table_name, const std::string& global_row_id,
+    const std::string& source_audit_id) {
 
+    const auto wire_id = db().generate_global_id();
+    const auto& diagnostic_id = source_audit_id.empty() ? wire_id : source_audit_id;
     const auto quote=[](const std::string& value) {
         std::string result="\"";
         for(char c:value) {if(c=='\"') result+='\"'; result+=c;}
@@ -1950,7 +1953,8 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
         const auto& bytes=rows[0].at(sentinel);
         if(!std::holds_alternative<int64_t>(bytes) || std::get<int64_t>(bytes)<0 ||
             std::get<int64_t>(bytes)>static_cast<int64_t>(2*sync_max_encoded_message_bytes))
-            throw std::length_error("Sync current-row snapshot exceeds materialized byte limit");
+            throw std::length_error("Sync audit row " + diagnostic_id + " in table " + table_name +
+                " (snapshot of row " + global_row_id + ") exceeds materialized byte limit");
     }
     if (rows.empty()) {
         LOG_DEBUG("synchronizer", "build_insert_entry_from_current_row: row not found for globalId=%s (deleted?)", global_row_id.c_str());
@@ -1960,7 +1964,7 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
 
     // Build audit_log_entry
     audit_log_entry entry;
-    entry.global_id = db().generate_global_id();
+    entry.global_id = wire_id;
     entry.table_name = table_name;
     entry.operation = "INSERT";
     // A5: this is a full-row snapshot of LOCAL state (classify's
@@ -2373,7 +2377,7 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
             const bool matches = link || row_matches_filter(entry.table_name, entry.global_row_id);
             if (!matches && !in_set) { result.to_mark_synced.push_back(entry.id); continue; }
             if (matches && !in_set && entry.operation != "INSERT") {
-                auto snapshot = build_insert_entry_from_current_row(entry.table_name, entry.global_row_id);
+                auto snapshot = build_insert_entry_from_current_row(entry.table_name, entry.global_row_id, entry.global_id);
                 if (!snapshot) { result.to_mark_synced.push_back(entry.id); continue; }
                 delivery.wire = std::move(*snapshot); delivery.membership = 1;
             } else if (matches) {
@@ -2595,19 +2599,25 @@ encoded_audit_log_prefix encode_audit_log_prefix(
         // The single-row encoder can allocate one row; this is an encoded-send
         // limit, not a claim of a pre-materialization or parser allocation bound.
         auto row = entries[index].to_json();
-        if (row.size() > max_bytes - envelope) {
+        constexpr size_t hard_limit = 2 * sync_max_encoded_message_bytes;
+        if (row.size() > hard_limit - envelope) {
             if (result.count != 0) break;
-            throw std::length_error("Sync audit row exceeds encoded message byte limit");
+            throw std::length_error("Sync audit row " + entries[index].global_id + " (id " +
+                std::to_string(entries[index].id) + ") in table " + entries[index].table_name + " exceeds encoded byte limit (8 MiB)");
         }
         const size_t charge = row.size() + envelope;
+        const bool oversized = charge > max_bytes;
+        if (oversized && result.count != 0) break;
         if (charge > available_window_bytes - reserved) break;
         const size_t separator = result.count == 0 ? 0 : 1;
-        if (row.size() + separator > max_bytes - suffix.size() - result.json.size()) break;
+        if (!oversized && row.size() + separator > max_bytes - suffix.size() - result.json.size()) break;
         if (separator) result.json += ',';
         result.json += row;
         result.entry_charges.push_back(charge);
         reserved += charge;
         ++result.count;
+        // A large row gets its own frame, still charged against the 8 MiB window.
+        if (oversized) break;
     }
     if (result.count == 0) result.json.clear();
     else result.json += suffix;
@@ -2692,7 +2702,8 @@ void synchronizer_base::cancel_disallowed_deliveries() {
                     const auto retained=std::get<int64_t>(budget.at(0).at("bytes"));
                     if (retained<0 || retained-static_cast<int64_t>(delivery.routing_key.size())+
                         static_cast<int64_t>(routing_key.size())>static_cast<int64_t>(detail::sync_outbox_bytes))
-                        throw std::length_error("delivery routing metadata exceeds retained budget");
+                        throw std::length_error("Sync audit row " + delivery.source_global_id + " in table " +
+                            delivery.wire.table_name + " exceeds retained routing metadata budget");
                     db().db().execute("UPDATE main._lattice_sync_outbox SET routing_key=? WHERE sync_id=? "
                         "AND receipt_id=? AND wire_global_id=?", {routing_key,config_.sync_id,delivery.receipt_id,delivery.wire.global_id});
                     return true;
@@ -2718,7 +2729,7 @@ void synchronizer_base::cancel_disallowed_deliveries() {
             if (delivery.wire.operation == "DELETE" && matches) {
                 // It may already have applied remotely before its ACK was lost. Persist a full
                 // repair snapshot even when widening to unfiltered (which has no reconcile pass).
-                auto replacement=build_insert_entry_from_current_row(delivery.wire.table_name,delivery.wire.global_row_id);
+                auto replacement=build_insert_entry_from_current_row(delivery.wire.table_name,delivery.wire.global_row_id,delivery.source_global_id);
                 if (replacement) { successor.emplace(); successor->wire=std::move(*replacement); successor->membership=1; }
             } else {
                 const bool retract=table_allowed && delivery.routing_key==routing_key;
@@ -2768,7 +2779,8 @@ void synchronizer_base::cancel_disallowed_deliveries() {
                 const auto source=db().db().query("SELECT id FROM AuditLog WHERE globalId=?",{next.source_global_id});
                 next.source_id=std::get<int64_t>(source.at(0).at("id")); next.wire.id=next.source_id;
                 if(!detail::admit_sync_delivery_in_transaction(db(),config_.sync_id,next))
-                    throw std::length_error("delivery cancellation successor exceeds retained budget");
+                    throw std::length_error("Sync audit row " + delivery.source_global_id + " in table " +
+                        delivery.wire.table_name + " exceeds retained cancellation successor budget");
             }
             return true;
         });
@@ -2839,8 +2851,14 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries,
                     const auto encoded = encode_audit_log_prefix({entry},0,1);
                     wire = detail::single_encoded_audit_log_json(encoded); charge = encoded.entry_charges.at(0);
                 }
+                if (charge > byte_window_cap)
+                    throw std::length_error("Sync audit row " + entry.global_id + " (id " + std::to_string(entry.id) +
+                        ") in table " + entry.table_name + " exceeds encoded byte limit (8 MiB)");
+                const bool oversized = charge > sync_max_encoded_message_bytes;
+                if (oversized && frame.count != 0) break;
                 const auto appended = wire.size() + (frame.count ? 1 : 0) + 2;
-                if (appended > sync_max_encoded_message_bytes - frame.json.size() || charge > available_bytes-charged) break;
+                if ((!oversized && appended > sync_max_encoded_message_bytes - frame.json.size()) ||
+                    charge > available_bytes-charged) break;
                 if (admissions) {
                     const auto candidate = admissions->find(entry.global_id);
                     if (candidate != admissions->end()) {
@@ -2853,6 +2871,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries,
                 if (frame.count) frame.json += ',';
                 frame.json += wire; frame.entry_charges.push_back(charge);
                 charged += charge; ++frame.count;
+                if (oversized) break;
             }
         } catch (const std::exception& error) {
             fire_error(error.what());
@@ -4290,14 +4309,17 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
         // The first over-budget row is represented by a payload-free sentinel.
         // A later over-budget row truncates the prefix and reports a continuation
         // even if every returned row is subsequently skipped by the sync filter.
-        std::string select = "a.id";
+        // Refused payloads stay unhydrated; retain only bounded diagnostic identities.
+        const auto cap = std::to_string(materialized_byte_limit);
+        std::string select = "a.id, CASE WHEN r.total > " + cap +
+            " THEN substr(a.globalId,1,1024) END AS __audit_identity, CASE WHEN r.total > " + cap +
+            " THEN substr(a.tableName,1,1024) END AS __audit_table";
         for (const char* name : {"globalId", "tableName", "operation", "rowId", "globalRowId",
                                  "changedFields", "changedFieldsNames", "timestamp", "isFromRemote",
                                  "isSynchronized", "synthesized"}) {
             select += ", CASE WHEN r.total <= " + std::to_string(materialized_byte_limit) +
                       " THEN a." + name + " ELSE NULL END AS " + name;
         }
-        const auto cap = std::to_string(materialized_byte_limit);
         sql = "WITH pending AS (" + sql + "), ranked AS ("
             "SELECT id, SUM(bytes) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS total, "
             "ROW_NUMBER() OVER (ORDER BY id) AS ordinal FROM pending) SELECT " + select +
@@ -4309,8 +4331,16 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     auto rows = db.query(sql, params);
     if (db.is_closed()) throw db_error("Sync pending audit read on closed database");
     if (materialized_byte_limit > 0 && !rows.empty()) {
-        if (std::get<int64_t>(rows.front().at("__byte_refused")) != 0)
-            throw std::length_error("Sync audit row exceeds materialized byte limit");
+        if (std::get<int64_t>(rows.front().at("__byte_refused")) != 0) {
+            const auto& row = rows.front();
+            const auto identity = [&](const char* key) {
+                const auto& value = row.at(key);
+                return std::holds_alternative<std::string>(value) ? std::get<std::string>(value) : "<unknown>";
+            };
+            throw std::length_error("Sync audit row " + identity("__audit_identity") + " (id " +
+                std::to_string(std::get<int64_t>(row.at("id"))) + ") in table " + identity("__audit_table") +
+                " exceeds materialized byte limit");
+        }
         if (hit_byte_limit)
             *hit_byte_limit = std::get<int64_t>(rows.front().at("__byte_truncated")) != 0;
     }

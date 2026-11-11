@@ -2824,7 +2824,9 @@ TEST(Sync, EncodedByteBoundaryIncludesEnvelopeAndBinaryExpansion) {
     auto exact = lattice::encode_audit_log_prefix(rows, 0, 1, full.json.size());
     EXPECT_EQ(exact.count, 1u);
     EXPECT_EQ(exact.json.size(), full.json.size());
-    EXPECT_THROW(lattice::encode_audit_log_prefix(rows, 0, 1, full.json.size() - 1), std::length_error);
+    const auto oversized = lattice::encode_audit_log_prefix(rows, 0, 1, full.json.size() - 1);
+    EXPECT_EQ(oversized.count, 1u);
+    EXPECT_EQ(oversized.json, full.json);
     auto decoded = lattice::server_sent_event::from_json(exact.json);
     ASSERT_TRUE(decoded);
     ASSERT_EQ(decoded->audit_logs.size(), 1u);
@@ -2875,8 +2877,14 @@ TEST(Sync, OversizedRowNeverHidesBehindOrSkipsPastAPartialPrefix) {
         byte_budget_entry(0, 16), byte_budget_entry(1, 2048), byte_budget_entry(2, 16)};
     auto prefix = lattice::encode_audit_log_prefix(rows, 0, rows.size(), 1024);
     ASSERT_EQ(prefix.count, 1u);
-    EXPECT_THROW(lattice::encode_audit_log_prefix(rows, prefix.count, rows.size(), 1024), std::length_error);
-    EXPECT_EQ(rows[1].global_id, "byte-audit-1");
+    const auto oversized = lattice::encode_audit_log_prefix(rows, prefix.count, rows.size(), 1024);
+    ASSERT_EQ(oversized.count, 1u);
+    const auto decoded = lattice::server_sent_event::from_json(oversized.json);
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->audit_logs.size(), 1u);
+    EXPECT_EQ(decoded->audit_logs.front().global_id, "byte-audit-1");
+    const auto suffix = lattice::encode_audit_log_prefix(rows, 2, rows.size(), 1024);
+    EXPECT_EQ(suffix.count, 1u);
 }
 
 TEST(Sync, ExhaustedByteCreditDoesNotBecomeAnOversizedRowFailure) {
@@ -2971,34 +2979,56 @@ TEST(Sync, StalledTransportPlateausAtEncodedByteWindowThenDrains) {
     });
 }
 
-TEST(Sync, OversizedSingleUploadReportsErrorWithoutAdvancingFloorOrSyncState) {
+TEST(Sync, OversizedSingleUploadIsSentAloneAndAckReleasesFollowingRows) {
     bounded_mock_case([] {
         auto factory = std::make_shared<lattice::mock_network_factory>();
         lattice::set_network_factory(factory);
         TempDB tmp{"byteoversize"};
         auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        db->add(TestPerson{"before", 0, std::nullopt});
         db->add(TestPerson{std::string(lattice::sync_max_encoded_message_bytes, 'x'), 1, std::nullopt});
+        db->add(TestPerson{"after", 2, std::nullopt});
         auto* owned = db.get();
+        const auto pending = lattice::query_audit_log_for_sync(owned->db(), "byte-oversize");
+        ASSERT_EQ(pending.size(), 3u);
         lattice::sync_config cfg;
         cfg.websocket_url = "ws://localhost/sync"; cfg.sync_id = "byte-oversize";
         cfg.all_active_sync_ids = {cfg.sync_id};
+        std::string failure;
         lattice::synchronizer sync(std::move(db), cfg);
         auto* transport = factory->last_websocket();
         ASSERT_NE(transport, nullptr);
-        std::string failure;
         sync.set_on_error([&](const std::string& error) { failure = error; });
         sync.connect();
-        EXPECT_NE(failure.find("byte limit"), std::string::npos);
-        for (const auto& message : transport->get_sent_messages()) {
-            auto event = lattice::server_sent_event::from_json(message.as_string());
-            EXPECT_FALSE(event && event->event_type == lattice::server_sent_event::type::audit_log);
+        std::set<std::string> acknowledged;
+        bool saw_oversized = false;
+        for (int pass = 0; pass < 4 && acknowledged.size() < pending.size(); ++pass) {
+            std::vector<std::string> ids;
+            for (const auto& message : transport->get_sent_messages()) {
+                const auto bytes = message.as_string();
+                const auto event = lattice::server_sent_event::from_json(bytes);
+                if (!event || event->event_type != lattice::server_sent_event::type::audit_log) continue;
+                if (bytes.size() > lattice::sync_max_encoded_message_bytes) {
+                    saw_oversized = true;
+                    ASSERT_EQ(event->audit_logs.size(), 1u);
+                    EXPECT_EQ(event->audit_logs.front().global_id, pending[1].global_id);
+                    EXPECT_EQ(event->audit_logs.front().changed_fields.at("name").to_column_value(),
+                              pending[1].changed_fields.at("name").to_column_value());
+                }
+                for (const auto& row : event->audit_logs)
+                    if (acknowledged.insert(row.global_id).second) ids.push_back(row.global_id);
+            }
+            if (ids.empty()) break;
+            transport->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_ack(ids).to_json()));
         }
+        EXPECT_TRUE(saw_oversized);
+        EXPECT_TRUE(failure.empty()) << failure;
+        EXPECT_EQ(acknowledged.size(), pending.size());
+        for (const auto& row : pending) EXPECT_EQ(acknowledged.count(row.global_id), 1u);
+        EXPECT_TRUE(lattice::query_audit_log_for_sync(owned->db(), cfg.sync_id).empty());
         EXPECT_EQ(sync.get_progress().pending_upload, 0);
-        EXPECT_EQ(sync.get_progress().total_upload, 0);
-        EXPECT_EQ(lattice::read_upload_floor(owned->db(), cfg.sync_id), 0);
-        auto pending = lattice::query_audit_log_for_sync(owned->db(), cfg.sync_id);
-        EXPECT_EQ(pending.size(), 1u);
-    });
+    },30);
 }
 #endif
 
@@ -3046,7 +3076,7 @@ TEST(SyncDelivery, RefusalLeavesOriginalAndMembershipUntouched) {
     db.add(TestPerson{"receipt",1,std::nullopt});
     const auto source=lattice::query_audit_log(db.db()).back();
     auto delivery=outbox_delivery(source);
-    delivery.wire.changed_fields["name"]=lattice::any_property(std::string(lattice::sync_max_encoded_message_bytes,'x'));
+    delivery.wire.changed_fields["name"]=lattice::any_property(std::string(2*lattice::sync_max_encoded_message_bytes,'x'));
     EXPECT_THROW(lattice::detail::admit_sync_delivery(db,"outbox",delivery),std::length_error);
     EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
     EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
@@ -3157,14 +3187,16 @@ TEST(SyncDelivery, FilteredSyntheticOversizeDoesNotResolveItsOriginalUpdate) {
         auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
         TempDB tmp{"outboxsyntheticlarge"};
         auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
-        db->add(TestPerson{std::string(lattice::sync_max_encoded_message_bytes,'x'),0,std::nullopt});
+        db->add(TestPerson{std::string(2*lattice::sync_max_encoded_message_bytes,'x'),0,std::nullopt});
         db->db().execute("UPDATE AuditLog SET isSynchronized=1");
         db->db().execute("UPDATE TestPerson SET age=1");
         const auto source=lattice::query_audit_log(db->db()).back();
         auto cfg=outbox_config("synthetic-large"); cfg.sync_filter->at(0).where_clause="age=1";
-        lattice::synchronizer sync(std::move(db),cfg); std::string error;
+        std::string error; lattice::synchronizer sync(std::move(db),cfg);
         sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
-        EXPECT_FALSE(error.empty()); EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
+        EXPECT_NE(error.find(source.global_id),std::string::npos) << error;
+        EXPECT_NE(error.find(source.table_name),std::string::npos) << error;
+        EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
         EXPECT_EQ(outbox_number(*owned,"SELECT isSynchronized AS n FROM AuditLog WHERE id=?",{source.id}),0);
@@ -4960,4 +4992,143 @@ TEST(ImmutableSync, AuthorizedAckRollsBackWhenOwnerRevokes) {
     EXPECT_EQ(std::get<int64_t>(db.db().query("SELECT isSynchronized FROM AuditLog WHERE globalId=?", {event})[0].at("isSynchronized")), 0);
     lattice::mark_audit_entries_synced_authorized(db, {event}, [] { return true; });
     EXPECT_EQ(std::get<int64_t>(db.db().query("SELECT isSynchronized FROM AuditLog WHERE globalId=?", {event})[0].at("isSynchronized")), 1);
+}
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+// These regressions use the real sender and mock transport; the pre-change
+// sender refuses the first row at its 4 MiB batch bound.
+TEST(Sync, TwoLargeRowsWaitForAckWithinTheEightMiBWindow) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"two-large-rows"};
+        auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+        db->add(TestPerson{std::string(5*1024*1024,'a'),1,std::nullopt});
+        db->add(TestPerson{std::string(5*1024*1024,'b'),2,std::nullopt});
+        const auto pending=lattice::query_audit_log_for_sync(db->db(),"two-large"); ASSERT_EQ(pending.size(),2u);
+        auto cfg=outbox_config("two-large"); cfg.sync_filter=std::nullopt;
+        std::string error;
+        lattice::synchronizer sync(std::move(db),cfg);
+        sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+        auto* transport=factory->last_websocket();
+        auto sent=outbox_sent(*transport); ASSERT_EQ(sent.size(),1u);
+        EXPECT_EQ(sent[0].global_id,pending[0].global_id);
+        sync.sync_now();
+        EXPECT_EQ(outbox_sent(*transport).size(),1u);
+        EXPECT_EQ(sync.get_progress().pending_upload,1);
+        outbox_ack(*transport,{pending[0].global_id});
+        sent=outbox_sent(*transport); ASSERT_EQ(sent.size(),2u);
+        EXPECT_EQ(sent[1].global_id,pending[1].global_id);
+        for(const auto& message:transport->get_sent_messages()) {
+            const auto bytes=message.as_string(); const auto event=lattice::server_sent_event::from_json(bytes);
+            if(!event || event->event_type!=lattice::server_sent_event::type::audit_log) continue;
+            EXPECT_GT(bytes.size(),lattice::sync_max_encoded_message_bytes);
+            EXPECT_LE(bytes.size(),2*lattice::sync_max_encoded_message_bytes);
+            EXPECT_EQ(event->audit_logs.size(),1u);
+        }
+        outbox_ack(*transport,{pending[1].global_id});
+        EXPECT_TRUE(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).empty());
+        EXPECT_EQ(sync.get_progress().pending_upload,0);
+        EXPECT_TRUE(error.empty()) << error;
+    },30);
+}
+
+TEST(Sync, OverEightMiBUploadNamesTheRowWithoutAdvancingItsFloor) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"over-eight-mib"};
+        auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+        db->add(TestPerson{std::string(8*1024*1024,'x'),1,std::nullopt});
+        const auto source=lattice::query_audit_log(db->db()).back();
+        auto cfg=outbox_config("over-eight"); cfg.sync_filter=std::nullopt;
+        std::string error;
+        lattice::synchronizer sync(std::move(db),cfg);
+        sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+        EXPECT_NE(error.find(source.global_id),std::string::npos) << error;
+        EXPECT_NE(error.find(source.table_name),std::string::npos) << error;
+        EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
+        EXPECT_EQ(lattice::read_upload_floor(owned->db(),cfg.sync_id),0);
+        EXPECT_EQ(sync.get_progress().pending_upload,0);
+        EXPECT_EQ(sync.get_progress().total_upload,0);
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+        EXPECT_EQ(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).size(),1u);
+    },30);
+}
+
+TEST(SyncDelivery, LargeFilteredSnapshotReplaysExactBytesUntilAck) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"large-filtered-replay"};
+        auto cfg=outbox_config("large-filtered"); cfg.sync_filter->at(0).where_clause="age=1";
+        std::string exact,wire_id,source_id,error;
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+            db->add(TestPerson{std::string(5*1024*1024,'x'),0,std::nullopt});
+            db->db().execute("UPDATE AuditLog SET isSynchronized=1");
+            db->db().execute("UPDATE TestPerson SET age=1");
+            source_id=lattice::query_audit_log(db->db()).back().global_id;
+            lattice::synchronizer sync(std::move(db),cfg);
+            sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+            const auto sent=outbox_sent(*factory->last_websocket()); ASSERT_EQ(sent.size(),1u);
+            wire_id=sent[0].global_id; EXPECT_NE(wire_id,source_id);
+            EXPECT_EQ(sent[0].operation,"INSERT");
+            const auto retained=lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id);
+            ASSERT_EQ(retained.size(),1u); exact=retained[0].wire_json;
+            EXPECT_GT(retained[0].charge,lattice::sync_max_encoded_message_bytes);
+            EXPECT_LE(retained[0].charge,2*lattice::sync_max_encoded_message_bytes);
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+            EXPECT_EQ(outbox_number(*owned,"SELECT isSynchronized AS n FROM AuditLog WHERE globalId=?",{source_id}),0);
+            sync.disconnect();
+        }
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+            lattice::synchronizer sync(std::move(db),cfg);
+            sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+            auto* transport=factory->last_websocket();
+            const auto sent=outbox_sent(*transport); ASSERT_EQ(sent.size(),1u);
+            EXPECT_EQ(sent[0].global_id,wire_id);
+            const auto retained=lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id);
+            ASSERT_EQ(retained.size(),1u); EXPECT_EQ(retained[0].wire_json,exact);
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+            outbox_ack(*transport,{wire_id});
+            EXPECT_TRUE(lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id).empty());
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),1);
+            EXPECT_EQ(outbox_number(*owned,"SELECT isSynchronized AS n FROM AuditLog WHERE globalId=?",{source_id}),1);
+            EXPECT_TRUE(error.empty()) << error;
+        }
+    },30);
+}
+#endif
+
+TEST(SyncDelivery, AdmissionCountsMetadataAtTheEightMiBBoundary) {
+    TempDB tmp{"admit-retained-boundary"}; lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.add(TestPerson{"",1,std::nullopt});
+    auto delivery=outbox_delivery(lattice::query_audit_log(db.db()).back());
+    delivery.wire.changed_fields["name"]=lattice::any_property(std::string{});
+    const auto empty_wire=delivery.wire.to_json();
+    const auto overhead=lattice::detail::sync_delivery_retained_bytes(delivery,empty_wire);
+    ASSERT_LT(overhead,lattice::detail::sync_outbox_bytes);
+    for(size_t extra:{size_t{1},size_t{0}}) {
+        delivery.wire.changed_fields["name"]=lattice::any_property(
+            std::string(lattice::detail::sync_outbox_bytes-overhead+extra,'x'));
+        ASSERT_EQ(lattice::detail::sync_delivery_retained_bytes(delivery,delivery.wire.to_json()),
+                  lattice::detail::sync_outbox_bytes+extra);
+        if(extra) {
+            try { (void)lattice::detail::admit_sync_delivery(db,"boundary",delivery); FAIL()<<"over-budget receipt admitted"; }
+            catch(const std::length_error& error) {
+                const std::string message=error.what();
+                EXPECT_NE(message.find(delivery.wire.global_id),std::string::npos)<<message;
+                EXPECT_NE(message.find(delivery.wire.table_name),std::string::npos)<<message;
+                EXPECT_NE(message.find("retained"),std::string::npos)<<message;
+            }
+            EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
+        } else {
+            ASSERT_TRUE(lattice::detail::admit_sync_delivery(db,"boundary",delivery));
+            const auto stored=lattice::detail::read_sync_outbox(db.db(),"boundary");
+            ASSERT_EQ(stored.size(),1u);
+            EXPECT_EQ(lattice::detail::sync_delivery_retained_bytes(stored[0],stored[0].wire_json),
+                      lattice::detail::sync_outbox_bytes);
+        }
+        EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+        EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+    }
 }

@@ -3,6 +3,7 @@
 // Internal durable filtered-delivery storage. Not a second transport or sync engine.
 // Included after lattice.hpp by sync.cpp; tests may exercise its exact transactional seam.
 #include "sync.hpp"
+#include "sync_storage.hpp"
 
 namespace lattice::detail {
 inline constexpr size_t sync_outbox_bytes = 2 * sync_max_encoded_message_bytes;
@@ -63,7 +64,9 @@ inline std::vector<sync_delivery> read_sync_outbox(database& db, const std::stri
         "COALESCE(SUM(length(CAST(wire_json AS BLOB))+COALESCE(length(CAST(source_global_id AS BLOB)),0)+"
         "length(CAST(wire_global_id AS BLOB))+length(CAST(table_name AS BLOB))+"
         "length(CAST(global_row_id AS BLOB))+length(CAST(routing_key AS BLOB))+128),0) AS bytes FROM selected) "
-        "SELECT a.receipt_id, typeof(a.source_audit_id) IN ('integer','null') AS source_type_valid, "
+        "SELECT " + sync_outbox_diagnostic_columns("a.wire_global_id", "a.table_name", "a.", "a.receipt_id",
+            "b.n>4096 OR b.bytes>" + cap + " OR a.encoded_charge>" + cap) +
+        ", a.receipt_id, typeof(a.source_audit_id) IN ('integer','null') AS source_type_valid, "
         "CASE WHEN typeof(a.source_audit_id)='integer' THEN a.source_audit_id END AS source_audit_id, "
         "CASE WHEN typeof(a.membership)='integer' THEN a.membership END AS membership, "
         "CASE WHEN typeof(a.encoded_charge)='integer' THEN a.encoded_charge END AS encoded_charge, "
@@ -93,7 +96,7 @@ inline std::vector<sync_delivery> read_sync_outbox(database& db, const std::stri
             return std::get<int64_t>(value);
         };
         if (number("n") > static_cast<int64_t>(sync_outbox_rows) || number("bytes") > static_cast<int64_t>(sync_outbox_bytes))
-            throw db_error("delivery outbox exceeds retained budget");
+            throw db_error("delivery outbox exceeds retained budget" + sync_outbox_error_context(row));
         const auto string = [&](const char* name) -> const std::string& {
             const auto& value = row.at(name);
             if (!std::holds_alternative<std::string>(value)) throw db_error("invalid delivery text");
@@ -127,13 +130,14 @@ inline std::vector<sync_delivery> read_sync_outbox(database& db, const std::stri
         if (membership < -1 || membership > 1) throw db_error("invalid delivery membership");
         delivery.membership = static_cast<int>(membership);
         const auto charge = number("encoded_charge");
+        if (charge > static_cast<int64_t>(sync_outbox_bytes))
+            throw db_error("delivery receipt exceeds encoded limit" + sync_outbox_error_context(row));
         // Released source columns were independently nullable and never gated
         // retry. They remain provenance only, even if a live audit row reuses
         // that number; only modern receipts require current source identity.
         const bool source_valid = delivery.legacy_receipt || number("source_valid") == 1;
         if (!source_valid || (!absent_source && delivery.source_id <= 0) ||
             (!absent_global && delivery.source_global_id.empty()) || charge <= 0 ||
-            charge > static_cast<int64_t>(sync_max_encoded_message_bytes) ||
             delivery.membership < -1 || delivery.membership > 1 ||
             delivery.wire.id != (delivery.legacy_receipt ? 0 : delivery.source_id) || delivery.wire.global_id != string("wire_global_id") ||
             delivery.wire.table_name != string("table_name") ||
@@ -164,7 +168,9 @@ inline bool admit_sync_delivery_in_transaction(lattice_db& lattice, const std::s
         delivery.wire.id != delivery.source_id || delivery.membership < -1 || delivery.membership > 1 || frame.count != 1)
         throw db_error("invalid delivery admission");
     const auto retained = sync_delivery_retained_bytes(delivery, wire_json);
-    if (retained > sync_outbox_bytes) throw std::length_error("delivery exceeds retained byte limit");
+    if (retained > sync_outbox_bytes) throw std::length_error("delivery exceeds retained byte limit (audit " +
+        std::to_string(delivery.source_id) + ", wire " + delivery.wire.global_id +
+        ", table " + delivery.wire.table_name + ")");
     if (!db.is_in_transaction()) throw db_error("delivery admission requires an owned write transaction");
     if(delivery.source_id<=read_sync_reset_cutoff(db,sync_id)) throw db_error("delivery source belongs to a retired snapshot cohort");
     {
@@ -181,7 +187,9 @@ inline bool admit_sync_delivery_in_transaction(lattice_db& lattice, const std::s
         if (budget.size() != 1) throw db_error("cannot read delivery admission budget");
         const auto n = std::get<int64_t>(budget[0].at("n")), bytes = std::get<int64_t>(budget[0].at("bytes"));
         if (n < 0 || bytes < 0 || static_cast<uint64_t>(bytes) > sync_outbox_bytes)
-            throw db_error("invalid delivery admission budget");
+            throw db_error("invalid delivery admission budget (audit " +
+                std::to_string(delivery.source_id) + ", wire " + delivery.wire.global_id +
+                ", table " + delivery.wire.table_name + ")");
         if (!conflict.empty() || n >= static_cast<int64_t>(sync_outbox_rows) ||
             retained > sync_outbox_bytes - static_cast<size_t>(bytes)) return false;
         db.execute("INSERT INTO main._lattice_sync_outbox(sync_id,source_audit_id,source_global_id,"

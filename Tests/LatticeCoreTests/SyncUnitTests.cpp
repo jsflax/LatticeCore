@@ -5059,7 +5059,8 @@ struct recovery_fixture {
     readonly_replay_transport* wire;
     lattice::lattice_db* database;
     std::unique_ptr<lattice::synchronizer> sync;
-    explicit recovery_fixture(size_t count, double delay = 0.05, int maximum = 3, bool websocket = true) {
+    explicit recovery_fixture(size_t count, double delay = 0.05, int maximum = 3,
+                              bool websocket = true, bool observer = false) {
         auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), scheduler));
         database = db.get();
         auto seed = db->add(TestPerson{"seed", 0, std::nullopt});
@@ -5072,6 +5073,7 @@ struct recovery_fixture {
         config.sync_id = "wss:readonly-recovery";
         if (websocket) config.websocket_url = "wss://readonly.invalid/room";
         config.uploads_enabled = false;
+        config.is_observer = observer;
         config.base_delay_seconds = delay;
         config.max_delay_seconds = delay * 4;
         config.max_reconnect_attempts = maximum;
@@ -5378,4 +5380,48 @@ TEST(SyncRecovery, RejectedFramesRequireAStringAndASingleMatchingPayload) {
         EXPECT_FALSE(lattice::server_sent_event::from_json(wire, &diagnostic));
         EXPECT_FALSE(diagnostic.empty());
     }
+}
+
+
+TEST(SyncRecovery, ObserverDisconnectRetainsANullCursorUntilTheGapIsRepaired) {
+    // Delay the automatic retry so the explicit disconnect/connect path owns
+    // this attempt; disconnect cancels that delay without waiting for it.
+    recovery_fixture fixture(4, 60.0, 1, true, true);
+    fixture.database->db().execute("CREATE TRIGGER reject_first BEFORE INSERT ON TestPerson "
+        "WHEN NEW.age=0 BEGIN SELECT RAISE(ABORT,'injected first-row failure'); END");
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    ASSERT_TRUE(fixture.wait([&] { return fixture.errors >= 1; }));
+    const auto count = [&] {
+        return std::get<int64_t>(fixture.database->db().query("SELECT COUNT(*) AS n FROM TestPerson")[0].at("n"));
+    };
+    const auto slots = [&] {
+        return fixture.database->db().query("SELECT last_received_event_id AS cursor,is_observer "
+            "FROM _lattice_replication_slots WHERE sync_id='wss:readonly-recovery'");
+    };
+    ASSERT_EQ(count(),3);
+    const auto before = slots();
+    ASSERT_EQ(before.size(),1u);
+    EXPECT_EQ(std::get<int64_t>(before[0].at("is_observer")),1);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(before[0].at("cursor")));
+
+    fixture.sync->disconnect();
+    const auto held = slots();
+    ASSERT_EQ(held.size(),1u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(held[0].at("cursor")));
+    fixture.database->db().execute("DROP TRIGGER reject_first");
+    fixture.sync->connect();
+    const auto urls = fixture.wire->urls();
+    ASSERT_EQ(urls.size(),2u);
+    EXPECT_EQ(urls[1].find("last-event-id="),std::string::npos);
+    ASSERT_TRUE(fixture.wait([&] {
+        const auto acks = fixture.wire->acks();
+        return std::count_if(acks.begin(),acks.end(),[](const auto& ack) { return ack.first == 2; }) == 4;
+    }));
+    EXPECT_EQ(count(),4);
+    const auto repaired = slots();
+    ASSERT_EQ(repaired.size(),1u);
+    EXPECT_EQ(std::get<std::string>(repaired[0].at("cursor")),"recover-audit-3");
+    fixture.sync->disconnect();
+    EXPECT_TRUE(slots().empty());
 }

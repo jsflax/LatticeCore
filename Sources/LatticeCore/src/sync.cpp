@@ -1469,9 +1469,10 @@ void synchronizer_base::disconnect() {
             fire_state_change(false);
     });
 
-    // An observer's slot carries no upload state — evict it on a clean
-    // disconnect so it never lingers as a participant in anyone's floor.
-    if (config_.is_observer && !is_destroyed_) {
+    // A failed download must keep even a NULL cursor: deleting the slot would
+    // let the legacy fallback resume after later rows of the incomplete frame.
+    // A complete apply restores ordinary observer eviction on clean disconnect.
+    if (config_.is_observer && !is_destroyed_ && !download_failure_outstanding_) {
         try {
             remove_replication_slot(db().db(), config_.sync_id);
         } catch (const std::exception& e) {
@@ -1842,6 +1843,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 void synchronizer_base::download_failed(uint64_t generation, finite_cycle_failure failure,
                                         const std::string& error) {
     if (is_destroyed_ || connection_generation_ != generation) return;
+    download_failure_outstanding_ = true;
     fail_finite_cycle(failure, generation);
     auto diagnostic = error;
     if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
@@ -3213,7 +3215,11 @@ void synchronizer_base::upload_pending_changes_impl() {
 }
 
 std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
+    // Store/progress/ACK callbacks may disconnect before the caller reports a
+    // partial result. Retain the cursor while that outcome is still unknown.
+    if (!entries.empty()) download_failure_outstanding_ = true;
     auto applied = lattice::apply_remote_changes_for(db(), entries, config_.sync_id);
+    if (!entries.empty() && applied.size() == entries.size()) download_failure_outstanding_ = false;
     progress_received_.fetch_add(static_cast<int64_t>(applied.size()), std::memory_order_relaxed);
     fire_progress();
     return applied;

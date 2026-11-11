@@ -281,6 +281,13 @@ target_link_libraries(LatticePendingImportTests PRIVATE LatticeCore LatticeSwift
 add_executable(LatticeTransportAuthenticationTests Tests/LatticeCoreTests/TransportAuthenticationTests.cpp)
 target_link_libraries(LatticeTransportAuthenticationTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 
+# This exit-order oracle must run as its own process, outside the test runner.
+if(UNIX)
+    add_executable(LatticeCacheExitProbe Tests/Regression/LatticeCacheExitProbe.cpp)
+    target_compile_definitions(LatticeCacheExitProbe PRIVATE SQLITE_CORE)
+    target_link_libraries(LatticeCacheExitProbe PRIVATE LatticeSwiftCppBridge)
+endif()
+
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp)

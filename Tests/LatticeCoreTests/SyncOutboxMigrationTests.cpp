@@ -199,7 +199,8 @@ TEST(SyncOutboxMigration, NullMetadataAndOversizeAreRefusedBeforePayloadHydratio
         const auto schema = fixture.raw->query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name");
         try { auto unexpected = fixture.open(); FAIL() << "invalid predecessor was accepted"; }
         catch (const lattice::db_error& error) {
-            EXPECT_STREQ(error.what(),"Sync outbox predecessor has an invalid or oversized receipt");
+            EXPECT_NE(std::string(error.what()).find("Sync outbox predecessor has an invalid or oversized receipt"), std::string::npos);
+            EXPECT_NE(std::string(error.what()).find(fixture.source.global_id), std::string::npos);
         }
         EXPECT_EQ(fixture.raw->query("SELECT * FROM _lattice_sync_outbox"), before);
         EXPECT_EQ(fixture.raw->query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name"), schema);
@@ -265,4 +266,124 @@ TEST(SyncOutboxMigration, FiniteCancellationKeepsMigratedObligationForNextOwner)
     ASSERT_EQ(next.uploaded_ids(), std::vector<std::string>{delivery.global_id});
     next.ack(delivery.global_id);
     EXPECT_TRUE(next.db->db().query("SELECT 1 FROM _lattice_sync_outbox").empty());
+}
+
+
+// A receipt above the normal message target keeps its exact durable bytes;
+// the hard retained limit still includes provenance and routing metadata.
+TEST(SyncOutboxMigration, OversizedPredecessorReceiptMigratesAndReopensWithExactBytes) {
+    for (bool legacy : {false, true}) {
+        predecessor_store fixture(legacy);
+        auto delivery = legacy ? fixture.wire("Oversized-Legacy-Receipt") : fixture.source;
+        delivery.changed_fields["name"] = lattice::any_property(std::string(5 * 1024 * 1024, 'x'));
+        const std::string bytes = " \n" + delivery.to_json() + " ";
+        const auto charge = bytes.size() + lattice::detail::sync_storage_envelope;
+        ASSERT_GT(charge, lattice::sync_max_encoded_message_bytes);
+        ASSERT_LT(charge, lattice::detail::sync_storage_retained_bytes);
+        if (legacy) {
+            fixture.legacy(17, delivery);
+        } else {
+            fixture.raw->execute("INSERT INTO _lattice_sync_outbox VALUES(?,?,?,?,?,?,?,?,?,?)",
+                {std::string("migration"), delivery.id, delivery.global_id, delivery.global_id,
+                 delivery.table_name, delivery.global_row_id, int64_t{1}, bytes,
+                 std::string("null"), static_cast<int64_t>(charge)});
+        }
+        for (int pass = 0; pass != 2; ++pass) {
+            auto reopened = fixture.open();
+            const auto receipts = lattice::detail::read_sync_outbox(reopened->db(), "migration");
+            ASSERT_EQ(receipts.size(), 1u);
+            EXPECT_EQ(receipts[0].wire_json, bytes);
+            EXPECT_EQ(receipts[0].charge, charge);
+            EXPECT_EQ(receipts[0].wire.global_id, delivery.global_id);
+            EXPECT_EQ(receipts[0].legacy_receipt, legacy);
+        }
+    }
+}
+
+TEST(SyncOutboxMigration, OverEightMiBPredecessorNamesAuditAndTableWithoutChangingStorage) {
+    for (bool legacy : {false, true}) {
+        predecessor_store fixture(legacy);
+        auto delivery = legacy ? fixture.wire("Too-Large-Legacy-Receipt") : fixture.source;
+        delivery.changed_fields["name"] = lattice::any_property(
+            std::string(lattice::detail::sync_storage_retained_bytes, 'x'));
+        const auto bytes = delivery.to_json();
+        ASSERT_GT(bytes.size() + lattice::detail::sync_storage_envelope,
+                  lattice::detail::sync_storage_retained_bytes);
+        if (legacy) {
+            fixture.legacy(17, delivery, fixture.source.id, fixture.source.global_id);
+        } else {
+            fixture.raw->execute("INSERT INTO _lattice_sync_outbox VALUES(?,?,?,?,?,?,?,?,?,?)",
+                {std::string("migration"), delivery.id, delivery.global_id, delivery.global_id,
+                 delivery.table_name, delivery.global_row_id, int64_t{1}, bytes, std::string("null"),
+                 static_cast<int64_t>(bytes.size() + lattice::detail::sync_storage_envelope)});
+        }
+        const auto columns = lattice::detail::sync_outbox_columns(*fixture.raw);
+        const auto before = fixture.raw->query("SELECT * FROM _lattice_sync_outbox");
+        try { auto unexpected = fixture.open(); FAIL() << "oversized receipt was accepted"; }
+        catch (const lattice::db_error& error) {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("audit " + std::to_string(fixture.source.id)), std::string::npos);
+            EXPECT_NE(message.find(delivery.global_id), std::string::npos);
+            EXPECT_NE(message.find(delivery.table_name), std::string::npos);
+        }
+        EXPECT_EQ(lattice::detail::sync_outbox_columns(*fixture.raw), columns);
+        EXPECT_EQ(fixture.raw->query("SELECT * FROM _lattice_sync_outbox"), before);
+    }
+}
+
+TEST(SyncOutboxMigration, AggregatePredecessorBudgetStillRefusesTwoOversizedReceipts) {
+    predecessor_store fixture;
+    for (int index = 1; index <= 2; ++index) {
+        auto delivery = fixture.wire("Large-Receipt-" + std::to_string(index));
+        delivery.changed_fields["name"] = lattice::any_property(std::string(5 * 1024 * 1024, 'x'));
+        fixture.legacy(index, delivery, fixture.source.id, fixture.source.global_id);
+    }
+    const auto before = fixture.raw->query("SELECT * FROM _lattice_sync_outbox ORDER BY id");
+    try { auto unexpected = fixture.open(); FAIL() << "aggregate retained budget was ignored"; }
+    catch (const lattice::db_error& error) {
+        const std::string message = error.what();
+        EXPECT_NE(message.find("retained channel budget"), std::string::npos);
+        EXPECT_NE(message.find("audit " + std::to_string(fixture.source.id)), std::string::npos);
+        EXPECT_NE(message.find("Large-Receipt-2"), std::string::npos);
+        EXPECT_NE(message.find(fixture.source.table_name), std::string::npos);
+    }
+    EXPECT_EQ(fixture.raw->query("SELECT * FROM _lattice_sync_outbox ORDER BY id"), before);
+}
+
+TEST(SyncOutboxMigration, CanonicalReadAccountsForMetadataAtTheEightMiBBoundary) {
+    predecessor_store fixture;
+    auto delivery = fixture.wire("Retained-Boundary");
+    fixture.legacy(1, delivery);
+    auto current = fixture.open();
+    auto receipts = lattice::detail::read_sync_outbox(current->db(), "migration");
+    ASSERT_EQ(receipts.size(), 1u);
+    const auto metadata = lattice::detail::sync_delivery_retained_bytes(receipts[0], "");
+    delivery.changed_fields["name"] = lattice::any_property(std::string{});
+    const auto fixed_json = delivery.to_json().size();
+    ASSERT_GT(lattice::detail::sync_outbox_bytes, metadata + fixed_json);
+    const auto name_size = lattice::detail::sync_outbox_bytes - metadata - fixed_json;
+    for (size_t extra : {size_t{0}, size_t{1}}) {
+        delivery.changed_fields["name"] = lattice::any_property(std::string(name_size + extra, 'x'));
+        const auto bytes = delivery.to_json();
+        const auto charge = bytes.size() + lattice::detail::sync_storage_envelope;
+        ASSERT_EQ(bytes.size() + metadata, lattice::detail::sync_outbox_bytes + extra);
+        current->db().execute("UPDATE _lattice_sync_outbox SET wire_json=?,encoded_charge=? WHERE receipt_id=1",
+            {bytes, static_cast<int64_t>(charge)});
+        if (extra == 0) {
+            receipts = lattice::detail::read_sync_outbox(current->db(), "migration");
+            ASSERT_EQ(receipts.size(), 1u);
+            EXPECT_EQ(receipts[0].wire_json, bytes);
+            EXPECT_EQ(receipts[0].charge, charge);
+        } else {
+            try {
+                (void)lattice::detail::read_sync_outbox(current->db(), "migration");
+                FAIL() << "metadata was excluded from the retained bound";
+            } catch (const lattice::db_error& error) {
+                const std::string message = error.what();
+                EXPECT_NE(message.find("retained budget"), std::string::npos);
+                EXPECT_NE(message.find(delivery.global_id), std::string::npos);
+                EXPECT_NE(message.find(delivery.table_name), std::string::npos);
+            }
+        }
+    }
 }

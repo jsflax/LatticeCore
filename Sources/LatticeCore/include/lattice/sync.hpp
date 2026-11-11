@@ -225,8 +225,8 @@ struct sync_filter_entry {
     std::optional<std::string> where_clause;  // nullopt = all rows
 };
 
-// Audit JSON keeps the existing wire protocol. This bounds an encoded message,
-// independently of event count; the byte-accounted upload window is twice this.
+// Audit JSON keeps the existing wire protocol. Ordinary batches use this bound.
+// One larger row may be sent alone, up to the byte-accounted 8 MiB upload window.
 inline constexpr size_t sync_max_encoded_message_bytes = 4 * 1024 * 1024;
 
 struct encoded_audit_log_prefix {
@@ -237,9 +237,10 @@ struct encoded_audit_log_prefix {
     std::vector<size_t> entry_charges;
 };
 
-/// Encode only a contiguous prefix. A first row that cannot fit a whole message
-/// throws length_error; it is never silently skipped. A temporarily full byte
-/// window returns count 0. No audit/floor/in-flight state is changed here.
+/// Encode only a contiguous prefix. A row larger than max_bytes is sent alone,
+/// up to 8 MiB including its envelope; a larger first row throws length_error.
+/// Rows are never silently skipped. A temporarily full byte window returns
+/// count 0. No audit/floor/in-flight state is changed here.
 encoded_audit_log_prefix encode_audit_log_prefix(
     const std::vector<audit_log_entry>& entries, size_t start, size_t max_count,
     size_t max_bytes = sync_max_encoded_message_bytes,
@@ -777,7 +778,9 @@ protected:
     std::optional<std::optional<std::string>> get_filter_for_table(const std::string& table_name) const;
     bool is_table_in_filter(const std::string& table_name) const;
     bool row_matches_filter(const std::string& table_name, const std::string& global_row_id);
-    std::optional<audit_log_entry> build_insert_entry_from_current_row(const std::string& table_name, const std::string& global_row_id);
+    std::optional<audit_log_entry> build_insert_entry_from_current_row(
+        const std::string& table_name, const std::string& global_row_id,
+        const std::string& source_audit_id = {});
 
     // Sync set management
     void sync_set_add(const std::string& table_name, const std::string& global_row_id);

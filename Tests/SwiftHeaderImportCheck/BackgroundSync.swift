@@ -27,3 +27,10 @@ func checkBackgroundSyncImport(_ ref: lattice.swift_lattice_ref) {
     _ = ref.current_background_sync_generation()
     _ = ref.is_background_sync_managed()
 }
+
+
+// The relay must be able to distinguish its ordinary batch target from the
+// larger single-row limit through the same public module it consumes.
+func checkSyncFrameLimitsImport() -> (batchBytes: Int64, rowBytes: Int64) {
+    (lattice.sync_max_encoded_message_bytes_value(), lattice.sync_max_encoded_row_bytes_value())
+}

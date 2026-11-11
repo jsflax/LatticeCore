@@ -8,9 +8,36 @@ namespace lattice::detail {
 // Epoch 9 joins the released six-column outbox and the asset-reader ten-column
 // outbox. Receipt identity and legacy disposition never alter the wire payload.
 inline constexpr int sync_storage_writer_epoch = 9;
-inline constexpr size_t sync_storage_retained_bytes = 2 * sync_max_encoded_message_bytes;
+inline constexpr size_t sync_storage_retained_bytes = sync_max_encoded_row_bytes;
 inline constexpr size_t sync_storage_retained_rows = 4096;
 inline constexpr size_t sync_storage_envelope = sizeof("{\"kind\":\"auditLog\",\"auditLog\":[") - 1 + 2;
+
+// Error metadata remains readable when a payload or channel is too large to hydrate.
+// Keep every diagnostic string bounded independently of the retained-byte check.
+inline std::string sync_outbox_diagnostic_columns(const std::string& wire_id,
+        const std::string& table, const std::string& prefix = "", const std::string& receipt = "rowid",
+        const std::string& refusal = "") {
+    const auto admitted = [&](const std::string& value, const char* alias) {
+        return (refusal.empty() ? value : "CASE WHEN " + refusal + " THEN " + value + " END") +
+            " AS " + alias;
+    };
+    return admitted(receipt, "diagnostic_receipt") + ", " +
+        admitted("CASE WHEN typeof(" + prefix + "source_audit_id)='integer' THEN " + prefix +
+                 "source_audit_id END", "diagnostic_audit") + ", " +
+        admitted("substr(CAST(" + wire_id + " AS TEXT),1,1024)", "diagnostic_wire") + ", " +
+        admitted("substr(CAST((" + table + ") AS TEXT),1,1024)", "diagnostic_table");
+}
+
+inline std::string sync_outbox_error_context(const database::row_t& row) {
+    const auto value = [&](const char* key) {
+        const auto& field = row.at(key);
+        if (const auto* number = std::get_if<int64_t>(&field)) return std::to_string(*number);
+        if (const auto* text = std::get_if<std::string>(&field)) return *text;
+        return std::string("unknown");
+    };
+    return " (audit " + value("diagnostic_audit") + ", wire " + value("diagnostic_wire") +
+        ", table " + value("diagnostic_table") + ", receipt " + value("diagnostic_receipt") + ")";
+}
 
 inline std::string sync_storage_quote(const std::string& value) {
     std::string result = "\"";
@@ -144,16 +171,24 @@ inline void ensure_sync_outbox_schema(database& db) {
           "typeof(routing_key)!='text' OR length(CAST(routing_key AS BLOB)) NOT BETWEEN 1 AND 65536 OR "
           "typeof(membership)!='integer' OR membership NOT IN(-1,0,1) OR "
           "typeof(encoded_charge)!='integer' OR encoded_charge NOT BETWEEN 1 AND " +
-          std::to_string(sync_max_encoded_message_bytes) + " OR ";
-    const auto invalid = db.query("SELECT 1 FROM main._lattice_sync_outbox WHERE " + invalid_provenance +
+          std::to_string(sync_storage_retained_bytes) + " OR ";
+    const auto diagnostic_table = legacy
+        ? "CASE WHEN json_valid(payload) THEN json_extract(payload,'$.tableName') END"
+        : "table_name";
+    const auto diagnostics = sync_outbox_diagnostic_columns(wire_id, diagnostic_table);
+    const auto invalid = db.query("SELECT " + diagnostics + " FROM main._lattice_sync_outbox WHERE " + invalid_provenance +
         "typeof(sync_id)!='text' OR length(CAST(sync_id AS BLOB)) NOT BETWEEN 1 AND 4096 OR "
         "typeof(" + wire_id + ")!='text' OR length(CAST(" + wire_id + " AS BLOB)) NOT BETWEEN 1 AND 65536 OR "
         "typeof(" + payload + ")!='text' OR length(CAST(" + payload + " AS BLOB))>" +
-        std::to_string(sync_max_encoded_message_bytes - sync_storage_envelope) + " LIMIT 1");
-    if (!invalid.empty()) throw db_error("Sync outbox predecessor has an invalid or oversized receipt");
-    const auto over_budget = db.query("SELECT 1 FROM main._lattice_sync_outbox GROUP BY sync_id HAVING COUNT(*)>4096 "
-        "OR SUM(length(CAST(" + payload + " AS BLOB))+" + metadata + ")>" + std::to_string(sync_storage_retained_bytes) + " LIMIT 1");
-    if (!over_budget.empty()) throw db_error("Sync outbox predecessor exceeds retained channel budget");
+        std::to_string(sync_storage_retained_bytes - sync_storage_envelope) + " LIMIT 1");
+    if (!invalid.empty()) throw db_error("Sync outbox predecessor has an invalid or oversized receipt" +
+        sync_outbox_error_context(invalid.front()));
+    const auto over_budget = db.query("SELECT " + diagnostics + " FROM main._lattice_sync_outbox WHERE sync_id IN ("
+        "SELECT sync_id FROM main._lattice_sync_outbox GROUP BY sync_id HAVING COUNT(*)>4096 "
+        "OR SUM(length(CAST(" + payload + " AS BLOB))+" + metadata + ")>" + std::to_string(sync_storage_retained_bytes) +
+        ") ORDER BY rowid DESC LIMIT 1");
+    if (!over_budget.empty()) throw db_error("Sync outbox predecessor exceeds retained channel budget" +
+        sync_outbox_error_context(over_budget.front()));
 
     create_sync_outbox_v9(db, "_lattice_sync_outbox_v9_migration");
     std::optional<int64_t> last_rowid;
@@ -175,8 +210,9 @@ inline void ensure_sync_outbox_schema(database& db) {
             throw db_error("Sync outbox predecessor wire identity mismatch");
         constexpr size_t envelope = sizeof("{\"kind\":\"auditLog\",\"auditLog\":[") - 1 + 2;
         const int64_t charge = static_cast<int64_t>(bytes.size() + envelope);
-        if (charge > static_cast<int64_t>(sync_max_encoded_message_bytes))
-            throw db_error("Sync outbox predecessor frame exceeds encoded limit");
+        if (charge > static_cast<int64_t>(sync_storage_retained_bytes))
+            throw db_error("Sync outbox predecessor frame exceeds encoded limit (audit " +
+                std::to_string(wire->id) + ", wire " + wire->global_id + ", table " + wire->table_name + ")");
         int64_t membership = 0; // Released six-column code committed membership at staging.
         std::string routing = "legacy-v7"; // Must pass current policy before replay/rebinding.
         if (!legacy) {
@@ -192,12 +228,15 @@ inline void ensure_sync_outbox_schema(database& db) {
             legacy ? column_value_t(*last_rowid) : column_value_t(nullptr), row.at("sync_id"), row.at("source_audit_id"), row.at("source_global_id"), wire->global_id, wire->table_name,
             wire->global_row_id, membership, bytes, routing, charge, int64_t{legacy ? 1 : 0}});
     }
-    const auto actual_budget = db.query("SELECT 1 FROM main._lattice_sync_outbox_v9_migration GROUP BY sync_id "
+    const auto actual_budget = db.query("SELECT " + sync_outbox_diagnostic_columns("wire_global_id", "table_name") +
+        " FROM main._lattice_sync_outbox_v9_migration WHERE sync_id IN ("
+        "SELECT sync_id FROM main._lattice_sync_outbox_v9_migration GROUP BY sync_id "
         "HAVING SUM(length(CAST(wire_json AS BLOB))+COALESCE(length(CAST(source_global_id AS BLOB)),0)+"
         "length(CAST(wire_global_id AS BLOB))+length(CAST(table_name AS BLOB))+"
         "length(CAST(global_row_id AS BLOB))+length(CAST(routing_key AS BLOB))+128)>" +
-        std::to_string(sync_storage_retained_bytes) + " LIMIT 1");
-    if (!actual_budget.empty()) throw db_error("Migrated outbox metadata exceeds retained channel budget");
+        std::to_string(sync_storage_retained_bytes) + ") ORDER BY rowid DESC LIMIT 1");
+    if (!actual_budget.empty()) throw db_error("Migrated outbox metadata exceeds retained channel budget" +
+        sync_outbox_error_context(actual_budget.front()));
     // DROP/RENAME and writer guards commit with the unchanged bytes, IDs and
     // pre-existing source disposition/membership/floors. No transport is run.
     db.execute("DROP TABLE main._lattice_sync_outbox");

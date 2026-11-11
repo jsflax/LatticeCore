@@ -698,10 +698,6 @@ TEST(Sync, SynchronizerNackReportsReasonWithoutAcknowledgingOrImmediateResend) {
         EXPECT_EQ(errors.back(), "Sync upload rejected: no reason supplied");
         EXPECT_EQ(transport->get_sent_messages().size(), sent);
         transport->simulate_message(lattice::transport_message::from_string(
-            R"({"kind":"nack","nack":["SECRET",42]})"));
-        EXPECT_EQ(errors.back(), "Failed to parse server message: invalid nack entry");
-        EXPECT_EQ(sync.get_progress().pending_upload, before.pending_upload);
-        transport->simulate_message(lattice::transport_message::from_string(
             lattice::server_sent_event::make_ack(ids).to_json()));
         EXPECT_TRUE(lattice::query_audit_log(reader.db(), true).empty());
         EXPECT_EQ(sync.get_progress().pending_upload, 0);
@@ -2824,7 +2820,9 @@ TEST(Sync, EncodedByteBoundaryIncludesEnvelopeAndBinaryExpansion) {
     auto exact = lattice::encode_audit_log_prefix(rows, 0, 1, full.json.size());
     EXPECT_EQ(exact.count, 1u);
     EXPECT_EQ(exact.json.size(), full.json.size());
-    EXPECT_THROW(lattice::encode_audit_log_prefix(rows, 0, 1, full.json.size() - 1), std::length_error);
+    const auto oversized = lattice::encode_audit_log_prefix(rows, 0, 1, full.json.size() - 1);
+    EXPECT_EQ(oversized.count, 1u);
+    EXPECT_EQ(oversized.json, full.json);
     auto decoded = lattice::server_sent_event::from_json(exact.json);
     ASSERT_TRUE(decoded);
     ASSERT_EQ(decoded->audit_logs.size(), 1u);
@@ -2875,8 +2873,14 @@ TEST(Sync, OversizedRowNeverHidesBehindOrSkipsPastAPartialPrefix) {
         byte_budget_entry(0, 16), byte_budget_entry(1, 2048), byte_budget_entry(2, 16)};
     auto prefix = lattice::encode_audit_log_prefix(rows, 0, rows.size(), 1024);
     ASSERT_EQ(prefix.count, 1u);
-    EXPECT_THROW(lattice::encode_audit_log_prefix(rows, prefix.count, rows.size(), 1024), std::length_error);
-    EXPECT_EQ(rows[1].global_id, "byte-audit-1");
+    const auto oversized = lattice::encode_audit_log_prefix(rows, prefix.count, rows.size(), 1024);
+    ASSERT_EQ(oversized.count, 1u);
+    const auto decoded = lattice::server_sent_event::from_json(oversized.json);
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->audit_logs.size(), 1u);
+    EXPECT_EQ(decoded->audit_logs.front().global_id, "byte-audit-1");
+    const auto suffix = lattice::encode_audit_log_prefix(rows, 2, rows.size(), 1024);
+    EXPECT_EQ(suffix.count, 1u);
 }
 
 TEST(Sync, ExhaustedByteCreditDoesNotBecomeAnOversizedRowFailure) {
@@ -2971,34 +2975,56 @@ TEST(Sync, StalledTransportPlateausAtEncodedByteWindowThenDrains) {
     });
 }
 
-TEST(Sync, OversizedSingleUploadReportsErrorWithoutAdvancingFloorOrSyncState) {
+TEST(Sync, OversizedSingleUploadIsSentAloneAndAckReleasesFollowingRows) {
     bounded_mock_case([] {
         auto factory = std::make_shared<lattice::mock_network_factory>();
         lattice::set_network_factory(factory);
         TempDB tmp{"byteoversize"};
         auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+        db->add(TestPerson{"before", 0, std::nullopt});
         db->add(TestPerson{std::string(lattice::sync_max_encoded_message_bytes, 'x'), 1, std::nullopt});
+        db->add(TestPerson{"after", 2, std::nullopt});
         auto* owned = db.get();
+        const auto pending = lattice::query_audit_log_for_sync(owned->db(), "byte-oversize");
+        ASSERT_EQ(pending.size(), 3u);
         lattice::sync_config cfg;
         cfg.websocket_url = "ws://localhost/sync"; cfg.sync_id = "byte-oversize";
         cfg.all_active_sync_ids = {cfg.sync_id};
+        std::string failure;
         lattice::synchronizer sync(std::move(db), cfg);
         auto* transport = factory->last_websocket();
         ASSERT_NE(transport, nullptr);
-        std::string failure;
         sync.set_on_error([&](const std::string& error) { failure = error; });
         sync.connect();
-        EXPECT_NE(failure.find("byte limit"), std::string::npos);
-        for (const auto& message : transport->get_sent_messages()) {
-            auto event = lattice::server_sent_event::from_json(message.as_string());
-            EXPECT_FALSE(event && event->event_type == lattice::server_sent_event::type::audit_log);
+        std::set<std::string> acknowledged;
+        bool saw_oversized = false;
+        for (int pass = 0; pass < 4 && acknowledged.size() < pending.size(); ++pass) {
+            std::vector<std::string> ids;
+            for (const auto& message : transport->get_sent_messages()) {
+                const auto bytes = message.as_string();
+                const auto event = lattice::server_sent_event::from_json(bytes);
+                if (!event || event->event_type != lattice::server_sent_event::type::audit_log) continue;
+                if (bytes.size() > lattice::sync_max_encoded_message_bytes) {
+                    saw_oversized = true;
+                    ASSERT_EQ(event->audit_logs.size(), 1u);
+                    EXPECT_EQ(event->audit_logs.front().global_id, pending[1].global_id);
+                    EXPECT_EQ(event->audit_logs.front().changed_fields.at("name").to_column_value(),
+                              pending[1].changed_fields.at("name").to_column_value());
+                }
+                for (const auto& row : event->audit_logs)
+                    if (acknowledged.insert(row.global_id).second) ids.push_back(row.global_id);
+            }
+            if (ids.empty()) break;
+            transport->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_ack(ids).to_json()));
         }
+        EXPECT_TRUE(saw_oversized);
+        EXPECT_TRUE(failure.empty()) << failure;
+        EXPECT_EQ(acknowledged.size(), pending.size());
+        for (const auto& row : pending) EXPECT_EQ(acknowledged.count(row.global_id), 1u);
+        EXPECT_TRUE(lattice::query_audit_log_for_sync(owned->db(), cfg.sync_id).empty());
         EXPECT_EQ(sync.get_progress().pending_upload, 0);
-        EXPECT_EQ(sync.get_progress().total_upload, 0);
-        EXPECT_EQ(lattice::read_upload_floor(owned->db(), cfg.sync_id), 0);
-        auto pending = lattice::query_audit_log_for_sync(owned->db(), cfg.sync_id);
-        EXPECT_EQ(pending.size(), 1u);
-    });
+    },30);
 }
 #endif
 
@@ -3046,7 +3072,7 @@ TEST(SyncDelivery, RefusalLeavesOriginalAndMembershipUntouched) {
     db.add(TestPerson{"receipt",1,std::nullopt});
     const auto source=lattice::query_audit_log(db.db()).back();
     auto delivery=outbox_delivery(source);
-    delivery.wire.changed_fields["name"]=lattice::any_property(std::string(lattice::sync_max_encoded_message_bytes,'x'));
+    delivery.wire.changed_fields["name"]=lattice::any_property(std::string(2*lattice::sync_max_encoded_message_bytes,'x'));
     EXPECT_THROW(lattice::detail::admit_sync_delivery(db,"outbox",delivery),std::length_error);
     EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
     EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
@@ -3157,14 +3183,16 @@ TEST(SyncDelivery, FilteredSyntheticOversizeDoesNotResolveItsOriginalUpdate) {
         auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
         TempDB tmp{"outboxsyntheticlarge"};
         auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
-        db->add(TestPerson{std::string(lattice::sync_max_encoded_message_bytes,'x'),0,std::nullopt});
+        db->add(TestPerson{std::string(2*lattice::sync_max_encoded_message_bytes,'x'),0,std::nullopt});
         db->db().execute("UPDATE AuditLog SET isSynchronized=1");
         db->db().execute("UPDATE TestPerson SET age=1");
         const auto source=lattice::query_audit_log(db->db()).back();
         auto cfg=outbox_config("synthetic-large"); cfg.sync_filter->at(0).where_clause="age=1";
-        lattice::synchronizer sync(std::move(db),cfg); std::string error;
+        std::string error; lattice::synchronizer sync(std::move(db),cfg);
         sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
-        EXPECT_FALSE(error.empty()); EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
+        EXPECT_NE(error.find(source.global_id),std::string::npos) << error;
+        EXPECT_NE(error.find(source.table_name),std::string::npos) << error;
+        EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
         EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
         EXPECT_EQ(outbox_number(*owned,"SELECT isSynchronized AS n FROM AuditLog WHERE id=?",{source.id}),0);
@@ -4297,13 +4325,15 @@ TEST(SyncPublication, ErrorHandlerReplacementAndCallbackOwnerReleaseKeepAdmitted
         sync->set_on_error([&](const auto&) {
             ++old_calls;sync->set_on_error({});entered.set();if(!release.wait()) timed_out=true;old_finished.set();
         });
-        sync->connect();raw->simulate_message(lattice::transport_message::from_string("{"));
+        // A valid rejection reports an error without retiring the transport.
+        const auto rejection = lattice::server_sent_event::make_nack({"probe"}, "probe failure").to_json();
+        sync->connect();raw->simulate_message(lattice::transport_message::from_string(rejection));
         const bool reached=entered.wait();
         sync->set_on_error([&](const auto&) {
             ++new_calls;sync->disconnect();sync.reset();retained=!weak.expired();new_called.set();
         });
         release.set();EXPECT_TRUE(old_finished.wait());
-        raw->simulate_message(lattice::transport_message::from_string("{"));
+        raw->simulate_message(lattice::transport_message::from_string(rejection));
         EXPECT_TRUE(new_called.wait());EXPECT_TRUE(reached);EXPECT_FALSE(timed_out);EXPECT_TRUE(retained);
         EXPECT_EQ(old_calls,1);EXPECT_EQ(new_calls,1);
         ASSERT_TRUE(outbox_wait_quiescent(observer,cfg.sync_id));EXPECT_TRUE(weak.expired());
@@ -4960,4 +4990,609 @@ TEST(ImmutableSync, AuthorizedAckRollsBackWhenOwnerRevokes) {
     EXPECT_EQ(std::get<int64_t>(db.db().query("SELECT isSynchronized FROM AuditLog WHERE globalId=?", {event})[0].at("isSynchronized")), 0);
     lattice::mark_audit_entries_synced_authorized(db, {event}, [] { return true; });
     EXPECT_EQ(std::get<int64_t>(db.db().query("SELECT isSynchronized FROM AuditLog WHERE globalId=?", {event})[0].at("isSynchronized")), 1);
+}
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+// These regressions use the real sender and mock transport; the pre-change
+// sender refuses the first row at its 4 MiB batch bound.
+TEST(Sync, TwoLargeRowsWaitForAckWithinTheEightMiBWindow) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"two-large-rows"};
+        auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+        db->add(TestPerson{std::string(5*1024*1024,'a'),1,std::nullopt});
+        db->add(TestPerson{std::string(5*1024*1024,'b'),2,std::nullopt});
+        const auto pending=lattice::query_audit_log_for_sync(db->db(),"two-large"); ASSERT_EQ(pending.size(),2u);
+        auto cfg=outbox_config("two-large"); cfg.sync_filter=std::nullopt;
+        std::string error;
+        lattice::synchronizer sync(std::move(db),cfg);
+        sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+        auto* transport=factory->last_websocket();
+        auto sent=outbox_sent(*transport); ASSERT_EQ(sent.size(),1u);
+        EXPECT_EQ(sent[0].global_id,pending[0].global_id);
+        sync.sync_now();
+        EXPECT_EQ(outbox_sent(*transport).size(),1u);
+        EXPECT_EQ(sync.get_progress().pending_upload,1);
+        outbox_ack(*transport,{pending[0].global_id});
+        sent=outbox_sent(*transport); ASSERT_EQ(sent.size(),2u);
+        EXPECT_EQ(sent[1].global_id,pending[1].global_id);
+        for(const auto& message:transport->get_sent_messages()) {
+            const auto bytes=message.as_string(); const auto event=lattice::server_sent_event::from_json(bytes);
+            if(!event || event->event_type!=lattice::server_sent_event::type::audit_log) continue;
+            EXPECT_GT(bytes.size(),lattice::sync_max_encoded_message_bytes);
+            EXPECT_LE(bytes.size(),2*lattice::sync_max_encoded_message_bytes);
+            EXPECT_EQ(event->audit_logs.size(),1u);
+        }
+        outbox_ack(*transport,{pending[1].global_id});
+        EXPECT_TRUE(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).empty());
+        EXPECT_EQ(sync.get_progress().pending_upload,0);
+        EXPECT_TRUE(error.empty()) << error;
+    },30);
+}
+
+TEST(Sync, OverEightMiBUploadNamesTheRowWithoutAdvancingItsFloor) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"over-eight-mib"};
+        auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+        db->add(TestPerson{std::string(8*1024*1024,'x'),1,std::nullopt});
+        const auto source=lattice::query_audit_log(db->db()).back();
+        auto cfg=outbox_config("over-eight"); cfg.sync_filter=std::nullopt;
+        std::string error;
+        lattice::synchronizer sync(std::move(db),cfg);
+        sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+        EXPECT_NE(error.find(source.global_id),std::string::npos) << error;
+        EXPECT_NE(error.find(source.table_name),std::string::npos) << error;
+        EXPECT_TRUE(outbox_sent(*factory->last_websocket()).empty());
+        EXPECT_EQ(lattice::read_upload_floor(owned->db(),cfg.sync_id),0);
+        EXPECT_EQ(sync.get_progress().pending_upload,0);
+        EXPECT_EQ(sync.get_progress().total_upload,0);
+        EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+        EXPECT_EQ(lattice::query_audit_log_for_sync(owned->db(),cfg.sync_id).size(),1u);
+    },30);
+}
+
+TEST(SyncDelivery, LargeFilteredSnapshotReplaysExactBytesUntilAck) {
+    bounded_mock_case([] {
+        auto factory=std::make_shared<lattice::mock_network_factory>(); lattice::set_network_factory(factory);
+        TempDB tmp{"large-filtered-replay"};
+        auto cfg=outbox_config("large-filtered"); cfg.sync_filter->at(0).where_clause="age=1";
+        std::string exact,wire_id,source_id,error;
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+            db->add(TestPerson{std::string(5*1024*1024,'x'),0,std::nullopt});
+            db->db().execute("UPDATE AuditLog SET isSynchronized=1");
+            db->db().execute("UPDATE TestPerson SET age=1");
+            source_id=lattice::query_audit_log(db->db()).back().global_id;
+            lattice::synchronizer sync(std::move(db),cfg);
+            sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+            const auto sent=outbox_sent(*factory->last_websocket()); ASSERT_EQ(sent.size(),1u);
+            wire_id=sent[0].global_id; EXPECT_NE(wire_id,source_id);
+            EXPECT_EQ(sent[0].operation,"INSERT");
+            const auto retained=lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id);
+            ASSERT_EQ(retained.size(),1u); exact=retained[0].wire_json;
+            EXPECT_GT(retained[0].charge,lattice::sync_max_encoded_message_bytes);
+            EXPECT_LE(retained[0].charge,2*lattice::sync_max_encoded_message_bytes);
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+            EXPECT_EQ(outbox_number(*owned,"SELECT isSynchronized AS n FROM AuditLog WHERE globalId=?",{source_id}),0);
+            sync.disconnect();
+        }
+        {
+            auto db=std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())); auto* owned=db.get();
+            lattice::synchronizer sync(std::move(db),cfg);
+            sync.set_on_error([&](const std::string& value){error=value;}); sync.connect();
+            auto* transport=factory->last_websocket();
+            const auto sent=outbox_sent(*transport); ASSERT_EQ(sent.size(),1u);
+            EXPECT_EQ(sent[0].global_id,wire_id);
+            const auto retained=lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id);
+            ASSERT_EQ(retained.size(),1u); EXPECT_EQ(retained[0].wire_json,exact);
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+            outbox_ack(*transport,{wire_id});
+            EXPECT_TRUE(lattice::detail::read_sync_outbox(owned->db(),cfg.sync_id).empty());
+            EXPECT_EQ(outbox_number(*owned,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),1);
+            EXPECT_EQ(outbox_number(*owned,"SELECT isSynchronized AS n FROM AuditLog WHERE globalId=?",{source_id}),1);
+            EXPECT_TRUE(error.empty()) << error;
+        }
+    },30);
+}
+#endif
+
+TEST(SyncDelivery, AdmissionCountsMetadataAtTheEightMiBBoundary) {
+    TempDB tmp{"admit-retained-boundary"}; lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.add(TestPerson{"",1,std::nullopt});
+    auto delivery=outbox_delivery(lattice::query_audit_log(db.db()).back());
+    delivery.wire.changed_fields["name"]=lattice::any_property(std::string{});
+    const auto empty_wire=delivery.wire.to_json();
+    const auto overhead=lattice::detail::sync_delivery_retained_bytes(delivery,empty_wire);
+    ASSERT_LT(overhead,lattice::detail::sync_outbox_bytes);
+    for(size_t extra:{size_t{1},size_t{0}}) {
+        delivery.wire.changed_fields["name"]=lattice::any_property(
+            std::string(lattice::detail::sync_outbox_bytes-overhead+extra,'x'));
+        ASSERT_EQ(lattice::detail::sync_delivery_retained_bytes(delivery,delivery.wire.to_json()),
+                  lattice::detail::sync_outbox_bytes+extra);
+        if(extra) {
+            try { (void)lattice::detail::admit_sync_delivery(db,"boundary",delivery); FAIL()<<"over-budget receipt admitted"; }
+            catch(const std::length_error& error) {
+                const std::string message=error.what();
+                EXPECT_NE(message.find(delivery.wire.global_id),std::string::npos)<<message;
+                EXPECT_NE(message.find(delivery.wire.table_name),std::string::npos)<<message;
+                EXPECT_NE(message.find("retained"),std::string::npos)<<message;
+            }
+            EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_outbox"),0);
+        } else {
+            ASSERT_TRUE(lattice::detail::admit_sync_delivery(db,"boundary",delivery));
+            const auto stored=lattice::detail::read_sync_outbox(db.db(),"boundary");
+            ASSERT_EQ(stored.size(),1u);
+            EXPECT_EQ(lattice::detail::sync_delivery_retained_bytes(stored[0],stored[0].wire_json),
+                      lattice::detail::sync_outbox_bytes);
+        }
+        EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_set"),0);
+        EXPECT_EQ(outbox_number(db,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+    }
+}
+
+// Read-only hosts do not retry failed downloads via the upload loop. A receive
+// gap must redial from the committed prefix, fencing every queued old frame.
+namespace {
+std::vector<lattice::audit_log_entry> recovery_entries(size_t count) {
+    std::vector<lattice::audit_log_entry> entries;
+    for (size_t i = 0; i < count; ++i) {
+        lattice::audit_log_entry e;
+        e.global_id = "recover-audit-" + std::to_string(i);
+        e.table_name = "TestPerson";
+        e.operation = "INSERT";
+        e.global_row_id = "recover-person-" + std::to_string(i);
+        e.changed_fields = {{"name", lattice::any_property("P" + std::to_string(i))},
+                            {"age", lattice::any_property(int64_t(i))}};
+        e.changed_fields_names = {"name", "age"};
+        e.timestamp = "2026-09-09T12:00:00Z";
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+class readonly_replay_transport : public lattice::sync_transport {
+public:
+    std::vector<lattice::audit_log_entry> history;
+    std::function<void(size_t)> before_connect;
+    std::atomic<size_t> connections{0};
+    std::atomic<size_t> uploads{0};
+    void connect(const std::string& url,
+                 const std::map<std::string, std::string>&) override {
+        size_t attempt;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            urls_.push_back(url);
+            attempt = urls_.size();
+        }
+        connections = attempt;
+        if (before_connect) before_connect(attempt);
+        state_ = lattice::transport_state::open;
+        if (on_open_) on_open_();
+        if (attempt > 1) {
+            // A real readonly server enumerates strictly AFTER this checkpoint.
+            // It sends no unsolicited replay and has no client uploads to retry.
+            size_t first = 0;
+            auto pos = url.find("last-event-id=");
+            if (pos != std::string::npos) {
+                auto checkpoint = url.substr(pos + 14);
+                auto it = std::find_if(history.begin(), history.end(), [&](const auto& e) {
+                    return e.global_id == checkpoint;
+                });
+                if (it != history.end()) first = size_t(it - history.begin()) + 1;
+            }
+            deliver({history.begin() + first, history.end()});
+        }
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    void send(const lattice::transport_message& message) override {
+        auto event = lattice::server_sent_event::from_json(message.as_string());
+        if (event && event->event_type == lattice::server_sent_event::type::audit_log) ++uploads;
+        if (!event || event->event_type != lattice::server_sent_event::type::ack) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& id : event->acked_ids) acks_.emplace_back(connections.load(), id);
+    }
+    void set_on_open(on_open_handler handler) override { on_open_ = std::move(handler); }
+    void set_on_message(on_message_handler handler) override { on_message_ = std::move(handler); }
+    void set_on_error(on_error_handler handler) override { on_error_ = std::move(handler); }
+    void set_on_close(on_close_handler handler) override { on_close_ = std::move(handler); }
+    void deliver(const std::vector<lattice::audit_log_entry>& entries) {
+        deliver_json(lattice::server_sent_event::make_audit_log(entries).to_json());
+    }
+    void deliver_json(const std::string& json) {
+        if (on_message_) on_message_(lattice::transport_message::from_string(json));
+    }
+    std::vector<std::string> urls() {
+        std::lock_guard<std::mutex> lock(mutex_); return urls_;
+    }
+    std::vector<std::pair<size_t, std::string>> acks() {
+        std::lock_guard<std::mutex> lock(mutex_); return acks_;
+    }
+private:
+    std::mutex mutex_;
+    std::vector<std::string> urls_;
+    std::vector<std::pair<size_t, std::string>> acks_;
+    std::atomic<lattice::transport_state> state_{lattice::transport_state::closed};
+    on_open_handler on_open_;
+    on_message_handler on_message_;
+    on_error_handler on_error_;
+    on_close_handler on_close_;
+};
+
+struct recovery_fixture {
+    TempDB tmp{"readonly-recovery"};
+    std::shared_ptr<lattice::std_thread_scheduler> scheduler =
+        std::make_shared<lattice::std_thread_scheduler>();
+    std::atomic<int> errors{0};
+    std::mutex error_mutex;
+    std::string last_error;
+    readonly_replay_transport* wire;
+    lattice::lattice_db* database;
+    std::unique_ptr<lattice::synchronizer> sync;
+    explicit recovery_fixture(size_t count, double delay = 0.05, int maximum = 3,
+                              bool websocket = true, bool observer = false) {
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str(), scheduler));
+        database = db.get();
+        auto seed = db->add(TestPerson{"seed", 0, std::nullopt});
+        db->remove(seed);
+        db->db().execute("DELETE FROM AuditLog");
+        auto transport = std::make_unique<readonly_replay_transport>();
+        wire = transport.get();
+        wire->history = recovery_entries(count);
+        lattice::sync_config config;
+        config.sync_id = "wss:readonly-recovery";
+        if (websocket) config.websocket_url = "wss://readonly.invalid/room";
+        config.uploads_enabled = false;
+        config.is_observer = observer;
+        config.base_delay_seconds = delay;
+        config.max_delay_seconds = delay * 4;
+        config.max_reconnect_attempts = maximum;
+        config.stable_connection_ms = 60'000;
+        sync = std::make_unique<lattice::synchronizer>(std::move(db), config, std::move(transport));
+        sync->set_on_error([this](const std::string& message) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            last_error = message;
+            ++errors;
+        });
+    }
+    ~recovery_fixture() {
+        sync.reset(); // Join apply/reconnect before clearing captured test hooks.
+        lattice::test_hooks::apply_chunk_begin = nullptr;
+    }
+    template<class Predicate> bool wait(Predicate predicate, int milliseconds = 2500) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+        while (!predicate() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return predicate();
+    }
+    void expect_complete(size_t count) {
+        EXPECT_TRUE(wait([&] { return sync->get_progress().received >= int64_t(count); }));
+        sync.reset();
+        lattice::lattice_db reopened{lattice::configuration(tmp.str())};
+        auto rows = reopened.db().query("SELECT COUNT(*) AS count FROM TestPerson");
+        EXPECT_EQ(std::get<int64_t>(rows[0].at("count")), int64_t(count));
+        auto slot = reopened.db().query("SELECT last_received_event_id AS cursor FROM _lattice_replication_slots WHERE sync_id='wss:readonly-recovery'");
+        ASSERT_EQ(slot.size(), 1u);
+        ASSERT_TRUE(std::holds_alternative<std::string>(slot[0].at("cursor")));
+        EXPECT_EQ(std::get<std::string>(slot[0].at("cursor")), "recover-audit-" + std::to_string(count - 1));
+    }
+};
+}
+
+TEST(SyncRecovery, ReadonlyZeroApplyRedialsWithoutAnyFutureUploads) {
+    recovery_fixture fixture(4);
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t) {
+        if (failures->fetch_sub(1) > 0) throw std::runtime_error("injected write contention");
+    };
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+    EXPECT_GE(fixture.errors.load(), 1);
+    auto urls = fixture.wire->urls();
+    if (urls.size() >= 2) EXPECT_EQ(urls[1].find("last-event-id="), std::string::npos);
+    fixture.expect_complete(4);
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_EQ(fixture.last_error,
+            "Download incomplete: applied 0 of 4 entries; reconnecting from the committed checkpoint.");
+    }
+}
+
+TEST(SyncRecovery, MissingMiddleFencesAlreadyQueuedFollowingFrameAndResumesPrefix) {
+    recovery_fixture fixture(60);
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t start) {
+        if (start == 50 && failures->fetch_sub(1) > 0)
+            throw std::runtime_error("injected second-chunk failure");
+    };
+    fixture.sync->connect();
+    fixture.wire->deliver({fixture.wire->history.begin(), fixture.wire->history.begin() + 55});
+    fixture.wire->deliver({fixture.wire->history.begin() + 55, fixture.wire->history.end()});
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+    auto urls = fixture.wire->urls();
+    ASSERT_GE(urls.size(), 2u);
+    EXPECT_NE(urls[1].find("last-event-id=recover-audit-49"), std::string::npos);
+    auto acks = fixture.wire->acks();
+    EXPECT_NE(std::find(acks.begin(), acks.end(), std::make_pair(size_t(1), std::string("recover-audit-49"))), acks.end());
+    EXPECT_EQ(std::find(acks.begin(), acks.end(), std::make_pair(size_t(1), std::string("recover-audit-59"))), acks.end());
+    fixture.expect_complete(60);
+}
+
+TEST(SyncRecovery, FailedFirstRowDoesNotSeedNullCheckpointFromLaterSuccessfulRows) {
+    recovery_fixture fixture(4);
+    fixture.database->db().execute("CREATE TRIGGER reject_first BEFORE INSERT ON TestPerson WHEN NEW.age=0 BEGIN SELECT RAISE(ABORT,'injected first-row failure'); END");
+    fixture.wire->before_connect = [&](size_t attempt) {
+        if (attempt == 2) fixture.database->db().execute("DROP TRIGGER reject_first");
+    };
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+    auto urls = fixture.wire->urls();
+    ASSERT_GE(urls.size(), 2u);
+    EXPECT_EQ(urls[1].find("last-event-id="), std::string::npos);
+    fixture.expect_complete(4);
+}
+
+TEST(SyncRecovery, FilterRemovalAcksDoNotHideAnOrdinaryApplyFailure) {
+    recovery_fixture fixture(2);
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t) {
+        if (failures->fetch_sub(1) > 0) throw std::runtime_error("injected write contention");
+    };
+    auto removal = fixture.wire->history.back();
+    removal.operation = "DELETE";
+    removal.changed_fields_names.push_back("__lattice_filter_removal");
+    fixture.wire->history.back() = removal;
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+    EXPECT_TRUE(fixture.wait([&] { return fixture.sync->get_progress().received >= 1; }));
+    EXPECT_GE(fixture.errors.load(), 1);
+}
+
+TEST(SyncRecovery, MalformedMiddleEntryCannotBeSilentlySkipped) {
+    recovery_fixture fixture(3);
+    auto json = lattice::server_sent_event::make_audit_log(fixture.wire->history).to_json();
+    // Missing required tableName makes one entry undecodable while siblings remain valid.
+    auto first = json.find("\"tableName\"");
+    auto middle = json.find("\"tableName\"", first + 1);
+    ASSERT_NE(middle, std::string::npos);
+    json.replace(middle, 11, "\"wrongName\"");
+    fixture.sync->connect();
+    fixture.wire->deliver_json(json);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+    auto urls = fixture.wire->urls();
+    ASSERT_GE(urls.size(), 2u);
+    EXPECT_EQ(urls[1].find("last-event-id="), std::string::npos);
+    fixture.expect_complete(3);
+}
+
+TEST(SyncRecovery, PersistentFailureHasBoundedAttemptsAndExplicitDisconnectCancelsRedial) {
+    {
+        recovery_fixture fixture(1, 0.05, 2);
+        lattice::test_hooks::apply_chunk_begin = [](size_t) { throw std::runtime_error("persistent failure"); };
+        fixture.sync->connect();
+        fixture.wire->deliver(fixture.wire->history);
+        EXPECT_TRUE(fixture.wait([&] { return fixture.errors >= 3; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        EXPECT_EQ(fixture.wire->connections, 3u);
+        EXPECT_EQ(fixture.sync->get_progress().received, 0);
+    }
+    {
+        recovery_fixture fixture(1, 0.5);
+        lattice::test_hooks::apply_chunk_begin = [](size_t) { throw std::runtime_error("persistent failure"); };
+        fixture.sync->connect();
+        fixture.wire->deliver(fixture.wire->history);
+        ASSERT_TRUE(fixture.wait([&] { return fixture.errors >= 1; }));
+        fixture.sync->disconnect();
+        std::this_thread::sleep_for(std::chrono::milliseconds(650));
+        EXPECT_EQ(fixture.wire->connections, 1u);
+    }
+}
+
+
+// Green guard: intentionally acknowledged removals do not create a receive gap.
+TEST(SyncRecovery, CompleteFrameWithFilterRemovalDoesNotTriggerFalseRecovery) {
+    recovery_fixture fixture(2);
+    auto removal = fixture.wire->history.back();
+    removal.operation = "DELETE";
+    removal.changed_fields_names.push_back("__lattice_filter_removal");
+    fixture.wire->history.back() = removal;
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->acks().size() == 2; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(fixture.errors, 0);
+    EXPECT_EQ(fixture.wire->connections, 1u);
+    EXPECT_EQ(fixture.sync->get_progress().received, 1);
+}
+
+TEST(SyncRecovery, IPCPartialApplyKeepsExistingSenderRetryPath) {
+    recovery_fixture fixture(3, 0.05, 3, false);
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t) {
+        if (failures->fetch_sub(1) > 0) throw std::runtime_error("injected IPC write contention");
+    };
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.errors >= 1; }));
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_EQ(fixture.last_error,
+            "Download incomplete: applied 0 of 3 entries; waiting for sender retry.");
+    }
+    EXPECT_TRUE(fixture.sync->is_connected());
+    // A peer's existing ACK timeout retries the unacknowledged frame.
+    fixture.wire->deliver(fixture.wire->history);
+    EXPECT_TRUE(fixture.wait([&] { return fixture.wire->acks().size() == 3; }));
+    EXPECT_EQ(fixture.wire->connections, 1u);
+    fixture.expect_complete(3);
+}
+
+// Green guard: the existing connection generation still fences queued deliveries.
+TEST(SyncRecovery, QueuedOldFrameCannotApplyAfterAReplacementConnectionOpens) {
+    recovery_fixture fixture(3);
+    fixture.sync->connect();
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool blocked = false, release = false;
+    fixture.scheduler->invoke([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        blocked = true;
+        condition.notify_one();
+        condition.wait(lock, [&] { return release; });
+    });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool started = condition.wait_for(lock, std::chrono::seconds(2), [&] { return blocked; });
+        if (!started) {
+            release = true;
+            lock.unlock();
+            condition.notify_one();
+            fixture.sync.reset();
+            FAIL() << "scheduler did not reach the bounded fixture gate";
+        }
+    }
+    // This delivery captures the OLD generation, but cannot execute yet.
+    fixture.wire->deliver({fixture.wire->history.back()});
+    fixture.sync->disconnect();
+    fixture.sync->connect(); // A new open must not admit the old queued delivery.
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    condition.notify_one();
+    EXPECT_TRUE(fixture.wait([&] { return fixture.sync->get_progress().received >= 3; }));
+    auto acks = fixture.wire->acks();
+    EXPECT_EQ(acks.size(), 3u) << "old frame was applied/ACKed on the replacement connection";
+    fixture.expect_complete(3);
+}
+
+TEST(SyncRecovery, MalformedNackRedialsWithoutAcknowledgingItsIds) {
+    recovery_fixture fixture(3);
+    fixture.sync->connect();
+    fixture.wire->deliver_json(R"({"kind":"nack","nack":["SECRET",42]})");
+    ASSERT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+    auto urls = fixture.wire->urls();
+    ASSERT_GE(urls.size(), 2u);
+    EXPECT_EQ(urls[1].find("last-event-id="), std::string::npos);
+    auto acks = fixture.wire->acks();
+    for (const auto& [attempt, id] : acks) {
+        EXPECT_GT(attempt, 1u);
+        EXPECT_NE(id, "SECRET");
+    }
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_NE(fixture.last_error.find("invalid nack entry"), std::string::npos);
+        EXPECT_EQ(fixture.last_error.find("SECRET"), std::string::npos);
+    }
+    fixture.expect_complete(3);
+}
+
+TEST(SyncRecovery, InvalidControlStillFencesQueuedHistoryAndRecoversFromCommittedCursor) {
+    for (const auto* wire : {R"({"kind":"floorReset","floorReason":false})", R"({"kind":"futureControl"})"}) {
+        SCOPED_TRACE(wire);
+        recovery_fixture fixture(3);
+        fixture.sync->connect();
+        fixture.wire->deliver({fixture.wire->history.front()});
+        ASSERT_TRUE(fixture.wait([&] { return fixture.wire->acks().size() == 1; }));
+        fixture.wire->deliver_json(wire);
+        fixture.wire->deliver({fixture.wire->history.back()}); // must not skip the middle row
+        ASSERT_TRUE(fixture.wait([&] { return fixture.wire->connections >= 2; }));
+        const auto urls = fixture.wire->urls();
+        ASSERT_GE(urls.size(), 2u);
+        EXPECT_NE(urls[1].find("last-event-id=recover-audit-0"), std::string::npos);
+        const auto acks = fixture.wire->acks();
+        EXPECT_EQ(std::find(acks.begin(), acks.end(), std::make_pair(size_t(1), std::string("recover-audit-2"))), acks.end());
+        EXPECT_GE(fixture.errors, 1);
+        EXPECT_EQ(fixture.wire->uploads, 0u);
+        fixture.expect_complete(3);
+    }
+}
+
+
+TEST(SyncRecovery, RejectedFrameDoesNotFenceQueuedPagesOrRedial) {
+    recovery_fixture fixture(4);
+    fixture.sync->connect();
+    fixture.wire->deliver({fixture.wire->history.begin(), fixture.wire->history.begin() + 2});
+    fixture.wire->deliver_json(R"({"kind":"rejected","rejected":"write policy refused"})");
+    fixture.wire->deliver({fixture.wire->history.begin() + 2, fixture.wire->history.end()});
+    ASSERT_TRUE(fixture.wait([&] { return fixture.sync->get_progress().received >= 4; }));
+    EXPECT_EQ(fixture.wire->connections, 1u);
+    fixture.expect_complete(4);
+    EXPECT_EQ(fixture.errors, 1);
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_EQ(fixture.last_error, "Sync upload rejected: write policy refused");
+    }
+}
+
+TEST(SyncRecovery, RejectedFramesRequireAStringAndASingleMatchingPayload) {
+    for (const auto* wire : {R"({"kind":"rejected","rejected":"policy refused"})",
+                             R"({"kind":"rejected","rejected":""})",
+                             R"({"rejected":"legacy refusal"})"}) {
+        SCOPED_TRACE(wire);
+        const auto event = lattice::server_sent_event::from_json(wire);
+        ASSERT_TRUE(event);
+        EXPECT_EQ(event->event_type, lattice::server_sent_event::type::nack);
+        EXPECT_TRUE(event->nacked_ids.empty());
+        EXPECT_TRUE(event->acked_ids.empty());
+        EXPECT_TRUE(event->audit_logs.empty());
+    }
+    for (const auto* wire : {R"({"kind":"rejected","rejected":null})",
+                             R"({"kind":"rejected","rejected":12})",
+                             R"({"kind":"rejected","rejected":[]})",
+                             R"({"kind":"rejected","rejected":"no","ack":[]})",
+                             R"({"kind":"nack","rejected":"no"})"}) {
+        SCOPED_TRACE(wire);
+        std::string diagnostic;
+        EXPECT_FALSE(lattice::server_sent_event::from_json(wire, &diagnostic));
+        EXPECT_FALSE(diagnostic.empty());
+    }
+}
+
+
+TEST(SyncRecovery, ObserverDisconnectRetainsANullCursorUntilTheGapIsRepaired) {
+    // Delay the automatic retry so the explicit disconnect/connect path owns
+    // this attempt; disconnect cancels that delay without waiting for it.
+    recovery_fixture fixture(4, 60.0, 1, true, true);
+    fixture.database->db().execute("CREATE TRIGGER reject_first BEFORE INSERT ON TestPerson "
+        "WHEN NEW.age=0 BEGIN SELECT RAISE(ABORT,'injected first-row failure'); END");
+    fixture.sync->connect();
+    fixture.wire->deliver(fixture.wire->history);
+    ASSERT_TRUE(fixture.wait([&] { return fixture.errors >= 1; }));
+    const auto count = [&] {
+        return std::get<int64_t>(fixture.database->db().query("SELECT COUNT(*) AS n FROM TestPerson")[0].at("n"));
+    };
+    const auto slots = [&] {
+        return fixture.database->db().query("SELECT last_received_event_id AS cursor,is_observer "
+            "FROM _lattice_replication_slots WHERE sync_id='wss:readonly-recovery'");
+    };
+    ASSERT_EQ(count(),3);
+    const auto before = slots();
+    ASSERT_EQ(before.size(),1u);
+    EXPECT_EQ(std::get<int64_t>(before[0].at("is_observer")),1);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(before[0].at("cursor")));
+
+    fixture.sync->disconnect();
+    const auto held = slots();
+    ASSERT_EQ(held.size(),1u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(held[0].at("cursor")));
+    fixture.database->db().execute("DROP TRIGGER reject_first");
+    fixture.sync->connect();
+    const auto urls = fixture.wire->urls();
+    ASSERT_EQ(urls.size(),2u);
+    EXPECT_EQ(urls[1].find("last-event-id="),std::string::npos);
+    ASSERT_TRUE(fixture.wait([&] {
+        const auto acks = fixture.wire->acks();
+        return std::count_if(acks.begin(),acks.end(),[](const auto& ack) { return ack.first == 2; }) == 4;
+    }));
+    EXPECT_EQ(count(),4);
+    const auto repaired = slots();
+    ASSERT_EQ(repaired.size(),1u);
+    EXPECT_EQ(std::get<std::string>(repaired[0].at("cursor")),"recover-audit-3");
+    fixture.sync->disconnect();
+    EXPECT_TRUE(slots().empty());
 }

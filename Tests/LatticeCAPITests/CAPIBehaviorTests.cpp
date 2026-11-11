@@ -1054,6 +1054,112 @@ TEST(CAPIHandleLifetime, RetainedHandlesAndQueryObjectsSurviveOwnerHandleRelease
     lattice_object_release(queried);
 }
 
+TEST(CAPILinks, UnlinkAfterPresenceCheckReturnsNull) {
+    TempPath path("capi_link_unlinked_after_check");
+    GraphSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), schema.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    auto* author = lattice_db_create_object(db, "Author");
+    auto* pet = lattice_db_create_object(db, "Pet");
+    ASSERT_NE(author, nullptr);
+    ASSERT_NE(pet, nullptr);
+    ASSERT_EQ(lattice_db_add(db, author), author);
+    ASSERT_EQ(lattice_db_add(db, pet), pet);
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    auto* absent = lattice_object_get_object(author, "pet");
+    EXPECT_EQ(absent, nullptr);
+    lattice_object_release(absent);
+    lattice_object_set_object(author, "pet", pet);
+    ASSERT_TRUE(lattice_object_has_value(author, "pet"));
+
+    auto* other = lattice_db_create_with_schemas(path.str().c_str(), schema.schemas, 2);
+    ASSERT_NE(other, nullptr) << lattice_last_error();
+    const auto authorID = global_id_of(author);
+    auto* otherAuthor = lattice_db_find_by_global_id(other, "Author", authorID.c_str());
+    ASSERT_NE(otherAuthor, nullptr);
+    lattice_object_set_object(otherAuthor, "pet", nullptr);
+    EXPECT_FALSE(lattice_object_has_value(otherAuthor, "pet"));
+    auto* missing = lattice_object_get_object(author, "pet");
+    EXPECT_EQ(missing, nullptr);
+    lattice_object_release(missing);
+
+    lattice_object_release(otherAuthor);
+    lattice_db_release(other);
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_db_release(db);
+}
+
+TEST(CAPILinks, UnmanagedStagedChildRemainsReadableWithoutPersisting) {
+    TempPath path("capi_link_staged_child");
+    GraphSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), schema.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    auto* author = lattice_db_create_object(db, "Author");
+    auto* pet = lattice_db_create_object(db, "Pet");
+    ASSERT_NE(author, nullptr);
+    ASSERT_NE(pet, nullptr);
+    auto* absent = lattice_object_get_object(author, "pet");
+    EXPECT_EQ(absent, nullptr);
+    lattice_object_release(absent);
+    lattice_object_set_string(pet, "name", "staged pet");
+    lattice_object_set_object(author, "pet", pet);
+    auto* linked = lattice_object_get_object(author, "pet");
+    ASSERT_NE(linked, nullptr);
+    EXPECT_STREQ(lattice_object_get_table_name(linked), "Pet");
+    EXPECT_STREQ(lattice_object_get_string(linked, "name"), "staged pet");
+    EXPECT_EQ(lattice_db_count(db, "Author", nullptr), 0u);
+    EXPECT_EQ(lattice_db_count(db, "Pet", nullptr), 0u);
+    lattice_object_release(linked);
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_db_release(db);
+}
+
+TEST(CAPILinks, RemoteTargetDeleteWithoutLinkCascadeReturnsNull) {
+    TempPath path("capi_link_remote_target_delete");
+    GraphSchema schema;
+    auto* db = lattice_db_create_with_schemas(path.str().c_str(), schema.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    auto* author = lattice_db_create_object(db, "Author");
+    auto* pet = lattice_db_create_object(db, "Pet");
+    ASSERT_NE(author, nullptr);
+    ASSERT_NE(pet, nullptr);
+    ASSERT_EQ(lattice_db_add(db, author), author);
+    ASSERT_EQ(lattice_db_add(db, pet), pet);
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_object_set_object(author, "pet", pet);
+
+    // Apply only the target deletion, as a remote batch can omit a link
+    // cascade. The surviving junction must not produce a phantom object.
+    const auto entries = nlohmann::json::array({{
+        {"globalId", "remote-pet-delete"},
+        {"tableName", "Pet"}, {"operation", "DELETE"},
+        {"globalRowId", global_id_of(pet)},
+        {"changedFields", nlohmann::json::object()},
+        {"changedFieldsNames", nlohmann::json::array()}
+    }}).dump();
+    char* message = lattice_create_sync_message(entries.c_str());
+    ASSERT_NE(message, nullptr) << lattice_last_error();
+    char* applied = lattice_db_receive_sync_data(
+        db, reinterpret_cast<const uint8_t*>(message), std::strlen(message));
+    ASSERT_NE(applied, nullptr) << lattice_last_error();
+    EXPECT_EQ(nlohmann::json::parse(applied),
+              nlohmann::json::array({"remote-pet-delete"}));
+    lattice_string_free(applied);
+    lattice_string_free(message);
+    ASSERT_EQ(lattice_db_count(db, "Pet", nullptr), 0u);
+    ASSERT_TRUE(lattice_object_has_value(author, "pet"));
+    auto* missing = lattice_object_get_object(author, "pet");
+    EXPECT_EQ(missing, nullptr);
+    lattice_object_release(missing);
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_db_release(db);
+}
+
 TEST(CAPIHandleLifetime, LinkedObjectGetterReturnsOneOwnedReference) {
     TempPath path("capi_link_handle_lifetime");
     GraphSchema schema;

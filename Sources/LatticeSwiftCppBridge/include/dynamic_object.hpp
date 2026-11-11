@@ -173,7 +173,10 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
             return managed_.get_managed_field<T>(name);
         } else {
             auto value = unmanaged_.get(name);
-            return *std::get_if<T>(&value);
+            if (auto* typed = std::get_if<T>(&value)) return *typed;
+            // An unresolved link is an empty unmanaged object. Match the
+            // unmanaged scalar getters for absent or differently typed fields.
+            return T{};
         }
     }
     

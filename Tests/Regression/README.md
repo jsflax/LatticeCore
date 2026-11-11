@@ -1,7 +1,7 @@
 # Foreground WAL checkpoint regression
 
-`WalForeignReaderProbe.cpp` is the exact standalone fixture executed for QA284's
-foreground checkpoint correction. It has two controller-driven modes, both given
+`WalForeignReaderProbe.cpp` is a standalone fixture for foreground WAL
+checkpoint behavior. It has two controller-driven modes, both given
 one explicit isolated database path. `writer` owns a normal LATTICE_SCHEMA model;
 `reader` uses a separate process/SQLite connection and holds its read transaction
 until the controller acknowledges release. No application profile is involved.
@@ -14,14 +14,10 @@ its existing bounded budget while the reader is held. On `releaseReader`, the
 controller acknowledges and joins the reader before acknowledging the writer.
 The writer then proves maintenance truncates the WAL without another write.
 
-The saved exact runner and results are under Orbital iteration284
-`wal-acquire-regression-1`; source SHA equality is recorded in the handoff.
-The actual test compiled every Core translation unit from this patched tree and
-reused only unchanged SqliteVec.o. It did not link the old Core.o.
-This is a standalone native regression, not a claim that the full GoogleTest
-suite or rebuilt Orbital GUI was executed.
+The probe checks that a foreign reader does not delay foreground acquisition,
+while maintenance retains its bounded wait and can truncate the WAL after the
+reader releases its transaction. Exact row checks cover data visibility across
+connection release and reacquisition.
 
-This branch applies only the WAL correction to current upstream main. The saved
-regression result above qualifies the retained private Core source, and the
-subsequent Orbital consumer run qualifies that private source through the Swift
-bridge. Native checks have not been rerun on this contextual upstream commit.
+This standalone native regression covers checkpoint behavior only. It does not
+qualify the full GoogleTest suite or a consuming application's integration.

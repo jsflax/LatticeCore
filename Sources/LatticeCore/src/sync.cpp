@@ -266,8 +266,13 @@ static any_property json_to_any_property(const json& j) {
 
         const auto& v = j["value"];
         switch (kind) {
-            case any_property_kind::int_kind:
-                return any_property(static_cast<int>(v.get<int>()));
+            case any_property_kind::int_kind: {
+                // Legacy kind 0 carries int64 values; preserve the kind when re-sending them.
+                any_property p;
+                p.kind = kind;
+                p.value = v.get<int64_t>();
+                return p;
+            }
             case any_property_kind::int64_kind:
                 return any_property(v.get<int64_t>());
             case any_property_kind::string_kind:
@@ -3761,9 +3766,8 @@ bool selected_value_valid(const json& value) {
     const auto& v = value["value"];
     if (kind == static_cast<int>(any_property_kind::null_kind)) return v.is_null();
     if (kind == static_cast<int>(any_property_kind::string_kind)) return v.is_string();
-    if (kind == static_cast<int>(any_property_kind::int_kind))
-        return integer64(v) && v.get<int64_t>() >= INT32_MIN && v.get<int64_t>() <= INT32_MAX;
-    if (kind == static_cast<int>(any_property_kind::int64_kind)) return integer64(v);
+    if (kind == static_cast<int>(any_property_kind::int_kind) ||
+        kind == static_cast<int>(any_property_kind::int64_kind)) return integer64(v);
     if (kind == static_cast<int>(any_property_kind::float_kind))
         return v.is_number() && std::isfinite(v.get<float>());
     if (kind == static_cast<int>(any_property_kind::date_kind) ||

@@ -995,7 +995,11 @@ extern "C" lattice_object_t* lattice_object_get_object(lattice_object_t* obj, co
     if (!obj || !field) return nullptr;
     try {
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
-        auto* linked = adopt_capi_ref(bridge_ref(obj_ref).get_object(std::string(field)));
+        auto resolved = bridge_ref(obj_ref).get()->get_object(std::string(field));
+        // Empty results have no table. A staged unmanaged child still has its
+        // schema table and must remain readable before the graph is persisted.
+        if (resolved.get_table_name().empty()) return nullptr;
+        auto* linked = adopt_capi_ref(lattice::dynamic_object_ref::wrap(resolved));
         return reinterpret_cast<lattice_object_t*>(linked);
     } catch (...) {
         return nullptr;

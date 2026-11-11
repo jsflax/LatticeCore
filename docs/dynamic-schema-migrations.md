@@ -64,7 +64,8 @@ uses the same registered factory path as Swift/JS callers and asserts managed
 state before getters. The production repair remained unchanged. This correction
 does not qualify direct stack-store managed-object use.
 
-Exact receipts are under `/Users/jason/localdev/hud-scratch/latticecore-hud-migration`:
+The receipts were kept in a local qualification directory, shown below as
+`/path/to/migration-checks`; they are not included in this repository.
 `native-unmanaged-link-v1.log`, `native-unmanaged-link-v1-crash.ips` and the
 hash-matched `native-unmanaged-link-v1-fixture.cpp` preserve the failed fixture;
 `native-unmanaged-link-targeted-v2.json` and `native-unmanaged-link-v2.json`
@@ -79,7 +80,9 @@ actual-Wasm/SQLite lifecycle and explicit-model cases. Link presence, repeated
 unmanaged reads, managed cycles, exact Int64 fields, identity-only hydration,
 constraint error delivery/retry and wrapper cleanup passed. All five ownership
 counters returned to zero; no async errors or fatal native logs were recorded.
-`/Users/jason/localdev/latticejs-hud/tmp/native-runtime-unmanaged-link-v1.json`
+The Wasm receipts were kept in a separate local qualification directory,
+represented by `/path/to/wasm-checks`, and are not included in this repository.
+`/path/to/wasm-checks/native-runtime-unmanaged-link-v1.json`
 is the runtime receipt, with source and artifact hashes in the adjacent
 `native-runtime-unmanaged-link-v1-source.json` and `.receipt.txt` files. The
 incremental Emscripten build used the explicit isolated-Core override and two
@@ -129,29 +132,29 @@ says `2026-10-24T00:58:38Z`, which is the Eastern wall time incorrectly suffixed
 with `Z`; the receipt's filesystem timestamp is `2026-10-24T04:58:39.680379+00:00`.
 The raw receipt was preserved unchanged.
 
-Commands used (all scratch, fixtures and module cache remain under `localdev`):
+Equivalent commands with placeholder source and qualification paths:
 
 ```sh
-TMPDIR=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/tmp \
-CLANG_MODULE_CACHE_PATH=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/module-cache \
-cmake -S /Users/jason/localdev/latticecore-hud-migration \
-  -B /Users/jason/localdev/hud-scratch/latticecore-hud-migration/build \
+TMPDIR=/path/to/migration-checks/tmp \
+CLANG_MODULE_CACHE_PATH=/path/to/migration-checks/module-cache \
+cmake -S /path/to/lattice-core \
+  -B /path/to/migration-checks/build \
   -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=/usr/bin/clang \
   -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
 
-TMPDIR=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/tmp \
-CLANG_MODULE_CACHE_PATH=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/module-cache \
-cmake --build /Users/jason/localdev/hud-scratch/latticecore-hud-migration/build \
+TMPDIR=/path/to/migration-checks/tmp \
+CLANG_MODULE_CACHE_PATH=/path/to/migration-checks/module-cache \
+cmake --build /path/to/migration-checks/build \
   --target LatticeDynamicMigrationTests --parallel 2 \
-  > /Users/jason/localdev/hud-scratch/latticecore-hud-migration/build.log 2>&1
+  > /path/to/migration-checks/build.log 2>&1
 
-TMPDIR=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/tmp \
-/Users/jason/localdev/hud-scratch/latticecore-hud-migration/build/LatticeDynamicMigrationTests \
-  --gtest_output=json:/Users/jason/localdev/hud-scratch/latticecore-hud-migration/native-tests.json \
-  > /Users/jason/localdev/hud-scratch/latticecore-hud-migration/native-tests.log 2>&1
+TMPDIR=/path/to/migration-checks/tmp \
+/path/to/migration-checks/build/LatticeDynamicMigrationTests \
+  --gtest_output=json:/path/to/migration-checks/native-tests.json \
+  > /path/to/migration-checks/native-tests.log 2>&1
 ```
 
-Receipts under `/Users/jason/localdev/hud-scratch/latticecore-hud-migration`:
+Receipts under `/path/to/migration-checks`:
 
 | File | SHA-256 |
 | --- | --- |
@@ -182,17 +185,17 @@ object was relinked with that scratch archive and the other passing libraries.
 Neither the checked-out source nor the passing binary/archive was replaced.
 
 Artifacts are in
-`/Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control`.
+`/path/to/migration-checks/negative-control`.
 The old source was extracted with
 `git show db7edece4f31e6b00ea537d870c2cb452ef9c409:Sources/LatticeSwiftCppBridge/src/lattice.cpp`.
 The selected test command was:
 
 ```sh
-TMPDIR=/Users/jason/localdev/hud-scratch/latticecore-hud-migration/tmp \
-/Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control/LatticeDynamicMigrationTests \
+TMPDIR=/path/to/migration-checks/tmp \
+/path/to/migration-checks/negative-control/LatticeDynamicMigrationTests \
   --gtest_filter=DynamicMigration.DetectsDynamicChangesAndAppliesTransformsOnce:DynamicMigration.SchemaChangesWithoutVersionBumpStillInvokeGenericCallback \
-  --gtest_output=json:/Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control/tests.json \
-  > /Users/jason/localdev/hud-scratch/latticecore-hud-migration/negative-control/tests.log 2>&1
+  --gtest_output=json:/path/to/migration-checks/negative-control/tests.json \
+  > /path/to/migration-checks/negative-control/tests.log 2>&1
 ```
 
 Expected process exit: 1; 2 tests failed, 0 errors, 0.176 seconds. The unchanged

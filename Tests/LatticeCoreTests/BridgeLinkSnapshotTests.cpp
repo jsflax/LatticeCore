@@ -168,7 +168,38 @@ TEST(BridgeLinkSnapshot, MissingTargetReturnsEmptyObjectWithoutRemovingLink) {
     EXPECT_EQ(missing.lattice, nullptr);
     EXPECT_TRUE(missing.get_table_name().empty());
     EXPECT_FALSE(missing.has_value("name"));
+    EXPECT_EQ(missing.get_string("name"), "");
+    EXPECT_EQ(missing.get_int("count"), 0);
+    EXPECT_EQ(missing.get_double("amount"), 0.0);
+    EXPECT_FALSE(missing.get_bool("enabled"));
+    EXPECT_TRUE(missing.get_data("data").empty());
     EXPECT_EQ(db.db().query(
         "SELECT rhs FROM _SnapshotTodo_SnapshotAgent_assignee "
         "WHERE lhs = 'todo-1' AND rhs = 'agent-1'").size(), 1u);
+}
+
+TEST(BridgeLinkSnapshot, UnlinkAfterPresenceCheckReturnsReadableEmptyObject) {
+    LinkSnapshotDatabase tmp;
+    SnapshotOwner owner(tmp.str());
+    auto& db = owner.get();
+    db.db().execute("INSERT INTO SnapshotTodo(globalId) VALUES('todo-1')");
+    db.db().execute(
+        "INSERT INTO SnapshotAgent(globalId, name) VALUES('agent-1', 'Willow')");
+    db.db().execute(
+        "INSERT INTO _SnapshotTodo_SnapshotAgent_assignee(lhs, rhs) "
+        "VALUES('todo-1', 'agent-1')");
+    auto todos = db.objects("SnapshotTodo");
+    ASSERT_EQ(todos.size(), 1u);
+    lattice::dynamic_object todo(todos[0]);
+    ASSERT_TRUE(todo.has_value("assignee"));
+
+    // A presence check cannot reserve the link for the subsequent read.
+    lattice::lattice_db foreignWriter{lattice::configuration(tmp.str())};
+    foreignWriter.db().execute(
+        "DELETE FROM _SnapshotTodo_SnapshotAgent_assignee WHERE lhs = 'todo-1'");
+    auto missing = todo.get_object("assignee");
+    EXPECT_EQ(missing.lattice, nullptr);
+    EXPECT_TRUE(missing.get_table_name().empty());
+    EXPECT_EQ(missing.get_string("name"), "");
+    EXPECT_EQ(db.objects("SnapshotAgent").size(), 1u);
 }

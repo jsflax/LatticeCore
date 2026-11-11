@@ -4667,6 +4667,25 @@ TEST(SyncUploadsDisabled, FiniteDownloadWaitsForCatchUpWithoutResolvingPendingUp
 }
 #endif
 
+TEST(SyncPrecision, IntegerValuedFutureDateKeeps64Bits) {
+    const auto fields = lattice::audit_log_entry::parse_changed_fields(
+        R"({"expiresAt":{"kind":0,"value":64092211200},"beforeEpoch":{"kind":0,"value":-64092211200},"aboveInt32":{"kind":0,"value":2147483648},"belowInt32":{"kind":0,"value":-2147483649},"modifiedAt":{"kind":3,"value":1788921763.083822}})");
+    EXPECT_EQ(fields.at("expiresAt").kind, lattice::any_property_kind::int_kind);
+    EXPECT_EQ(std::get<int64_t>(fields.at("expiresAt").to_column_value()), INT64_C(64092211200));
+    EXPECT_EQ(fields.at("beforeEpoch").kind, lattice::any_property_kind::int_kind);
+    EXPECT_EQ(std::get<int64_t>(fields.at("beforeEpoch").to_column_value()), -INT64_C(64092211200));
+    EXPECT_EQ(std::get<int64_t>(fields.at("aboveInt32").to_column_value()), INT64_C(2147483648));
+    EXPECT_EQ(std::get<int64_t>(fields.at("belowInt32").to_column_value()), -INT64_C(2147483649));
+    EXPECT_EQ(std::get<double>(fields.at("modifiedAt").to_column_value()), 1788921763.083822);
+    lattice::audit_log_entry entry;
+    entry.changed_fields = fields;
+    const auto roundTrip = lattice::audit_log_entry::parse_changed_fields(entry.changed_fields_to_json());
+    for (const auto* name : {"expiresAt", "beforeEpoch", "aboveInt32", "belowInt32"}) {
+        EXPECT_EQ(roundTrip.at(name).kind, lattice::any_property_kind::int_kind);
+        EXPECT_EQ(roundTrip.at(name).value, fields.at(name).value);
+    }
+}
+
 TEST(SyncPrecision, AuthoritativeSnapshotRepairsOldAuditWithoutChangingStoredRows) {
     lattice::lattice_db db;
     const double original = 1788921763.083822;

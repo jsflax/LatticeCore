@@ -94,6 +94,38 @@ TEST(PendingImport, NativeFrameKeepsAllInt64Bits) {
     }
 }
 
+TEST(PendingImport, LegacyIntegerFrameKeepsKindAndAllInt64Bits) {
+    File file; lattice::swift_lattice db(config(file), schema()); seed(db);
+    int sequence = 0;
+    for (const int64_t value : {std::numeric_limits<int64_t>::min(), int64_t(-9007199254740993LL),
+                               int64_t(-2147483649LL), int64_t(2147483648LL),
+                               int64_t(9007199254740993LL), std::numeric_limits<int64_t>::max()}) {
+        SCOPED_TRACE(std::to_string(value));
+        auto entry = change("legacy-integer-" + std::to_string(sequence++));
+        entry.changed_fields_names = {"amount"};
+        any_property legacy;
+        legacy.kind = any_property_kind::int_kind;
+        legacy.value = value;
+        entry.changed_fields = {{"amount", legacy}};
+
+        const auto parsed = audit_log_entry::from_json(entry.to_json());
+        ASSERT_TRUE(parsed);
+        EXPECT_EQ(parsed->changed_fields.at("amount").kind, any_property_kind::int_kind);
+        EXPECT_EQ(std::get<int64_t>(parsed->changed_fields.at("amount").value), value);
+        ASSERT_EQ(apply_pending_changes(db, {*parsed}).imported_ids.size(), 1u);
+        EXPECT_EQ(scalar(db.db(), "SELECT amount AS n FROM PendingRow WHERE globalId='row'"), value);
+
+        const auto selected = query_audit_log_selected(db.db(), {latest(db.db())});
+        ASSERT_EQ(selected.size(), 1u);
+        EXPECT_EQ(selected[0].changed_fields.at("amount").kind, any_property_kind::int_kind);
+        EXPECT_EQ(std::get<int64_t>(selected[0].changed_fields.at("amount").value), value);
+        const auto forwarded = audit_log_entry::from_json(selected[0].to_json());
+        ASSERT_TRUE(forwarded);
+        EXPECT_EQ(forwarded->changed_fields.at("amount").kind, any_property_kind::int_kind);
+        EXPECT_EQ(std::get<int64_t>(forwarded->changed_fields.at("amount").value), value);
+    }
+}
+
 TEST(PendingImport, NullableClearAndLegacyRequiredGuardsShareCorePolicy) {
     File file; lattice::swift_lattice db(config(file), schema()); seed(db);
     for (bool marked : {false, true}) {
@@ -267,9 +299,40 @@ TEST(SelectedAudit, ExactIdentityMalformedRowsAndDuplicateSelectionsRefuse) {
     EXPECT_THROW(query_audit_log_selected(db.db(), {{1, std::string(40, 'a')}, {2, std::string(40, 'b')}}, 64), std::length_error);
     db.db().execute("UPDATE AuditLog SET changedFields='[' WHERE id=?", {identity.first});
     EXPECT_THROW(query_audit_log_selected(db.db(), {identity}), std::invalid_argument);
-    for (const auto* malformed : {R"({"title":{}})", R"({"title":{"kind":999,"value":"x"}})", R"({"amount":{"kind":5,"value":1e100}})", R"({"amount":{"kind":0,"value":9007199254740993}})"}) {
+    for (const auto* malformed : {
+            R"({"title":{}})", R"({"title":{"kind":999,"value":"x"}})",
+            R"({"amount":{"kind":5,"value":1e100}})",
+            R"({"amount":{"kind":0,"value":9223372036854775808}})",
+            R"({"amount":{"kind":1,"value":9223372036854775808}})",
+            R"({"amount":{"kind":0,"value":-9223372036854775809}})",
+            R"({"amount":{"kind":1,"value":-9223372036854775809}})",
+            R"({"amount":{"kind":0,"value":1.5}})",
+            R"({"amount":{"kind":1,"value":1.5}})"}) {
         db.db().execute("UPDATE AuditLog SET changedFields=? WHERE id=?", {std::string(malformed), identity.first});
         EXPECT_THROW(query_audit_log_selected(db.db(), {identity}), std::invalid_argument);
+    }
+    EXPECT_FALSE(db.db().is_in_transaction());
+}
+
+TEST(SelectedAudit, LegacyIntegerKindKeepsTheSameSigned64BitRange) {
+    File file; lattice::swift_lattice db(config(file), schema()); seed(db);
+    const auto identity = latest(db.db());
+    for (const auto kind : {any_property_kind::int_kind, any_property_kind::int64_kind}) {
+        for (const int64_t value : {std::numeric_limits<int64_t>::min(), int64_t(-9007199254740993LL),
+                                   int64_t(9007199254740993LL), std::numeric_limits<int64_t>::max()}) {
+            SCOPED_TRACE(std::to_string(static_cast<int>(kind)) + ":" + std::to_string(value));
+            const auto fields = json{{"amount", {{"kind", static_cast<int>(kind)}, {"value", value}}}}.dump();
+            db.db().execute("UPDATE AuditLog SET changedFields=?, changedFieldsNames='[\"amount\"]' WHERE id=?",
+                            {fields, identity.first});
+            const auto parsed = audit_log_entry::parse_changed_fields(fields);
+            const auto selected = query_audit_log_selected(db.db(), {identity});
+            ASSERT_EQ(selected.size(), 1u);
+            const auto& exported = selected[0].changed_fields.at("amount");
+            EXPECT_EQ(exported.kind, kind);
+            EXPECT_EQ(parsed.at("amount").kind, kind);
+            EXPECT_EQ(std::get<int64_t>(exported.value), value);
+            EXPECT_EQ(exported.value, parsed.at("amount").value);
+        }
     }
     EXPECT_FALSE(db.db().is_in_transaction());
 }

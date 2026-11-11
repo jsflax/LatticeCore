@@ -388,7 +388,7 @@ LATTICE_EXPORT void lattice_db_remove_object_observer(lattice_db_t* db, const ch
 LATTICE_EXPORT void lattice_object_set_object(lattice_object_t* obj, const char* field, lattice_object_t* value);
 
 // Get a linked object - wraps dynamic_object_ref::get_object()
-// Returns NULL if no link. Caller must release.
+// Returns NULL if no link or the linked row no longer exists. Caller must release a non-NULL result.
 LATTICE_EXPORT lattice_object_t* lattice_object_get_object(lattice_object_t* obj, const char* field);
 
 // =============================================================================

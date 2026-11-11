@@ -49,6 +49,10 @@ inline int64_t sync_max_encoded_message_bytes_value() {
     return static_cast<int64_t>(sync_max_encoded_message_bytes);
 }
 
+inline int64_t sync_max_encoded_row_bytes_value() {
+    return static_cast<int64_t>(sync_max_encoded_row_bytes);
+}
+
 // ============================================================================
 // swift_dynamic_object - A type-erased model for Swift interop
 // Swift models map to this, with schema/properties set dynamically

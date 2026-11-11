@@ -22,7 +22,7 @@ The focused `LatticeTransportAuthenticationTests` target contains four
 regressions: default/copy semantics, actual bridge cache identity, actual Core startup
 with empty-token disabled versus managed admission, and legacy bearer headers. Its
 network factory records synthetic transport calls and never connects to a service.
-Set TMPDIR to a localdev scratch directory and build the target with at most two jobs
+Set TMPDIR to a caller-owned scratch directory and build the target with at most two jobs
 in the coordinated native window.
 
 On 2026-10-24 the actual native target passed all four tests (0 failures/errors,
@@ -31,11 +31,11 @@ jobs. The command was `cmake --build <scratch>/build --target
 LatticeTransportAuthenticationTests --parallel 2`, after reconfiguring the graph,
 then the resulting executable with `--gtest_output=json:<evidence>/tests.json`.
 Exact source hashes, the patch, configure/build logs, and GTest receipt are retained
-at `/Users/jason/localdev/hud-scratch/lattice-transport-auth-v1/`.
+in a local qualification directory, shown as `/path/to/transport-auth-checks/`.
 
 The paired LatticeJS candidate also passed its unchanged 39-case actual Wasm gate
 and four actual Chrome admission scenarios. Those exercise a loopback HttpOnly ticket
 fixture, not the production gateway or HTTPS/Secure-cookie policy. Evidence is under
-`/Users/jason/localdev/latticejs-hud/tmp/wasm-sync-admission-v1/`.
+`/path/to/wasm-checks/wasm-sync-admission-v1/` (a placeholder path).
 No release, published pin, or owner application adoption is claimed. The e7361f9
 qualified candidate evidence remains immutable.

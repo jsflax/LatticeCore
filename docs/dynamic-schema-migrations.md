@@ -64,8 +64,8 @@ uses the same registered factory path as Swift/JS callers and asserts managed
 state before getters. The production repair remained unchanged. This correction
 does not qualify direct stack-store managed-object use.
 
-Receipt paths below use `/path/to/migration-checks` as a placeholder for the
-qualification directory:
+The receipts were kept in a local qualification directory, shown below as
+`/path/to/migration-checks`; they are not included in this repository.
 `native-unmanaged-link-v1.log`, `native-unmanaged-link-v1-crash.ips` and the
 hash-matched `native-unmanaged-link-v1-fixture.cpp` preserve the failed fixture;
 `native-unmanaged-link-targeted-v2.json` and `native-unmanaged-link-v2.json`
@@ -80,6 +80,8 @@ actual-Wasm/SQLite lifecycle and explicit-model cases. Link presence, repeated
 unmanaged reads, managed cycles, exact Int64 fields, identity-only hydration,
 constraint error delivery/retry and wrapper cleanup passed. All five ownership
 counters returned to zero; no async errors or fatal native logs were recorded.
+The Wasm receipts were kept in a separate local qualification directory,
+represented by `/path/to/wasm-checks`, and are not included in this repository.
 `/path/to/wasm-checks/native-runtime-unmanaged-link-v1.json`
 is the runtime receipt, with source and artifact hashes in the adjacent
 `native-runtime-unmanaged-link-v1-source.json` and `.receipt.txt` files. The

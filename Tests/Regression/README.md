@@ -14,10 +14,13 @@ its existing bounded budget while the reader is held. On `releaseReader`, the
 controller acknowledges and joins the reader before acknowledging the writer.
 The writer then proves maintenance truncates the WAL without another write.
 
-The probe checks that a foreign reader does not delay foreground acquisition,
-while maintenance retains its bounded wait and can truncate the WAL after the
-reader releases its transaction. Exact row checks cover data visibility across
-connection release and reacquisition.
+No controller or build target for this probe ships in this repository. Compile
+it with C++20 against the Core and SqliteVec sources and their dependencies.
+Run the executable as `writer <new database path>` and `reader <same path>`;
+write `continue` followed by a newline to the appropriate process's stdin for
+each acknowledgement in the sequence above. Exact row checks cover data
+visibility across read-generation release and reacquisition. No run against
+this revision is recorded here.
 
 This standalone native regression covers checkpoint behavior only. It does not
 qualify the full GoogleTest suite or a consuming application's integration.

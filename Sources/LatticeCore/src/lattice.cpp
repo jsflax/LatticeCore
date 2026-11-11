@@ -1741,7 +1741,8 @@ void lattice_db::reopen_write_db() {
     // Declared before the attach guard: error cleanup and retired-owner
     // destruction must run after that guard is released.
     auto staged = std::make_shared<database>(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms, config_.private_sync_cancellation);
+        database::open_mode::read_write, config_.busy_timeout_ms,
+        config_.private_sync_cancellation, config_.create_if_missing);
     register_sql_functions(*staged);
     // A maintenance caller can already own the writer SQLite mutex. Never
     // wait behind attach while it may be waiting for that writer. A busy

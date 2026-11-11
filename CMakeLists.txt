@@ -213,6 +213,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/BridgeCacheConfigurationTests.cpp
     Tests/LatticeCoreTests/ExistingSchemaAccessTests.cpp
+    Tests/LatticeCoreTests/NoCreateOpenTests.cpp
     Tests/LatticeCoreTests/MainFileCurrentnessTests.cpp
     Tests/LatticeCoreTests/SyncOutboxMigrationTests.cpp
     Tests/LatticeCoreTests/DetachedReadTests.cpp

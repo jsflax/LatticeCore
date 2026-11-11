@@ -155,13 +155,17 @@ public:
         read_write_existing ///< No CREATE, journal-mode changes, automatic optimize or checkpoint.
     };
 
+    /// File creation is independent of writable setup and maintenance. False
+    /// omits SQLITE_OPEN_CREATE; it does not select strict existing-file mode.
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
                       int busy_timeout_ms = kDefaultBusyTimeoutMs,
-                      std::shared_ptr<const std::atomic<bool>> cancellation = {});
+                      std::shared_ptr<const std::atomic<bool>> cancellation = {},
+                      bool create_if_missing = true);
     // Private construction capability; callers cannot manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
              initialization_key key,
-             std::shared_ptr<const std::atomic<bool>> cancellation = {});
+             std::shared_ptr<const std::atomic<bool>> cancellation = {},
+             bool create_if_missing = true);
     ~database();
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.

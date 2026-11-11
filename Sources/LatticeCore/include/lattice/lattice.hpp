@@ -542,6 +542,10 @@ struct configuration {
     /// no creation, migration, schema repair or automatic open/close maintenance is permitted.
     int32_t required_existing_schema_version = 0;
 
+    /// Permit creation of a missing database file. Disabling creation leaves
+    /// normal schema initialization and migration enabled for an existing file.
+    bool create_if_missing = true;
+
     /// Migration block. Called when schema changes are detected, BEFORE auto-migration.
     /// This allows you to transform data before columns are removed or types change.
     /// Example: copying lat/lon to new geo_bounds columns before lat/lon are dropped.
@@ -983,7 +987,7 @@ public:
         : config_(validate_background_sync_configuration(config))
         , db_(std::make_shared<database>(resolve_path(config),
               configured_open_mode(config),
-              config.busy_timeout_ms, config.private_sync_cancellation))
+              config.busy_timeout_ms, config.private_sync_cancellation, config.create_if_missing))
         , read_db_(config.read_only || config.required_existing_schema_version != 0 ? nullptr :
                    (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, config.private_sync_cancellation) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only && config.required_existing_schema_version == 0 ?

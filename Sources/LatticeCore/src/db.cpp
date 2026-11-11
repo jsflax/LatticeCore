@@ -163,8 +163,9 @@ uint64_t database::thread_statement_count() {
 
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   std::shared_ptr<const std::atomic<bool>> cancellation)
-    : database(path, mode, busy_timeout_ms, initialization_key(false), std::move(cancellation)) {}
+                   std::shared_ptr<const std::atomic<bool>> cancellation,
+                   bool create_if_missing)
+    : database(path, mode, busy_timeout_ms, initialization_key(false), std::move(cancellation), create_if_missing) {}
 
 std::shared_ptr<database> database::make_read_keeper(const std::string& path,
                                                    int busy_timeout_ms) {
@@ -174,7 +175,8 @@ std::shared_ptr<database> database::make_read_keeper(const std::string& path,
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
                    initialization_key key,
-                   std::shared_ptr<const std::atomic<bool>> cancellation)
+                   std::shared_ptr<const std::atomic<bool>> cancellation,
+                   bool create_if_missing)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
     if (cancellation && cancellation->load(std::memory_order_acquire))
         throw db_error("database operation cancelled");
@@ -199,7 +201,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     } else {
         flags |= SQLITE_OPEN_READWRITE;
-        if (mode == open_mode::read_write) flags |= SQLITE_OPEN_CREATE;
+        if (mode == open_mode::read_write && create_if_missing) flags |= SQLITE_OPEN_CREATE;
         flags |= SQLITE_OPEN_URI;  // see read-only branch note
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }

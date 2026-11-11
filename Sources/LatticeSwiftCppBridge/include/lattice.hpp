@@ -914,6 +914,15 @@ public:
         }
     }
 
+    std::string main_file_path() SWIFT_NAME(mainFilePath()) {
+        last_bridge_error().clear();
+        try { return lattice_db::main_file_path(); }
+        catch (const std::exception& error) {
+            last_bridge_error() = error.what();
+            return {};
+        }
+    }
+
     bool require_main_file_unmoved(const std::string& expected_path) SWIFT_NAME(requireMainFileUnmoved(_:)) {
         last_bridge_error().clear();
         try { lattice_db::require_main_file_unmoved(expected_path); return true; }
@@ -3893,6 +3902,9 @@ public:
         return impl().read_audit_cursor();
     }
 
+    std::string main_file_path() const SWIFT_NAME(mainFilePath()) {
+        return impl().main_file_path();
+    }
     bool require_main_file_unmoved(const std::string& expected_path) const SWIFT_NAME(requireMainFileUnmoved(_:)) {
         return impl().require_main_file_unmoved(expected_path);
     }

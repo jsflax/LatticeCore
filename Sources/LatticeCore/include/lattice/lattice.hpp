@@ -3473,6 +3473,25 @@ public:
         return version;
     }
 
+    /// Read the filename retained by the exact primary connection, not a
+    /// resolved configured path or the separately opened read connection.
+    std::string main_file_path() {
+        std::shared_ptr<database> primary;
+        uint64_t revision;
+        {
+            std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+            if (is_closed() || !db_) throw db_error("Main file primary connection is unavailable");
+            primary = db_; revision = connection_revision_;
+        }
+        auto path = primary->main_file_path();
+        {
+            std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+            if (is_closed() || primary->is_closed() || db_ != primary || connection_revision_ != revision)
+                throw db_error("Main file primary connection changed during filename read");
+        }
+        return path;
+    }
+
     /// Check the primary connection that owns this lattice's writes, not a
     /// separately opened read/keeper connection. Publication locks never cover
     /// SQLite, final shared-owner destruction or application callbacks.

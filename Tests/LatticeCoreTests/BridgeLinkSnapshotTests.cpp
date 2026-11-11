@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <lattice.hpp>
 #include <dynamic_object.hpp>
+#include <list.hpp>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -202,4 +203,20 @@ TEST(BridgeLinkSnapshot, UnlinkAfterPresenceCheckReturnsReadableEmptyObject) {
     EXPECT_TRUE(missing.get_table_name().empty());
     EXPECT_EQ(missing.get_string("name"), "");
     EXPECT_EQ(db.objects("SnapshotAgent").size(), 1u);
+}
+
+TEST(BridgeLinkSnapshot, EmptyObjectHasAnEmptyUnstagedList) {
+    // An unresolved to-one link returns this empty dynamic object. A later
+    // to-many read must stay empty rather than throw across the bridge.
+    lattice::dynamic_object empty;
+#if LATTICE_HAS_FRT
+    std::unique_ptr<lattice::link_list_ref> children(empty.get_link_list("children"));
+    ASSERT_NE(children, nullptr);
+    EXPECT_TRUE(children->empty());
+    EXPECT_EQ(children->size(), 0u);
+#else
+    auto children = empty.get_link_list("children");
+    EXPECT_TRUE(children.empty());
+    EXPECT_EQ(children.size(), 0u);
+#endif
 }

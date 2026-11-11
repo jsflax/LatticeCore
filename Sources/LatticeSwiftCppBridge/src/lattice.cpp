@@ -89,8 +89,10 @@ std::shared_ptr<lattice::swift_lattice> lattice::managed<lattice::swift_dynamic_
 }
 
 lattice::detail::LatticeCache& lattice::detail::LatticeCache::instance() {
-   static LatticeCache inst;
-   return inst;
+    // Observer delivery may resolve handles during process teardown. Keep the
+    // registry alive like the core instance/sync registries, including its mutex.
+    static auto* inst = new LatticeCache();
+    return *inst;
 }
 
 // MARK: Dynamic Object

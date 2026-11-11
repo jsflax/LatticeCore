@@ -5245,6 +5245,11 @@ TEST(SyncRecovery, IPCPartialApplyKeepsExistingSenderRetryPath) {
     fixture.sync->connect();
     fixture.wire->deliver(fixture.wire->history);
     EXPECT_TRUE(fixture.wait([&] { return fixture.errors >= 1; }));
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_EQ(fixture.last_error,
+            "Download incomplete: applied 0 of 3 entries; waiting for sender retry.");
+    }
     EXPECT_TRUE(fixture.sync->is_connected());
     // A peer's existing ACK timeout retries the unacknowledged frame.
     fixture.wire->deliver(fixture.wire->history);

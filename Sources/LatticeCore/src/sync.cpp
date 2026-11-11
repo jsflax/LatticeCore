@@ -1686,14 +1686,14 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if (partial) {
                     download_failed(generation, finite_cycle_failure::partial_apply,
                         "Download incomplete: applied " + std::to_string(applied_count) +
-                        " of " + std::to_string(entry_count) + " entries.");
+                        " of " + std::to_string(entry_count) + " entries");
                 }
                 } catch (const std::exception& error) {
                     download_failed(generation, finite_cycle_failure::storage,
                                     "Download incomplete: " + std::string(error.what()));
                 } catch (...) {
                     download_failed(generation, finite_cycle_failure::storage,
-                                    "Download incomplete: unknown apply error.");
+                                    "Download incomplete: unknown apply error");
                 }
             });
 
@@ -1791,7 +1791,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
     } catch (...) {
         invoke_on_scheduler([this, generation] {
             download_failed(generation, finite_cycle_failure::storage,
-                            "Download incomplete: unknown message error.");
+                            "Download incomplete: unknown message error");
         });
     }
 }
@@ -1800,17 +1800,17 @@ void synchronizer_base::download_failed(uint64_t generation, finite_cycle_failur
                                         const std::string& error) {
     if (is_destroyed_ || connection_generation_ != generation) return;
     fail_finite_cycle(failure, generation);
+    auto diagnostic = error;
+    if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
     if (config_.finite_cycle) {
         // Finite owners receive the failed receipt and decide when to retry.
         fire_error(error);
     } else if (config_.websocket_url.empty()) {
         // Accepted IPC sockets cannot redial. Preserve their sender's ACK retry.
-        fire_error(error + " Waiting for sender retry.");
+        fire_error(diagnostic + "; waiting for sender retry.");
     } else {
         // A quiet download-only peer has no upload cycle to trigger recovery.
         receive_halted_ = true;
-        auto diagnostic = error;
-        if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
         on_websocket_error(diagnostic + "; reconnecting from the committed checkpoint.");
     }
 }

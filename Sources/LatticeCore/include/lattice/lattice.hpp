@@ -979,7 +979,7 @@ public:
             (!config.websocket_url.empty() || config.is_ipc_enabled()))
             throw db_error("Existing schema handles do not own sync transports");
         if (config.read_only) return database::open_mode::read_only;
-        return config.required_existing_schema_version != 0 || !config.create_if_missing
+        return config.required_existing_schema_version != 0
             ? database::open_mode::read_write_existing : database::open_mode::read_write;
     }
 
@@ -987,7 +987,7 @@ public:
         : config_(validate_background_sync_configuration(config))
         , db_(std::make_shared<database>(resolve_path(config),
               configured_open_mode(config),
-              config.busy_timeout_ms, config.private_sync_cancellation))
+              config.busy_timeout_ms, config.private_sync_cancellation, config.create_if_missing))
         , read_db_(config.read_only || config.required_existing_schema_version != 0 ? nullptr :
                    (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, config.private_sync_cancellation) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only && config.required_existing_schema_version == 0 ?

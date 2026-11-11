@@ -5120,6 +5120,11 @@ TEST(SyncRecovery, ReadonlyZeroApplyRedialsWithoutAnyFutureUploads) {
     auto urls = fixture.wire->urls();
     if (urls.size() >= 2) EXPECT_EQ(urls[1].find("last-event-id="), std::string::npos);
     fixture.expect_complete(4);
+    {
+        std::lock_guard<std::mutex> lock(fixture.error_mutex);
+        EXPECT_EQ(fixture.last_error,
+            "Download incomplete: applied 0 of 4 entries; reconnecting from the committed checkpoint.");
+    }
 }
 
 TEST(SyncRecovery, MissingMiddleFencesAlreadyQueuedFollowingFrameAndResumesPrefix) {

@@ -1809,7 +1809,9 @@ void synchronizer_base::download_failed(uint64_t generation, finite_cycle_failur
     } else {
         // A quiet download-only peer has no upload cycle to trigger recovery.
         receive_halted_ = true;
-        on_websocket_error(error + " Reconnecting from the committed checkpoint.");
+        auto diagnostic = error;
+        if (!diagnostic.empty() && diagnostic.back() == '.') diagnostic.pop_back();
+        on_websocket_error(diagnostic + "; reconnecting from the committed checkpoint.");
     }
 }
 

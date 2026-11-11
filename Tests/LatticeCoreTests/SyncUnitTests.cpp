@@ -5109,9 +5109,9 @@ struct recovery_fixture {
 
 TEST(SyncRecovery, ReadonlyZeroApplyRedialsWithoutAnyFutureUploads) {
     recovery_fixture fixture(4);
-    std::atomic<int> failures{2};
-    lattice::test_hooks::apply_chunk_begin = [&](size_t) {
-        if (failures.fetch_sub(1) > 0) throw std::runtime_error("injected write contention");
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t) {
+        if (failures->fetch_sub(1) > 0) throw std::runtime_error("injected write contention");
     };
     fixture.sync->connect();
     fixture.wire->deliver(fixture.wire->history);
@@ -5124,9 +5124,9 @@ TEST(SyncRecovery, ReadonlyZeroApplyRedialsWithoutAnyFutureUploads) {
 
 TEST(SyncRecovery, MissingMiddleFencesAlreadyQueuedFollowingFrameAndResumesPrefix) {
     recovery_fixture fixture(60);
-    std::atomic<int> failures{2};
-    lattice::test_hooks::apply_chunk_begin = [&](size_t start) {
-        if (start == 50 && failures.fetch_sub(1) > 0)
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t start) {
+        if (start == 50 && failures->fetch_sub(1) > 0)
             throw std::runtime_error("injected second-chunk failure");
     };
     fixture.sync->connect();
@@ -5159,9 +5159,9 @@ TEST(SyncRecovery, FailedFirstRowDoesNotSeedNullCheckpointFromLaterSuccessfulRow
 
 TEST(SyncRecovery, FilterRemovalAcksDoNotHideAnOrdinaryApplyFailure) {
     recovery_fixture fixture(2);
-    std::atomic<int> failures{2};
-    lattice::test_hooks::apply_chunk_begin = [&](size_t) {
-        if (failures.fetch_sub(1) > 0) throw std::runtime_error("injected write contention");
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t) {
+        if (failures->fetch_sub(1) > 0) throw std::runtime_error("injected write contention");
     };
     auto removal = fixture.wire->history.back();
     removal.operation = "DELETE";
@@ -5233,9 +5233,9 @@ TEST(SyncRecovery, CompleteFrameWithFilterRemovalDoesNotTriggerFalseRecovery) {
 
 TEST(SyncRecovery, IPCPartialApplyKeepsExistingSenderRetryPath) {
     recovery_fixture fixture(3, 0.05, 3, false);
-    std::atomic<int> failures{2};
-    lattice::test_hooks::apply_chunk_begin = [&](size_t) {
-        if (failures.fetch_sub(1) > 0) throw std::runtime_error("injected IPC write contention");
+    auto failures = std::make_shared<std::atomic<int>>(2);
+    lattice::test_hooks::apply_chunk_begin = [failures](size_t) {
+        if (failures->fetch_sub(1) > 0) throw std::runtime_error("injected IPC write contention");
     };
     fixture.sync->connect();
     fixture.wire->deliver(fixture.wire->history);

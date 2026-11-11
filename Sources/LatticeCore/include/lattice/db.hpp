@@ -293,6 +293,10 @@ public:
     /// Throws for a moved/unlinked file, closed/memory database or unsupported VFS.
     void require_main_file_unmoved(const std::string& expected_path);
 
+    /// Copy SQLite's actual main filename under the connection mutex. No SQL or path resolution.
+    /// Throws for a closed or memory database. This is a name, not a currentness check.
+    std::string main_file_path();
+
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }
 

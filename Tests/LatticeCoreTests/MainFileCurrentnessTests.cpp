@@ -49,6 +49,72 @@ TEST(MainFileCurrentness, LivePrimaryAndReadOnlyProbeIssueNoSQL) {
     EXPECT_EQ(lattice::database::thread_statement_count(), before);
 }
 
+TEST(MainFileCurrentness, MainFilePathReturnsSQLiteNameWithoutSQLOrAliasResolution) {
+    CurrentnessFiles files;
+    { auto seed = open_currentness(files.file); }
+    const auto alias = files.directory / "selected.sqlite";
+    std::filesystem::create_symlink(files.file, alias);
+    auto writer = open_currentness(alias);
+    auto reader = open_currentness(files.file, true);
+    const std::string opened_name = sqlite3_db_filename(writer->db().handle(), "main");
+    const auto before = lattice::database::thread_statement_count();
+    const auto path = writer->main_file_path();
+    EXPECT_EQ(path, opened_name);
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+    EXPECT_NO_THROW(require_current(*writer, path));
+    EXPECT_EQ(reader->main_file_path(), sqlite3_db_filename(reader->db().handle(), "main"));
+    EXPECT_EQ(lattice::database::thread_statement_count(), before);
+
+    std::filesystem::remove(alias);
+    std::filesystem::create_symlink(files.replacement, alias);
+    // Reading the open name never follows a newly retargeted configured alias.
+    EXPECT_EQ(writer->main_file_path(), opened_name);
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+}
+
+TEST(MainFileCurrentness, MainFilePathKeepsTheOpenedNameAfterReplacement) {
+    CurrentnessFiles files;
+    auto writer = open_currentness(files.file);
+    const auto opened_name = writer->main_file_path();
+    ASSERT_FALSE(opened_name.empty());
+    EXPECT_NO_THROW(require_current(*writer, opened_name));
+    // Replace with a complete checkpointed image, not a fresh writable database
+    // opened beside the old primary's live WAL/SHM files.
+    writer->db().query("PRAGMA wal_checkpoint(TRUNCATE)");
+    std::filesystem::copy_file(files.file, files.replacement);
+    ASSERT_EQ(image(files.file), image(files.replacement));
+    std::filesystem::rename(files.file, files.retired);
+    std::filesystem::rename(files.replacement, files.file);
+    ASSERT_FALSE(std::filesystem::equivalent(files.retired, files.file));
+    auto replacement = open_currentness(files.file, true);
+    writer->reopen_read_db();
+    EXPECT_EQ(writer->main_file_path(), opened_name);
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+    EXPECT_THROW(require_current(*writer, opened_name), lattice::db_error);
+    EXPECT_NO_THROW(require_current(*replacement, replacement->main_file_path()));
+}
+
+TEST(MainFileCurrentness, MainFilePathSealsClosedMemoryAndAbsentPrimaryErrors) {
+    CurrentnessFiles files;
+    auto owner = open_currentness(files.file);
+    owner->close();
+    EXPECT_TRUE(owner->main_file_path().empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    auto absent = open_currentness(files.replacement);
+    absent->close_write_db();
+    EXPECT_TRUE(absent->main_file_path().empty());
+    EXPECT_FALSE(lattice::last_bridge_error().empty());
+    for (const auto& path : {std::string(":memory:"), std::string("file:filename-memory?mode=memory&cache=shared")}) {
+        lattice::swift_configuration config(path);
+        lattice::swift_lattice memory(config, lattice::SchemaVector{});
+        EXPECT_TRUE(memory.main_file_path().empty());
+        EXPECT_FALSE(lattice::last_bridge_error().empty());
+    }
+    auto live = open_currentness(files.file);
+    EXPECT_FALSE(live->main_file_path().empty());
+    EXPECT_TRUE(lattice::last_bridge_error().empty());
+}
+
 TEST(MainFileCurrentness, IdenticalReplacementCannotBeAdmittedByOldPrimaryOrNewReader) {
     CurrentnessFiles files;
     auto writer = open_currentness(files.file);

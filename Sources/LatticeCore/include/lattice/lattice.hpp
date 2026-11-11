@@ -542,6 +542,10 @@ struct configuration {
     /// no creation, migration, schema repair or automatic open/close maintenance is permitted.
     int32_t required_existing_schema_version = 0;
 
+    /// Permit creation of a missing database file. Disabling creation leaves
+    /// normal schema initialization and migration enabled for an existing file.
+    bool create_if_missing = true;
+
     /// Migration block. Called when schema changes are detected, BEFORE auto-migration.
     /// This allows you to transform data before columns are removed or types change.
     /// Example: copying lat/lon to new geo_bounds columns before lat/lon are dropped.
@@ -975,7 +979,7 @@ public:
             (!config.websocket_url.empty() || config.is_ipc_enabled()))
             throw db_error("Existing schema handles do not own sync transports");
         if (config.read_only) return database::open_mode::read_only;
-        return config.required_existing_schema_version != 0
+        return config.required_existing_schema_version != 0 || !config.create_if_missing
             ? database::open_mode::read_write_existing : database::open_mode::read_write;
     }
 

@@ -3278,6 +3278,7 @@ namespace detail {
         fp += config.uploads_enabled ? 'U' : 'D';
         fp += config.sync_autostart ? 'A' : 'D';
         fp += config.background_sync_managed ? 'M' : 'U';
+        fp += config.create_if_missing ? 'C' : 'E';
         fp += std::to_string(config.required_existing_schema_version); fp += '|';
         fp += std::to_string(config.busy_timeout_ms); fp += '|';
         fp += std::to_string(config.audit_retention_seconds); fp += '|';

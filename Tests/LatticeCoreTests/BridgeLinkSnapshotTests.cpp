@@ -1,10 +1,15 @@
+// This executable calls SQLite directly, not through the extension API table.
+#ifndef SQLITE_CORE
+#define SQLITE_CORE 1
+#endif
 #include <gtest/gtest.h>
-#ifndef __linux__
 #include <lattice.hpp>
 #include <dynamic_object.hpp>
 #include <exception>
 #include <filesystem>
+#include <memory>
 #include <random>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -75,13 +80,32 @@ lattice::SchemaVector snapshotSchemas() {
     return {todoSchema, agentSchema};
 }
 
+struct SnapshotOwner {
+#if LATTICE_HAS_FRT
+    std::unique_ptr<lattice::swift_lattice_ref> handle;
+#else
+    lattice::swift_lattice_ref handle;
+#endif
+
+    explicit SnapshotOwner(const std::string& path)
+        : handle(lattice::swift_lattice_ref::create(
+            lattice::swift_configuration(path), snapshotSchemas())) {}
+
+    lattice::swift_lattice& get() {
+#if LATTICE_HAS_FRT
+        return *handle->get();
+#else
+        return *handle.get();
+#endif
+    }
+};
+
 } // namespace
 
 TEST(BridgeLinkSnapshot, RetainsResolvedTargetWhenAnotherConnectionUnlinksIt) {
     LinkSnapshotDatabase tmp;
-    std::unique_ptr<lattice::swift_lattice_ref> owner(
-        lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), snapshotSchemas()));
-    auto& db = *owner->get();
+    SnapshotOwner owner(tmp.str());
+    auto& db = owner.get();
     db.db().execute("INSERT INTO SnapshotTodo(globalId) VALUES('todo-1')");
     db.db().execute(
         "INSERT INTO SnapshotAgent(globalId, name) VALUES('agent-1', 'Willow')");
@@ -120,9 +144,8 @@ TEST(BridgeLinkSnapshot, RetainsResolvedTargetWhenAnotherConnectionUnlinksIt) {
 
 TEST(BridgeLinkSnapshot, MissingTargetReturnsEmptyObjectWithoutRemovingLink) {
     LinkSnapshotDatabase tmp;
-    std::unique_ptr<lattice::swift_lattice_ref> owner(
-        lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()), snapshotSchemas()));
-    auto& db = *owner->get();
+    SnapshotOwner owner(tmp.str());
+    auto& db = owner.get();
     db.db().execute("INSERT INTO SnapshotTodo(globalId) VALUES('todo-1')");
     db.db().execute(
         "INSERT INTO SnapshotAgent(globalId, name) VALUES('agent-1', 'Willow')");
@@ -149,4 +172,3 @@ TEST(BridgeLinkSnapshot, MissingTargetReturnsEmptyObjectWithoutRemovingLink) {
         "SELECT rhs FROM _SnapshotTodo_SnapshotAgent_assignee "
         "WHERE lhs = 'todo-1' AND rhs = 'agent-1'").size(), 1u);
 }
-#endif

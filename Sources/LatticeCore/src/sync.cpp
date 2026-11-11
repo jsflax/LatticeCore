@@ -751,6 +751,10 @@ std::string server_sent_event::to_json() const {
             audit_array.push_back(entry_to_json_obj(entry));
         }
         j["auditLog"] = audit_array;
+    } else if (event_type == type::floor_reset) {
+        j["kind"] = "floorReset";
+        if (floor_reset_head) j["floorReset"] = *floor_reset_head;
+        j["floorReason"] = floor_reset_reason;
     } else if (event_type == type::nack) {
         j["kind"] = "nack";
         j["nack"] = nacked_ids;
@@ -834,6 +838,31 @@ std::optional<server_sent_event> server_sent_event::from_json(
     try {
         json j = json::parse(json_str);
         if (!j.is_object()) return reject("sync frame is not an object");
+
+        // A replay boundary is informational. It requires an explicit kind,
+        // a reason, and an optional UUID head; mixed control/data frames are
+        // still invalid. Check it before legacy payload counting because an
+        // empty server history can omit the floorReset key entirely.
+        if ((j.contains("kind") && j["kind"] == "floorReset") ||
+            j.contains("floorReset") || j.contains("floorReason")) {
+            if (!j.contains("kind") || j["kind"] != "floorReset" ||
+                !j.contains("floorReason") || !j["floorReason"].is_string())
+                return reject("invalid floorReset control");
+            for (const auto& [key, value] : j.items()) {
+                if (key != "kind" && key != "floorReset" && key != "floorReason")
+                    return reject("ambiguous floorReset control");
+            }
+            server_sent_event event;
+            event.event_type = type::floor_reset;
+            event.floor_reset_reason = j["floorReason"].get<std::string>();
+            if (j.contains("floorReset") && !j["floorReset"].is_null()) {
+                if (!j["floorReset"].is_string()) return reject("invalid floorReset head");
+                const auto head = j["floorReset"].get<std::string>();
+                if (!is_sync_uuid(head)) return reject("invalid floorReset head");
+                event.floor_reset_head = head;
+            }
+            return event;
+        }
 
         // Legacy frames can omit kind. When it is supplied, it must agree
         // with the sole payload key. In particular a NACK must never reach
@@ -1596,6 +1625,14 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     fail_finite_cycle(finite_cycle_failure::invalid_frame, generation);
                 fire_error("Failed to parse server message: " + parse_error);
             });
+            return;
+        }
+
+        if (event->event_type == server_sent_event::type::floor_reset) {
+            // Only the following replay may earn receipts and a checkpoint.
+            // The advertised head changes no rows, upload state or finite
+            // cycle completion state, and must never become an ACK.
+            LOG_INFO("synchronizer", "[%s] floor reset control; awaiting full replay", log_id());
             return;
         }
 

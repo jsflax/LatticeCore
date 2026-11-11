@@ -76,8 +76,17 @@ TEST(MainFileCurrentness, MainFilePathKeepsTheOpenedNameAfterReplacement) {
     CurrentnessFiles files;
     auto writer = open_currentness(files.file);
     const auto opened_name = writer->main_file_path();
+    ASSERT_FALSE(opened_name.empty());
+    EXPECT_NO_THROW(require_current(*writer, opened_name));
+    // Replace with a complete checkpointed image, not a fresh writable database
+    // opened beside the old primary's live WAL/SHM files.
+    writer->db().query("PRAGMA wal_checkpoint(TRUNCATE)");
+    std::filesystem::copy_file(files.file, files.replacement);
+    ASSERT_EQ(image(files.file), image(files.replacement));
     std::filesystem::rename(files.file, files.retired);
-    auto replacement = open_currentness(files.file);
+    std::filesystem::rename(files.replacement, files.file);
+    ASSERT_FALSE(std::filesystem::equivalent(files.retired, files.file));
+    auto replacement = open_currentness(files.file, true);
     writer->reopen_read_db();
     EXPECT_EQ(writer->main_file_path(), opened_name);
     EXPECT_TRUE(lattice::last_bridge_error().empty());

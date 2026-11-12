@@ -51,13 +51,16 @@
   no rows and its count is zero, including otherwise matching receiver rows.
   The bridge records the missing-column query error. Per-arm search projection
   remains separate follow-up work.
-- Read-only attachments require a file-backed source. Memory and temporary
-  sources, duplicate URI parameters, and URI parameters other than `mode`,
-  `cache` and `vfs`, and logically closed read-only source handles are refused
-  before ATTACH. These source-form refusals differ from 3.0.0. Writable sources,
-  including named memory databases, retain their existing attachment access
-  policy. Reattaching
-  an existing path with a different access mode is refused.
+- Read-only attachment has four behavior changes from 3.0.0. Each is refused
+  before any ATTACH, with an error identifying the unsupported form:
+  - A source with no backing file: private memory, fileless temporary, or named
+    shared-memory databases.
+  - A source path with a repeated URI parameter or any parameter other than
+    `mode`, `cache` or `vfs`.
+  - A source handle that is already closed.
+  - The same path already attached in the other access mode.
+  Writable sources, including named memory databases, retain their existing
+  attachment access policy and the explicit-attachment alias tolerance above.
 
 ## [3.0.0] - 2026-11-12
 

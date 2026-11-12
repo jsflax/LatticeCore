@@ -87,6 +87,52 @@ Rows topology(lattice::database& db) {
     db.query("SELECT name FROM sqlite_temp_master");
     return db.query("PRAGMA database_list");
 }
+
+struct AttachAttempts {
+    sqlite3* handle;
+    int count = 0;
+    explicit AttachAttempts(sqlite3* value) : handle(value) {
+        if (sqlite3_set_authorizer(handle,
+                [](void* context, int action, const char*, const char*, const char*, const char*) {
+                    if (action == SQLITE_ATTACH) ++static_cast<AttachAttempts*>(context)->count;
+                    return SQLITE_OK;
+                }, this) != SQLITE_OK)
+            throw std::runtime_error("Cannot observe attachment attempts");
+    }
+    ~AttachAttempts() { sqlite3_set_authorizer(handle, nullptr, nullptr); }
+    AttachAttempts(const AttachAttempts&) = delete;
+    AttachAttempts& operator=(const AttachAttempts&) = delete;
+};
+
+void expect_refused_before_attach(lattice::lattice_db& receiver,
+                                 lattice::lattice_db& rejected_source,
+                                 lattice::lattice_db& admitted_control,
+                                 const char* message) {
+    const auto writer_before = topology(receiver.db());
+    const auto reader_before = topology(receiver.read_db());
+    const std::string views_query = "SELECT name,sql FROM sqlite_temp_master WHERE type='view' ORDER BY name";
+    const auto writer_views = receiver.db().query(views_query);
+    const auto reader_views = receiver.read_db().query(views_query);
+    AttachAttempts writer(receiver.db().handle()), reader(receiver.read_db().handle());
+    try {
+        receiver.attach(rejected_source);
+        ADD_FAILURE() << "Unsupported source was attached";
+    } catch (const std::runtime_error& error) {
+        EXPECT_STREQ(error.what(), message);
+    }
+    EXPECT_EQ(writer.count, 0);
+    EXPECT_EQ(reader.count, 0);
+    EXPECT_EQ(topology(receiver.db()), writer_before);
+    EXPECT_EQ(topology(receiver.read_db()), reader_before);
+    EXPECT_EQ(receiver.db().query(views_query), writer_views);
+    EXPECT_EQ(receiver.read_db().query(views_query), reader_views);
+
+    // The same authorizers must observe a real ATTACH on each connection.
+    ASSERT_NO_THROW(receiver.attach(admitted_control));
+    EXPECT_EQ(writer.count, 1);
+    EXPECT_EQ(reader.count, 1);
+    receiver.detach(admitted_control);
+}
 } // namespace
 
 TEST(ReadOnlyAttachmentWrites, ProtectsBothHandlesAndRestoresPolicyAfterSourceCloses) {
@@ -268,6 +314,46 @@ TEST(ReadOnlyAttachmentWrites, WritableNamedMemoryAttachmentsKeepTheirExistingBe
     EXPECT_EQ(sqlite3_db_readonly(receiver.db().handle(), alias_for(path).c_str()), 0);
     receiver.detach(source);
     EXPECT_EQ(receiver.db().query("SELECT name FROM TestPerson").size(), 1u);
+}
+
+TEST(ReadOnlyAttachmentWrites, ReadOnlyNamedSharedMemoryIsRefusedBeforeAnyAttach) {
+    TempDB main_file{"readonly_named_memory_main"}, control_file{"readonly_named_memory_control"};
+    lattice::lattice_db receiver{lattice::configuration(main_file.str())};
+    lattice::lattice_db control{lattice::configuration(control_file.str())};
+    const auto path = "file:" + main_file.path.stem().string() + "?mode=memory&cache=shared";
+    lattice::lattice_db keeper{lattice::configuration(path)};
+    keeper.add(TestPerson{"shared-memory", 2, std::nullopt});
+    auto config = lattice::configuration(path);
+    config.read_only = true;
+    lattice::lattice_db source{config};
+    ASSERT_FALSE(source.is_closed());
+    const char* filename = sqlite3_db_filename(source.db().handle(), "main");
+    ASSERT_TRUE(filename == nullptr || *filename == '\0');
+    const auto rows = source.db().query("SELECT name FROM TestPerson");
+    ASSERT_EQ(rows.size(), 1u);
+    ASSERT_EQ(std::get<std::string>(rows[0].at("name")), "shared-memory");
+
+    expect_refused_before_attach(receiver, source, control,
+        "attach: read-only attachments require a file-backed source");
+    EXPECT_EQ(source.db().query("SELECT name FROM TestPerson"), rows);
+}
+
+TEST(ReadOnlyAttachmentWrites, ClosedReadOnlySourceIsRefusedBeforeAnyAttach) {
+    TempDB main_file{"closed_readonly_main"}, source_file{"closed_readonly_source"};
+    seed(main_file); seed(source_file);
+    lattice::lattice_db receiver{lattice::configuration(main_file.str())};
+    auto config = lattice::configuration(source_file.str());
+    config.read_only = true;
+    lattice::lattice_db source{config};
+    source.close();
+    ASSERT_TRUE(source.is_closed());
+    ASSERT_TRUE(source.db().is_closed());
+    const SourceSnapshot before(source_file);
+    // A fresh handle to the same file is the admitted control, not the closed one.
+    lattice::lattice_db fresh{config};
+    expect_refused_before_attach(receiver, source, fresh,
+        "attach: the database being attached is closed");
+    EXPECT_EQ(SourceSnapshot(source_file), before);
 }
 
 TEST(ReadOnlyAttachmentWrites, RetainedAliasTeardownDoesNotAnalyzeSource) {

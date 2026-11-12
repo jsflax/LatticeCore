@@ -385,28 +385,44 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
     // delivery rides the instance registry (keyed on the canonical URI).
     if (configuration::path_is_memory(path)) return nullptr;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = shared_notifiers_.find(path);
-    if (it != shared_notifiers_.end()) {
-        return it->second.get();
+    for (;;) {
+        std::shared_ptr<notifier_slot> slot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = shared_notifiers_.find(path);
+            if (it != shared_notifiers_.end()) {
+                slot = it->second;
+            } else {
+                // A last-owner close may have removed a slot since this lookup
+                // began. Do not start an orphan listener after that retirement.
+                if (instances_.find(path) == instances_.end()) return nullptr;
+                auto notifier = make_cross_process_notifier(path);
+                if (!notifier) return nullptr;
+                slot = std::make_shared<notifier_slot>(std::move(notifier));
+                shared_notifiers_[path] = slot;
+            }
+        }
+        std::unique_lock<std::mutex> lifecycle(slot->lifecycle_mutex);
+        if (slot->retired) {
+            lifecycle.unlock();
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (instances_.find(path) == instances_.end()) return nullptr;
+            continue;
+        }
+        // Retain and serialize the slot without holding the registry mutex.
+        // A failed cached setup is retried on the next owner; a healthy listener
+        // returns immediately. Startup must not join a path's callback worker.
+        slot->notifier->start_listening([path] {
+            int notified = 0;
+            instance_registry::instance().for_each_alive(path,
+                [&notified](lattice_db* inst) {
+                    inst->handle_cross_process_notification();
+                    ++notified;
+                });
+            LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
+        });
+        return slot->notifier.get();
     }
-
-    auto notifier = make_cross_process_notifier(path);
-    if (!notifier) return nullptr;
-
-    notifier->start_listening([path] {
-        int notified = 0;
-        instance_registry::instance().for_each_alive(path,
-            [&notified](lattice_db* inst) {
-                inst->handle_cross_process_notification();
-                ++notified;
-            });
-        LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
-    });
-
-    auto* raw = notifier.get();
-    shared_notifiers_[path] = std::move(notifier);
-    return raw;
 }
 
 void lattice_db::setup_change_hook(database& connection) {

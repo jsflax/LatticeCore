@@ -25,6 +25,7 @@
 #include <sys/resource.h>
 #include <sys/inotify.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 extern char** environ;
@@ -402,6 +403,8 @@ void repaired_signal_path_retries_setup() {
 
     sibling.reset();
     first.reset();
+    EXPECT_EQ(registry.get_or_create_notifier(path), nullptr)
+        << "A diagnostic lookup must not resurrect a listener after the last owner closes";
     auto reopened = std::make_unique<lattice::lattice_db>(resource_config(path));
     auto* fresh = registry.get_or_create_notifier(path);
     ASSERT_NE(fresh, nullptr);
@@ -452,6 +455,197 @@ TEST(LinuxNotifierResources, RepairedSignalPathRetriesSetupForAnOpenStore) {
             _exit(1);
         }
     }, ::testing::ExitedWithCode(0), "notifier_setup_probe_complete");
+}
+TEST(LinuxNotifierResources, IndependentPathsUseAtMostOneAdditionalInotifyInstance) {
+    ResourceFiles files;
+    const auto initial = inotify_descriptors();
+    std::vector<std::unique_ptr<lattice::cross_process_notifier>> listeners;
+    for (size_t index = 0; index < 32; ++index) {
+        auto listener = lattice::make_cross_process_notifier(files.store(index));
+        ASSERT_NE(listener, nullptr);
+        listener->start_listening([] {});
+        ASSERT_TRUE(listener->is_listening()) << index;
+        listeners.push_back(std::move(listener));
+    }
+    const auto peak = inotify_descriptors();
+    EXPECT_LE(peak, initial + 1) << "File paths must share their process's inotify instance";
+    listeners.clear();
+    EXPECT_LE(inotify_descriptors(), initial + 1);
+}
+
+TEST(LinuxNotifierResources, StoppingOneSubscriberPreservesTheSameSignalWatch) {
+    ResourceFiles files;
+    std::mutex mutex;
+    std::condition_variable changed;
+    int first_calls = 0, second_calls = 0;
+    auto first = lattice::make_cross_process_notifier(files.store(0));
+    auto second = lattice::make_cross_process_notifier(files.store(0));
+    auto sender = lattice::make_cross_process_notifier(files.store(0));
+    first->start_listening([&] {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++first_calls;
+        changed.notify_all();
+    });
+    second->start_listening([&] {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++second_calls;
+        changed.notify_all();
+    });
+    ASSERT_TRUE(first->is_listening());
+    ASSERT_TRUE(second->is_listening());
+    sender->post_notification();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        EXPECT_TRUE(changed.wait_for(lock, std::chrono::seconds(5), [&] {
+            return first_calls > 0 && second_calls > 0;
+        }));
+    }
+    first->stop_listening();
+    int stopped_count, prior_second;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stopped_count = first_calls;
+        prior_second = second_calls;
+    }
+    sender->post_notification();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        EXPECT_TRUE(changed.wait_for(lock, std::chrono::seconds(5), [&] {
+            return second_calls > prior_second;
+        }));
+        EXPECT_EQ(first_calls, stopped_count);
+    }
+    EXPECT_FALSE(first->is_listening());
+    EXPECT_TRUE(second->is_listening());
+    second->stop_listening();
+}
+
+TEST(LinuxNotifierResources, ABlockedPathCallbackDoesNotBlockAnotherPath) {
+    ResourceFiles files;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false, release = false, delivered = false;
+    auto blocked = lattice::make_cross_process_notifier(files.store(0));
+    auto independent = lattice::make_cross_process_notifier(files.store(1));
+    // Always release the held callback before either notifier is destroyed,
+    // including an assertion or exception during fixture setup.
+    struct Release {
+        std::mutex& mutex;
+        std::condition_variable& changed;
+        bool& flag;
+        ~Release() {
+            std::lock_guard<std::mutex> lock(mutex);
+            flag = true;
+            changed.notify_all();
+        }
+    } release_on_exit{mutex, changed, release};
+    blocked->start_listening([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release; });
+    });
+    independent->start_listening([&] {
+        std::lock_guard<std::mutex> lock(mutex);
+        delivered = true;
+        changed.notify_all();
+    });
+    ASSERT_TRUE(blocked->is_listening());
+    ASSERT_TRUE(independent->is_listening());
+    blocked->post_notification();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }));
+    }
+    independent->post_notification();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        EXPECT_TRUE(changed.wait_for(lock, std::chrono::seconds(5), [&] { return delivered; }));
+        release = true;
+        changed.notify_all();
+    }
+    blocked->stop_listening();
+    independent->stop_listening();
+}
+
+TEST(LinuxNotifierResources, MovedSignalInvalidatesTheWatchAndCanBeRestarted) {
+    ResourceFiles files;
+    const auto path = files.store(0);
+    std::mutex mutex;
+    std::condition_variable changed;
+    int calls = 0;
+    auto listener = lattice::make_cross_process_notifier(path);
+    auto callback = [&] {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++calls;
+        changed.notify_all();
+    };
+    listener->start_listening(callback);
+    ASSERT_TRUE(listener->is_listening());
+    std::filesystem::rename(path + "-signal", path + "-old-signal");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (listener->is_listening() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_FALSE(listener->is_listening()) << "The watch no longer follows the advertised signal path";
+    listener->start_listening(callback);
+    ASSERT_TRUE(listener->is_listening());
+    EXPECT_TRUE(std::filesystem::is_regular_file(path + "-signal"));
+    int before;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        before = calls;
+    }
+    listener->post_notification();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        EXPECT_TRUE(changed.wait_for(lock, std::chrono::seconds(5), [&] { return calls > before; }));
+    }
+    listener->stop_listening();
+}
+
+bool release_notifier_from_its_callback() {
+    ResourceFiles files;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool released = false;
+    auto listener = lattice::make_cross_process_notifier(files.store(0));
+    auto sender = lattice::make_cross_process_notifier(files.store(0));
+    listener->start_listening([&] {
+        listener.reset();
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        changed.notify_all();
+    });
+    if (!listener->is_listening()) return false;
+    sender->post_notification();
+    std::unique_lock<std::mutex> lock(mutex);
+    return changed.wait_for(lock, std::chrono::seconds(5), [&] { return released; });
+}
+
+TEST(LinuxNotifierResources, ACallbackCanReleaseItsLastNotifierOwner) {
+    struct RestoreStyle {
+        std::string prior = GTEST_FLAG_GET(death_test_style);
+        ~RestoreStyle() { GTEST_FLAG_SET(death_test_style, prior); }
+    } restore_style;
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR) _exit(2);
+        sigset_t unblocked;
+        if (sigemptyset(&unblocked) != 0 || sigaddset(&unblocked, SIGALRM) != 0 ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        ::alarm(30);
+        try {
+            if (!release_notifier_from_its_callback() || ::testing::Test::HasFailure()) _exit(3);
+            std::fputs("notifier_callback_release_complete\n", stderr);
+            std::fflush(stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "notifier_callback_release_failure: %s\n", error.what());
+            std::fflush(stderr);
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "notifier_callback_release_complete");
 }
 #endif // Linux resource regression; not Android
 

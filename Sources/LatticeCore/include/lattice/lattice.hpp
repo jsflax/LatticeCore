@@ -125,6 +125,14 @@ struct instance_guard {
 };
 
 class instance_registry {
+    struct notifier_slot {
+        explicit notifier_slot(std::unique_ptr<cross_process_notifier> value)
+            : notifier(std::move(value)) {}
+        std::mutex lifecycle_mutex;
+        bool retired = false;
+        std::unique_ptr<cross_process_notifier> notifier;
+    };
+
 public:
     struct entry {
         lattice_db* ptr;
@@ -141,10 +149,9 @@ public:
     }
 
     void unregister_instance(const std::string& path, lattice_db* db) {
-        // Move the notifier out under the lock, destroy it AFTER releasing —
-        // the notifier destructor joins the inotify thread, which may be
-        // waiting for mutex_ inside for_each_alive → get_entries.
-        std::unique_ptr<cross_process_notifier> notifier_to_destroy;
+        // Retain the removed slot until startup has finished, then retire it.
+        // No registry or slot lock may be held while joining a callback worker.
+        std::shared_ptr<notifier_slot> notifier_to_retire;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = instances_.find(path);
@@ -156,13 +163,19 @@ public:
                     instances_.erase(it);
                     auto nit = shared_notifiers_.find(path);
                     if (nit != shared_notifiers_.end()) {
-                        notifier_to_destroy = std::move(nit->second);
+                        notifier_to_retire = std::move(nit->second);
                         shared_notifiers_.erase(nit);
                     }
                 }
             }
         }
-        // Notifier destroyed here, outside the lock — safe to join its thread.
+        if (notifier_to_retire) {
+            {
+                std::lock_guard<std::mutex> lock(notifier_to_retire->lifecycle_mutex);
+                notifier_to_retire->retired = true;
+            }
+            notifier_to_retire->notifier->stop_listening();
+        }
     }
 
     /// Iterate alive instances for a path with guard protection.
@@ -190,7 +203,7 @@ public:
     }
 
     /// Get or create a shared cross-process notifier for a path.
-    /// Only ONE Darwin listener is registered per path per process,
+    /// Only ONE listener is registered per path per process,
     /// preventing N^2 notification amplification when multiple lattice_db
     /// instances share the same path. The listener distributes to all
     /// instances via for_each_alive.
@@ -253,9 +266,9 @@ private:
 
     std::mutex mutex_;
     std::map<std::string, std::vector<entry>> instances_;
-    /// One Darwin listener per unique DB path — prevents N^2 notification
+    /// One listener per unique DB path — prevents N^2 notification
     /// amplification when multiple lattice_db instances share the same path.
-    std::map<std::string, std::unique_ptr<cross_process_notifier>> shared_notifiers_;
+    std::map<std::string, std::shared_ptr<notifier_slot>> shared_notifiers_;
     /// Per-path shared-cache write gates (see write_gate above).
     std::map<std::string, std::shared_ptr<std::recursive_timed_mutex>> write_gates_;
     /// Per-path WAL eviction thresholds (see the accessors above).

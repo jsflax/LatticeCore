@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>

@@ -27,8 +27,9 @@
   from column metadata. For admitted sources, equal-column and attached-only
   SQL projection is unchanged. The read-only source-form restrictions below
   also apply when the schemas have equal columns.
-- Writable sources retain the 3.0.0 tolerance for an SQLite attachment alias
-  that is already in use. If attachment fails on a later connection, cleanup
+- Explicit attachment of writable sources retains the 3.0.0 tolerance for
+  an SQLite alias that is already in use; connection reopening remains strict.
+  If attachment fails on a later connection, cleanup
   detaches only aliases created by that attempt and preserves existing ones.
 - There is no new storage-format epoch or public API change relative to 3.0.0.
   The one-way storage changes and ordinary-open behavior documented for 3.0.0

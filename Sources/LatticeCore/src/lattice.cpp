@@ -1644,13 +1644,16 @@ std::string read_only_attachment_uri(database& source) {
 // Return whether this call created the alias, so failure cleanup never
 // detaches an alias that was already present on this connection.
 bool attach_database(database& connection, const std::string& alias,
-                     const std::string& target, bool read_only) {
+                     const std::string& target, bool read_only,
+                     bool tolerate_existing = false) {
     try {
         connection.execute("ATTACH DATABASE ? AS " + quoted_attach_alias(alias), {target});
     } catch (const db_error& error) {
-        // Preserve the released duplicate-alias tolerance for writable
-        // sources. Read-only sources must establish their own checked alias.
-        if (!read_only && std::string(error.what()).find("already in use") != std::string::npos)
+        // Explicit writable attach retains the released duplicate-alias
+        // tolerance. Reopening a connection still requires a fresh alias,
+        // and read-only sources must establish their own checked alias.
+        if (tolerate_existing && !read_only &&
+            std::string(error.what()).find("already in use") != std::string::npos)
             return false;
         throw;
     }
@@ -1961,7 +1964,8 @@ void lattice_db::attach(lattice_db &lattice) {
     std::vector<std::shared_ptr<database>> attached_handles;
     try {
         for (const auto& handle : handles) {
-            if (attach_database(*handle, alias, target, read_only_uri.has_value()))
+            if (attach_database(*handle, alias, target, read_only_uri.has_value(),
+                                /*tolerate_existing=*/true))
                 attached_handles.push_back(handle);
         }
     } catch (...) {

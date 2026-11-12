@@ -102,6 +102,38 @@ TEST(Attach, WritableSourceAdoptsAnExistingSQLiteAlias) {
     }
 }
 
+TEST(Attach, WritableReservedAliasToleranceDoesNotExtendToReaderReopen) {
+    TempDB directory{"writable_reserved_alias_dir"};
+    ASSERT_TRUE(std::filesystem::create_directory(directory.path));
+    // The child is destroyed before its directory holder, including on failure.
+    TempDB source_file;
+    source_file.path = directory.path / "main.sqlite";
+    struct RemoveFixtureSignal {
+        std::filesystem::path path;
+        ~RemoveFixtureSignal() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } source_signal{source_file.str() + "-signal"};
+    TempDB main_file{"writable_reserved_alias_receiver"};
+    lattice::lattice_db receiver{lattice::configuration(main_file.str())};
+    lattice::lattice_db source{lattice::configuration(source_file.str())};
+    receiver.add(TestPerson{"main", 1, std::nullopt});
+    source.add(TestPerson{"source", 2, std::nullopt});
+    ASSERT_EQ(quoted_alias_for(source_file), "\"main\"");
+
+    // Explicit writable attach retains the released duplicate-alias tolerance.
+    // Restoring that tracked alias onto a fresh reader never had that tolerance.
+    ASSERT_NO_THROW(receiver.attach(source));
+    receiver.close_read_db();
+    std::string error;
+    try { receiver.reopen_read_db(); }
+    catch (const lattice::db_error& failure) { error = failure.what(); }
+    EXPECT_NE(error.find("database main is already in use"), std::string::npos);
+    EXPECT_EQ(std::get<std::string>(receiver.db().query(
+        "SELECT name FROM main.TestPerson")[0].at("name")), "main");
+}
+
 TEST(Attach, WritableAttachFailureUnwindsOnlyNewAliases) {
     for (bool writer_already_attached : {false, true}) {
         for (bool reader_already_attached : {false, true}) {

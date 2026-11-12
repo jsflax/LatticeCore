@@ -9,10 +9,16 @@ namespace {
 using Rows = std::vector<lattice::database::row_t>;
 
 void seed_legacy_table(const TempDB& file, const std::string& columns,
-                       const std::string& insert) {
+                       const std::string& insert,
+                       const std::string& initial_name = "LegacyItem") {
     lattice::lattice_db owner{lattice::configuration(file.str())};
-    owner.db().execute("CREATE TABLE LegacyItem (" + columns + ")");
+    owner.db().execute("CREATE TABLE " + initial_name + " (" + columns + ")");
     owner.db().execute(insert);
+    if (initial_name != "LegacyItem") {
+        // Missing-identity fixtures use a link-style seed name so the model
+        // update hook does not query their absent id/globalId before attachment.
+        owner.db().execute("ALTER TABLE " + initial_name + " RENAME TO LegacyItem");
+    }
     const auto checkpoint = owner.db().wal_checkpoint(true);
     if (checkpoint.rc != SQLITE_OK || checkpoint.busy != 0)
         throw std::runtime_error("Fixture checkpoint did not finish");
@@ -142,6 +148,8 @@ TEST(LegacyReadOnlyAttachment, ProjectsEachLegacyArmWithoutChangingItsFileOrRows
 
     {
         lattice::lattice_db main{lattice::configuration(main_file.str())};
+        // An ordinary index does not turn an additive nullable column into a key.
+        main.db().execute("CREATE INDEX legacy_optional_note ON LegacyItem(note)");
         auto first_config = lattice::configuration(first_file.str());
         auto second_config = lattice::configuration(second_file.str());
         first_config.read_only = second_config.read_only = true;
@@ -187,15 +195,18 @@ TEST(LegacyReadOnlyAttachment, RejectsUnsafeDifferencesBeforeAnyAttachSideEffect
         bool read_only;
         const char* main_insert = "INSERT INTO LegacyItem(label) VALUES('main')";
         const char* main_index = nullptr;
+        const char* source_seed_name = "LegacyItem";
     };
     const Case cases[] = {
         {"writable subset", "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT,optional TEXT",
             "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT", false},
         {"missing integer primary key", "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT",
-            "globalId TEXT,label TEXT", true},
+            "globalId TEXT,label TEXT", true,
+            "INSERT INTO LegacyItem(label) VALUES('main')", nullptr, "_LegacyItem"},
         {"missing global identity despite default",
             "id INTEGER PRIMARY KEY,globalId TEXT DEFAULT 'generated',label TEXT",
-            "id INTEGER PRIMARY KEY,label TEXT", true},
+            "id INTEGER PRIMARY KEY,label TEXT", true,
+            "INSERT INTO LegacyItem(label) VALUES('main')", nullptr, "_LegacyItem"},
         {"missing named identity despite default",
             "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT,primaryKey TEXT DEFAULT 'generated'",
             "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT", true},
@@ -207,6 +218,16 @@ TEST(LegacyReadOnlyAttachment, RejectsUnsafeDifferencesBeforeAnyAttachSideEffect
             "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT", true,
             "INSERT INTO LegacyItem(label,uniqueValue) VALUES('main','retained')",
             "CREATE UNIQUE INDEX legacy_unique_value ON LegacyItem(uniqueValue)"},
+        {"missing composite unique-index component",
+            "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT,uniqueValue TEXT DEFAULT 'unknown'",
+            "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT", true,
+            "INSERT INTO LegacyItem(label,uniqueValue) VALUES('main','retained')",
+            "CREATE UNIQUE INDEX legacy_unique_pair ON LegacyItem(label,uniqueValue)"},
+        {"unproven expression-key dependency",
+            "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT,uniqueValue TEXT",
+            "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT", true,
+            "INSERT INTO LegacyItem(label,uniqueValue) VALUES('main','retained')",
+            "CREATE UNIQUE INDEX legacy_unique_expression ON LegacyItem(lower(uniqueValue))"},
         {"required column without default",
             "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT,required TEXT NOT NULL",
             "id INTEGER PRIMARY KEY,globalId TEXT,label TEXT", true,
@@ -221,7 +242,9 @@ TEST(LegacyReadOnlyAttachment, RejectsUnsafeDifferencesBeforeAnyAttachSideEffect
         TempDB main_file{"legacy_reject_main"}, source_file{"legacy_reject_source"};
         seed_legacy_table(main_file, item.main_columns, item.main_insert);
         seed_legacy_table(source_file, item.source_columns,
-                          "INSERT INTO LegacyItem(label) VALUES('source')");
+                          "INSERT INTO " + std::string(item.source_seed_name) +
+                              "(label) VALUES('source')",
+                          item.source_seed_name);
         lattice::lattice_db main{lattice::configuration(main_file.str())};
         if (item.main_index) main.db().execute(item.main_index);
         auto config = lattice::configuration(source_file.str());

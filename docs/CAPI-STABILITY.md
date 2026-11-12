@@ -53,8 +53,9 @@ bridge (`LatticeSwiftCppBridge`) and core (`LatticeCore`) headers is
 ## Versioning & introspection
 
 - `lattice_capi_version()` / `lattice_capi_version_string()` — runtime
-  version of the linked library; tracks the LatticeCore release train
-  (`CHANGELOG.md`). Compile-time counterparts:
+  C ABI compatibility version of the linked library, independent of the
+  LatticeCore package version. It remains 1.0.0 in LatticeCore 3.0.0.
+  Compile-time counterparts:
   `LATTICE_CAPI_VERSION[_MAJOR|_MINOR|_PATCH|_STRING]`. The integer encoding
   is `MAJOR*1000000 + MINOR*1000 + PATCH`. Compare header vs runtime to
   detect skew.

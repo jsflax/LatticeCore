@@ -15,6 +15,7 @@ adds download-only sync, a stable sync identity, certificate pinning, strict
 and no-create opens, local metadata and pending-write rescue.
 
 ### Compatibility
+- iOS 15 and 16 remain declared but have not been tested for 3.0.0.
 - **Storage is one-way.** The storage epoch moves from 7 to 9. The first
   ordinary writable open of a store creates or rebuilds `_lattice_sync_outbox`
   in a 12-column shape, creates `_lattice_local_metadata_v1` and
@@ -43,18 +44,24 @@ and no-create opens, local metadata and pending-write rescue.
 - Upgrade and restart every process that shares a store together. A process
   still running an older build cannot write after the cutover, and its sync
   owner expects outbox columns that no longer exist.
-- The first open refuses, and leaves the store as it was, when a 2.5.x
-  filtered outbox cannot be carried over: a channel holds more than 4096
-  receipts or more than 8 MiB, or a receipt is malformed or larger than
-  8 MiB. The error text names the cause. It contains `Sync outbox
-  predecessor` in every case but one: a late budget check reads `Migrated
-  outbox metadata exceeds retained channel budget`. Size and budget refusals
-  name the audit id, wire id and table. The previous version can still open
-  that store. To recover, open the store with the previous version, let each
-  channel deliver its pending receipts, and then upgrade. Receipts of a
-  channel that is no longer configured are not delivered and stay in the
-  outbox. A single 2.5.x receipt over 4 MiB can migrate when its encoded
-  frame and retained metadata remain within their respective 8 MiB limits.
+- The first ordinary writable open refuses when a 2.5.x filtered outbox
+  cannot be carried over: a channel holds more than 4096 receipts or more than 8 MiB, or a
+  receipt is malformed or larger than 8 MiB. The error text names the cause.
+  It contains `Sync outbox predecessor` in every case but one: a late budget
+  check reads `Migrated outbox metadata exceeds retained channel budget`.
+  A channel over the predecessor budget reports
+  `Sync outbox predecessor exceeds retained channel budget`.
+  Size and budget refusals name the audit id, wire id and table.
+  A failed migration rolls back its schema and receipt changes, so the
+  store stays in its previous format. The open may still change the journal
+  mode or checkpoint the file, so the bytes on disk can differ. A store that
+  2.5.1 could open before this refusal can still be opened with 2.5.1.
+  Receipts of a channel that is no longer configured are not delivered and
+  stay in the outbox; they are subject to the same migration checks and
+  budget errors. 3.0.0 provides no recovery call for this refused-upgrade
+  case. A single 2.5.x receipt over 4 MiB can migrate if its encoded frame
+  fits within 8 MiB and its channel passes the 8 MiB retained-byte checks,
+  which count all retained entries and their metadata.
 - **Rebuild everything together.** Rebuild Core, the Swift bridge, the C API
   and every bridge consumer against 3.0.0. `configuration`, `sync_config`,
   `server_sent_event`, `sync_transport`, `generic_sync_transport`,
@@ -150,6 +157,7 @@ and no-create opens, local metadata and pending-write rescue.
   keep kind 0 when sent again. 2.5.1 read them as 32 bits. Both ends of a
   sync pair need this version to exchange larger values intact. Values
   already narrowed by an older reader are not repaired.
+- The C ABI version value remains 1.0.0 in this release.
 - **C API links.** `lattice_object_get_object` now returns NULL when the
   object has no link, and when the link row exists but the linked row is
   gone. It used to return a handle to an empty object. Check for NULL before

@@ -37,7 +37,7 @@ typedef struct lattice_link_list lattice_link_list_t;
 // Versioning & Introspection
 // =============================================================================
 
-// The C ABI version tracks the LatticeCore release train (see CHANGELOG.md).
+// The C ABI compatibility version is independent of the LatticeCore package version.
 // The surface becomes additive-only at 1.0 (see docs/CAPI-STABILITY.md).
 #define LATTICE_CAPI_VERSION_MAJOR 1
 #define LATTICE_CAPI_VERSION_MINOR 0

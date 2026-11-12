@@ -408,7 +408,7 @@ void ipc_server::stop() {
 ipc_endpoint::ipc_endpoint(const std::string& channel,
                            const std::optional<std::string>& socket_path)
     : channel_(channel)
-    , socket_path_(socket_path.value_or(resolve_ipc_socket_path(channel))) {}
+    , socket_path_(socket_path ? *socket_path : resolve_ipc_socket_path(channel)) {}
 
 ipc_endpoint::~ipc_endpoint() {
     stop();

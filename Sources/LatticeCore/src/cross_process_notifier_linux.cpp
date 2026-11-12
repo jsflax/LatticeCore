@@ -26,8 +26,12 @@ namespace {
 struct linux_listener_state : std::enable_shared_from_this<linux_listener_state> {
     explicit linux_listener_state(std::string path) : signal_path(std::move(path)) {}
 
-    bool start_worker(std::function<void()> next_callback) {
+    bool start_worker(std::function<void()> next_callback,
+                      std::function<void()>& retired_callback) {
         std::lock_guard<std::mutex> lock(mutex);
+        // The outer caller releases this function after its lifecycle lock too.
+        // Captured objects may re-enter the notifier from their destructors.
+        retired_callback = std::move(callback);
         callback = std::move(next_callback);
         if (worker.joinable()) return true;
         try {
@@ -40,6 +44,8 @@ struct linux_listener_state : std::enable_shared_from_this<linux_listener_state>
                     auto callback = self->callback;
                     lock.unlock();
                     if (callback) callback();
+                    // The last capture may stop this worker from its destructor.
+                    callback = nullptr;
                     lock.lock();
                 }
             });
@@ -293,15 +299,18 @@ public:
     }
 
     void start_listening(std::function<void()> callback) override {
-        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-        if (state_ && state_->listening.load()) return;
-        // A cached notifier can outlive a removed signal file. Reapply the same
-        // create-if-missing step as a fresh owner before trying its watch again.
-        const int signal = open(signal_path_.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
-        if (signal >= 0) close(signal);
-        if (!state_) state_ = std::make_shared<linux_listener_state>(signal_path_);
-        if (!state_->start_worker(std::move(callback))) return;
-        linux_notification_service::instance().subscribe(state_);
+        std::function<void()> retired_callback;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            if (state_ && state_->listening.load()) return;
+            // A cached notifier can outlive a removed signal file. Reapply the same
+            // create-if-missing step as a fresh owner before trying its watch again.
+            const int signal = open(signal_path_.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+            if (signal >= 0) close(signal);
+            if (!state_) state_ = std::make_shared<linux_listener_state>(signal_path_);
+            if (!state_->start_worker(std::move(callback), retired_callback)) return;
+            linux_notification_service::instance().subscribe(state_);
+        }
     }
 
     void stop_listening() override {

@@ -190,6 +190,8 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/SyncFloorResetTests.cpp
+    Tests/LatticeCoreTests/SyncOversizedRowTests.cpp
     Tests/LatticeCoreTests/StartupSyncRepairTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
@@ -200,6 +202,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
     Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
     Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp
+    Tests/LatticeCoreTests/LocalMetadataTests.cpp
     Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
@@ -210,7 +213,22 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ReaderLifetimeTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/BridgeLinkSnapshotTests.cpp
     Tests/LatticeCoreTests/BridgeCacheConfigurationTests.cpp
+    Tests/LatticeCoreTests/ExistingSchemaAccessTests.cpp
+    Tests/LatticeCoreTests/NoCreateOpenTests.cpp
+    Tests/LatticeCoreTests/MainFileCurrentnessTests.cpp
+    Tests/LatticeCoreTests/SyncOutboxMigrationTests.cpp
+    Tests/LatticeCoreTests/DetachedReadTests.cpp
+    Tests/LatticeCoreTests/FiniteSyncCycleTests.cpp
+    Tests/LatticeCoreTests/ManagedBackgroundSyncTests.cpp
+    Tests/LatticeCoreTests/BackgroundSyncSuspensionCharacterizationTests.cpp
+    Tests/LatticeCoreTests/NoHistoryNullTests.cpp
+    Tests/LatticeCoreTests/FilteredSyncWindowDurabilityTests.cpp
+    Tests/LatticeCoreTests/FilterRemovalGateTests.cpp
+    Tests/LatticeCoreTests/MultiChannelSyncSetTests.cpp
+    Tests/LatticeCoreTests/TransportAuthenticationTests.cpp
+    Tests/LatticeCoreTests/DynamicMigrationTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
@@ -218,7 +236,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
     Tests/LatticeCoreTests/AuditRetentionTests.cpp
     Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditedWritesPreparationTests.cpp
     Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditReadFenceTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
     Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
@@ -234,9 +254,43 @@ target_include_directories(LatticeCoreTests PRIVATE
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
 
+# Focused transaction/receipt qualification without compiling every bridge test.
+add_executable(LatticeLocalMetadataTests Tests/LatticeCoreTests/LocalMetadataTests.cpp)
+target_link_libraries(LatticeLocalMetadataTests PRIVATE LatticeCore gtest_main)
+
+# Audited-writer admission and the suppression/ownership paths it shares.
+add_executable(LatticeAuditedWritesPreparationTests
+    Tests/LatticeCoreTests/AuditedWritesPreparationTests.cpp
+    Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
+    Tests/LatticeCoreTests/AuditHygieneTests.cpp)
+target_link_libraries(LatticeAuditedWritesPreparationTests PRIVATE LatticeCore gtest_main)
+# Focused dynamic-schema migration regressions, with no unrelated model registry.
+add_executable(LatticeDynamicMigrationTests Tests/LatticeCoreTests/DynamicMigrationTests.cpp)
+target_link_libraries(LatticeDynamicMigrationTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
 # Focused no-history transport tests, using synthetic real-Core stores only.
 add_executable(LatticeNoHistoryNullTests Tests/LatticeCoreTests/NoHistoryNullTests.cpp)
 target_link_libraries(LatticeNoHistoryNullTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
+# Focused exact-open and scalar-cursor regressions. TestHelpers requires caller-owned TMPDIR and
+# LATTICE_TEST_LOG_PATH for isolated runs; no full unrelated test suite needs to compile.
+add_executable(LatticeExistingSchemaAccessTests Tests/LatticeCoreTests/ExistingSchemaAccessTests.cpp)
+target_link_libraries(LatticeExistingSchemaAccessTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+# Bounded pending-write rescue and selected audit export; synthetic stores only.
+add_executable(LatticePendingImportTests Tests/LatticeCoreTests/PendingImportTests.cpp)
+target_link_libraries(LatticePendingImportTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
+# Explicit transport authentication defaults and cache identity; synthetic stores only.
+add_executable(LatticeTransportAuthenticationTests Tests/LatticeCoreTests/TransportAuthenticationTests.cpp)
+target_link_libraries(LatticeTransportAuthenticationTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+
+# This exit-order oracle must run as its own process, outside the test runner.
+if(UNIX)
+    add_executable(LatticeCacheExitProbe EXCLUDE_FROM_ALL Tests/Regression/LatticeCacheExitProbe.cpp)
+    target_compile_definitions(LatticeCacheExitProbe PRIVATE SQLITE_CORE)
+    target_link_libraries(LatticeCacheExitProbe PRIVATE LatticeSwiftCppBridge)
+endif()
 
 # Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
 add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
@@ -248,6 +302,8 @@ set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 
 include(GoogleTest)
 gtest_discover_tests(LatticeCoreTests)
+gtest_discover_tests(LatticeExistingSchemaAccessTests TEST_PREFIX "Focused.")
+gtest_discover_tests(LatticePendingImportTests)
 
 # =============================================================================
 # LatticeCAPITests - behavioral tests against the C ABI (links the C surface)

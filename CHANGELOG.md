@@ -1,5 +1,382 @@
 # Changelog
 
+## [3.0.0] - 2026-11-12
+
+This release changes stored data one way. The first writable open of a store
+by 3.0.0 moves it to storage epoch 9 and installs writer guards, even when
+that open then fails in a later step. After that a build with an older core
+cannot write to the store, and neither can a raw SQLite connection. There is
+no downgrade path. Read the Compatibility section before the first open of an
+existing store.
+
+The release also bounds sync uploads by bytes, stops and redials a download
+that could not be applied in full, reads legacy wire integers as 64 bits, and
+adds download-only sync, a stable sync identity, certificate pinning, strict
+and no-create opens, local metadata and pending-write rescue.
+
+### Compatibility
+- iOS 15 and 16 remain declared but have not been tested for 3.0.0.
+- **Storage is one-way.** The storage epoch moves from 7 to 9. The first
+  ordinary writable open of a store creates or rebuilds `_lattice_sync_outbox`
+  in a 12-column shape, creates `_lattice_local_metadata_v1` and
+  `_lattice_applied_receipts` when absent, and installs `BEFORE INSERT`,
+  `BEFORE UPDATE` and `BEFORE DELETE` guard triggers named
+  `_lattice_writer_v9_<table>_<operation>` on every ordinary table in the
+  main database. Tables that Lattice does not manage are included. Virtual
+  tables, shadow tables and `sqlite_*` tables are not.
+- The guards call a SQL function, `lattice_storage_writer_epoch()`, that only
+  a 3.0.0 connection registers. After the cutover a build with an older core
+  cannot insert, update or delete rows in the store, and a raw SQLite
+  connection cannot either. The statement fails with an error that names the
+  missing function, not a version. Expect the ordinary writable open of an
+  older build to fail on a cut-over store too, because that open writes
+  bookkeeping rows. This was read from the source and not run against every
+  older release. There is no downgrade path. The only way back is a copy of
+  the store made before the first open.
+- The cutover commits before the Swift bridge runs its own schema pass and
+  migration callbacks. A writable open that fails after that point has still
+  cut the store over. A failure inside the core pass rolls back, and the
+  store is not cut over.
+- Read-only opens, dynamic (schema-from-file) opens, strict existing-schema
+  opens and attached databases do not cut a store over. The guards are row
+  triggers and do not block DDL. A file copy or SQLite backup of a cut-over
+  store carries them.
+- Upgrade and restart every process that shares a store together. A process
+  still running an older build cannot write after the cutover, and its sync
+  owner expects outbox columns that no longer exist.
+- The first ordinary writable open refuses when a 2.5.x filtered outbox
+  cannot be carried over: a channel holds more than 4096 receipts or more
+  than 8 MiB, or a receipt is malformed or larger than 8 MiB. The error text
+  names the cause.
+  It contains `Sync outbox predecessor` in every case but one: a late budget
+  check reads `Migrated outbox metadata exceeds retained channel budget`.
+  A channel over the predecessor budget reports
+  `Sync outbox predecessor exceeds retained channel budget`.
+  Size and budget refusals name the audit id, wire id and table.
+  A failed migration rolls back its schema and receipt changes, so the
+  store stays in its previous format. The open may still change the journal
+  mode or checkpoint the file, so the bytes on disk can differ. A store that
+  2.5.1 could open before this refusal can still be opened with 2.5.1.
+  For still-configured channels whose valid pending receipts exceed these
+  limits, open the store with 2.5.1, let those receipts be delivered and
+  acknowledged, and then retry the upgrade. Receipts of a channel that is
+  no longer configured cannot be delivered that way and stay in the outbox;
+  they are subject to the same migration checks and budget errors. 3.0.0
+  provides no recovery call for them. A single 2.5.x receipt over 4 MiB can
+  migrate if its encoded frame fits within 8 MiB and its channel passes the
+  8 MiB retained-byte checks, which count all retained entries and their
+  metadata.
+- **Rebuild everything together.** Rebuild Core, the Swift bridge, the C API
+  and every bridge consumer against 3.0.0. `configuration`, `sync_config`,
+  `server_sent_event`, `sync_transport`, `generic_sync_transport`,
+  `std_thread_scheduler` and the synchronizer changed layout. No C ABI symbol
+  was added or removed. `lattice_schema_format_epoch()` now returns 9.
+- Source changes for C++ consumers: `sync_config` has a new first member, so
+  positional aggregate initialization breaks. `sync_transport` has a new
+  virtual `configure_certificate_pin` with a default. The enum
+  `server_sent_event::type` has a new `floor_reset` case, and
+  `database::open_mode` has a new `read_write_existing` case.
+  `instance_guard::tls_depths()` is replaced by `tls_frames()`. The protected
+  `synchronizer_base` helpers `classify_delete`, `classify_insert_or_update`,
+  `ensure_sync_outbox`, `stage_sync_delivery`, `query_sync_outbox`,
+  `sync_outbox_sources` and `acknowledge_sync_outbox` are removed. `count`,
+  `query_rows`, `query_union_rows`, `query_audit_log_for_sync` and the
+  `database` constructors gained trailing defaulted parameters.
+- **Wire format.** The frames this version sends use the same kinds and keys
+  as 2.5.1, and there is no version negotiation. A 3.0.0 peer and a 2.5.x
+  peer or relay can still exchange rows, within the integer, row size and
+  schema notes in this section.
+- **Row size limit.** Sync uploads are now bounded by bytes. 2.5.1 had no
+  byte limit. An ordinary frame holds at most 4 MiB of encoded audit JSON,
+  and at most 8 MiB may be unacknowledged at a time. On an unfiltered
+  channel, a row larger than an ordinary batch is sent alone when the
+  encoded entry plus its singleton frame envelope fits within 8 MiB.
+  An entry that exceeds that combined limit is refused. The row is not
+  sent, it stays pending, and the rows behind it on that channel wait.
+  Rows ahead of it are still sent.
+- The sync error handler receives one of two texts for a refused row. When
+  the stored audit record is over 8 MiB the text is `Sync audit row
+  <globalId> (id <id>) in table <table> exceeds materialized byte limit`.
+  This check runs first. When only the encoded row with its envelope is over
+  8 MiB the text is `Sync audit row <globalId> (id <id>) in table <table>
+  exceeds encoded byte limit (8 MiB)`. Filtered channels have further texts.
+  Every text names the table. Match on the table and the row id, not on the
+  whole sentence.
+- BLOB columns travel as hex, so 8 MiB encoded is about 4 MiB of raw BLOB
+  data. Filtered channels must also fit the durable receipt within 8 MiB: its
+  encoded entry, source and wire identifiers, table and row identifiers,
+  routing key, and fixed metadata charge all count. Their largest admitted
+  entry therefore depends on those values and can be smaller than the
+  unfiltered singleton limit. These bounds apply to what the core sends
+  over WebSocket and IPC and to the receipts it stores.
+- The core does not check the size of the rows it receives. A row over 8 MiB
+  that an older peer or a relay sends is applied. A store that forwards
+  received rows to another channel then meets the send limit on that channel,
+  and that channel waits behind the row.
+- On a filtered channel a filtered model may have at most 128 relationship
+  tables (link and list tables), and table names and row ids over 4096 bytes
+  are refused. The sync error handler receives `Sync parent exceeds 128
+  relationship-table limit` or a text that ends `exceeds byte limit`. 2.5.1
+  had no such limits.
+- **Receive recovery.** When a download frame cannot be applied in full, a
+  continuous WebSocket channel now stops receiving on that connection,
+  reports the error and redials from the committed checkpoint. The checkpoint
+  is the last entry of the contiguous applied prefix. Frames already queued
+  on the old connection are dropped. The sync error handler receives exactly
+  `Download incomplete: applied N of M entries; reconnecting from the
+  committed checkpoint.` with the two counts filled in. 2.5.1 logged a
+  warning and kept receiving.
+- A frame that cannot be parsed takes the same path, with the text `Download
+  incomplete: failed to parse server message: <detail>; reconnecting from the
+  committed checkpoint.` This includes a frame kind this version does not
+  know. 2.5.1 reported `Failed to parse server message: <detail>` and kept
+  the connection. Update code that matches sync error text.
+- An exception while a download frame is handled or applied, for example a
+  storage error, takes the same path. The text is `Download incomplete:
+  <detail>` with the same ending. 2.5.1 reported `WebSocket message handling
+  failed: <detail>` for errors on the transport thread. Errors raised while a
+  frame was applied were only logged by the default scheduler.
+- On a channel with no WebSocket URL (IPC, or a transport injected without a
+  URL) the same failures end with `; waiting for sender retry.` and do not
+  redial. In a finite sync cycle the cycle fails and the handler receives the
+  cause with no suffix. One finite case keeps the 2.5.1 text: a frame that
+  cannot be parsed after the cycle received its catch-up marker is reported
+  as `Failed to parse server message: <detail>` and does not fail the cycle.
+- Browser (Emscripten) builds do not redial on their own. After one of these
+  download failures the channel stays stopped until the application
+  reconnects it.
+- A custom `sync_transport` must accept `connect()` while its previous
+  connection is still open. The redial does not call `disconnect()` first.
+- **Relay refusals.** A relay frame `{"rejected": "<reason>"}` is now
+  reported as its own error, `Sync upload rejected: <reason>`, through the
+  sync error handler, the bridge receive error and the C API last error. It
+  acknowledges nothing, does not move the checkpoint and does not restart the
+  download. It fails a finite cycle. 2.5.1 treated it as an unparsable frame.
+- **`floorReset` frames** are accepted as information only. They change no
+  rows, checkpoint, upload state or finite-cycle state, and the error handler
+  no longer fires for them. `floorReason` is required and must be a string.
+  The bridge and C API receive calls return no ids and no error for one. A
+  `floorReset` or `floorReason` key on any other frame is refused.
+- **Legacy integers.** Integers on wire kind 0 are now read as 64 bits and
+  keep kind 0 when sent again. 2.5.1 read them as 32 bits. Both ends of a
+  sync pair need this version to exchange larger values intact. Values
+  already narrowed by an older reader are not repaired.
+- The C ABI version value remains 1.0.0 in this release.
+- **C API links.** `lattice_object_get_object` now returns NULL when the
+  object has no link, and when the link row exists but the linked row is
+  gone. It used to return a handle to an empty object. Check for NULL before
+  using the result: `lattice_object_get_table_name` and
+  `lattice_object_to_json` return NULL for a NULL object, and passing NULL to
+  `lattice_object_set_object` clears the destination link.
+  `lattice_object_has_value` can be true while the getter returns NULL,
+  because it tests the link row only.
+- `lattice_object_get_link_list` on an unmanaged object now returns an empty
+  list when no list is staged for the field. It used to return NULL. That
+  list is not attached to the object, so appends to it are not kept.
+- **No-create opens.** With `configuration::create_if_missing` set to false,
+  a writable open of a missing file fails with the ordinary open error and
+  creates no database file. An existing file is opened and migrated as usual.
+  The dedicated sync connection, IPC writer connections and writer reopens
+  inherit the flag. The flag is part of the bridge cache key. A cached handle
+  is returned without checking the file again.
+- Bridge opens that differ in upload mode, certificate pin, sync identity,
+  authentication mode or file-creation policy no longer share a cached
+  handle.
+- `reset_sync_state` and `remove_sync_channel_state` now throw when the
+  channel still has a live synchronizer in this process or when called
+  inside a transaction. They also throw when the core cannot confirm that
+  the open main file is still the file at its path, for example after the
+  file was replaced or on a VFS without the moved-file check. A synchronizer
+  refuses to start on a file store whose main file was moved or replaced.
+  The error text is `Cannot establish unchanged admitted sync store
+  identity`. `reset_sync_state` also throws when the channel has durable
+  filtered state; use `reset_filtered_peer_snapshot` there. The bridge call
+  `remove_sync_channel_state` keeps its signature and does not throw. A
+  refusal is recorded in the bridge error slot, and
+  `remove_sync_channel_state_checked` also returns false for it.
+- Pending filtered receipts hold back audit pruning until they are
+  acknowledged or their channel is retired. `force_compact_audit_log`
+  refuses while any receipt is pending. Through the bridge it returns 0 and
+  sets the error slot.
+- Receive accepts an underscore-prefixed table only when it is a registered
+  model, a link table, a registered union table or a registered geo-bounds
+  list table. Other such entries are refused and are not acknowledged.
+  Ordinary receive writes `Unrecognized internal table in sync entry` to the
+  log and skips the entry. A geo-bounds list property must exist in every
+  peer's schema before its rows will drain.
+- **Schema skew.** A peer that receives a row of a union table or a
+  geo-bounds list table that its own schema does not have refuses the row.
+  On a WebSocket channel that refusal now stops the download and redials on
+  every attempt, so the channel stalls until the peer's schema has the
+  property. The sync error handler receives the `Download incomplete:
+  applied N of M entries` text. 2.5.1 skipped the row and kept receiving.
+  Rows of an unknown model table and unknown columns are still acknowledged
+  and skipped, as before. Ship a schema that adds a union or geo-bounds list
+  property to every peer before any peer writes such rows.
+
+### Added
+- Add `configuration::create_if_missing` (default true) and the matching
+  `database` constructor parameter. False omits file creation only.
+- Add `configuration::required_existing_schema_version` and
+  `open_mode::read_write_existing` for strict opens of an existing file. A
+  strict open requires the exact stored schema version and the schema
+  structure recorded by an ordinary 3.0.0 open. It performs no creation,
+  migration, repair or automatic maintenance, owns no sync transport and is
+  never served from the bridge cache.
+- Add `configuration::uploads_enabled`. False gives a download-only channel:
+  local writes stay local, downloads are applied and acknowledged, and
+  pending uploads are kept for a later owner.
+- Add `configuration::websocket_sync_identity`, a stable identity for one
+  logical WebSocket peer. The durable outbox, checkpoint, replication slot
+  and owner registry follow it when the dial URL changes. It is limited to
+  4092 bytes without NUL.
+- Add `configuration::pinned_server_certificate_sha256`,
+  `sync_transport::configure_certificate_pin` and
+  `generic_sync_transport::set_certificate_pin_callback`. A nonempty pin
+  needs a `wss://` URL and a transport that enforces it. Otherwise the
+  connection fails and does not retry. The error text is `This transport
+  cannot enforce the configured server certificate pin.`
+- Add `sync_authentication::transport_managed` and
+  `configuration::sync_authentication_mode`. In this mode sync is enabled
+  without a bearer token, and no Authorization header is sent for an empty
+  token. Bearer-token mode stays the default.
+- Add `main_file_path()` on `database`, `lattice_db` and the bridge
+  (`mainFilePath()`). It returns the file name SQLite holds for the primary
+  connection. Add `require_main_file_unmoved()`, exposed to Swift as
+  `requireMainFileUnmoved(_:)`, a checked probe that the open main file
+  still matches a path.
+- Add `sync_max_encoded_message_bytes` (4 MiB), `sync_max_encoded_row_bytes`
+  (8 MiB), their bridge accessors and `encode_audit_log_prefix`.
+- Add `apply_pending_changes` to rescue copied, unacknowledged audit entries
+  from a retired replica into its replacement. Each distinct input id is
+  reported as imported, already present or rejected, and the source store is
+  not changed. Add `query_audit_log_selected` for a bounded export of exact
+  audit identities that keeps 64-bit integers intact.
+- Add opt-in immutable receive: `apply_remote_changes_immutable`,
+  `mark_audit_entries_synced_authorized`,
+  `server_sent_event::from_json_immutable`, and the bridge calls
+  `receive_sync_data_immutable` and `receive_sync_data_authorized`, which
+  return ids and error per call. Named model tables accept complete INSERT
+  snapshots and identical replays only. The whole frame applies or rolls
+  back, and an optional authorization callback is checked before commit.
+- Add `local_metadata` and `insert_local_metadata_if_absent`: namespaced
+  write-once values stored in the database file and never synchronized.
+  Insertion requires the caller's open write transaction. Remote entries
+  that name this storage are refused.
+- Add `prepare_for_audited_writes`, which validates the sync control table
+  and clears a leftover disabled flag in one owned transaction.
+- Add `read_audit_cursor` and `read_audit_read_fence` (`auditCursor()`,
+  `auditReadFence()`), scalar snapshots of the audit head, floor and history
+  generation. Add the bounded `detached_read::by_ids` and
+  `detached_read::by_indexed_uuid` helpers, which return selected columns
+  together with such a fence.
+- Add `append_current_snapshots`, `ensure_current_history`,
+  `current_identity_snapshot` and `has_applied_sync_event` for publishing and
+  checking the history of an authoritative store.
+- Add `reset_filtered_peer_snapshot` for a fresh peer of a filtered channel
+  and the bridge call `remove_sync_channel_state_checked`.
+- Run the generic migration block for dynamic, bridge-supplied schemas. It
+  is called once per open that detects column changes, inside the schema
+  transaction. Add `migration_context::queue_row_value` and
+  `dynamic_object::get_property_descriptor`.
+- Add `synchronizer::create_owned`, `server_sent_event::type::floor_reset`
+  with its head and reason fields, `lattice_db::query_read_checked`, and
+  `swift_configuration` setters for the sync identity, certificate pin and
+  upload mode.
+
+### Changed
+- Bound upload frames and the in-flight window by encoded bytes as well as
+  by event count, and send an admitted row larger than one batch alone.
+- Keep filtered deliveries as durable receipts with their exact wire bytes.
+  Filter membership now commits together with the acknowledgement.
+- Stop a continuous WebSocket download after a partial apply or an invalid
+  frame and redial from the committed checkpoint. Report the same failures
+  on IPC channels and in finite cycles.
+- Accept `floorReset` and `rejected` relay frames.
+- Key sync ownership, the durable channel id and the checkpoint by the
+  effective sync identity instead of the dial URL alone.
+- Answer a replay request on a filtered channel with a new snapshot cohort
+  under new event identities instead of rewinding the channel's history.
+- Write REAL values to audit JSON with 17 significant digits. Existing
+  stores refresh their audit triggers on the next writable open.
+- Keep the bridge handle cache alive through process exit. Leak checkers
+  will report it.
+- Abort the migration transaction when a queued row update fails. It used to
+  be logged and skipped. The bridge `enumerateObjects` callback no longer
+  queues unchanged rows for rewrite.
+- Report a closed store through the bridge error slot for object, union and
+  count reads. `count(table)` no longer throws into Swift.
+- `configuration::is_sync_enabled()` is now true for a transport-managed
+  endpoint without a token.
+
+### Fixed
+- Read wire kind 0 integers as 64 bits and keep their kind when they are
+  sent again.
+- Resolve a to-one link once and return an empty object when its target row
+  is gone. The old code read the target twice and could dereference null.
+- Return default values for scalar reads on an empty unmanaged object, and
+  an empty list for a list that was never staged, instead of dereferencing
+  null or throwing.
+- Copy a staged link when an unmanaged object is read. A read used to move
+  the fields out of the shared target and leave it empty.
+- Do not seed an empty checkpoint from later rows of a partial delivery, and
+  keep an observer's replication slot across an explicit disconnect while a
+  download failure is outstanding.
+- Schedule one reconnect when a transport reports both an error and a close
+  for the same attempt.
+- Keep a synchronizer and its dedicated database alive until admitted
+  callbacks return. A callback may replace its handler or close its store.
+- Keep registry callback guards valid when a thread exits and releases a
+  store after C++ thread-local destructors have run.
+- Let `std_thread_scheduler` shut down from its own worker without losing
+  its loop state, and make an outside shutdown wait for the loop to exit.
+- Quote SQL identifiers when applying remote entries and when regenerating
+  history, so union tables with a `case` column replay correctly.
+- Stop counting list properties as columns of the model table when schema
+  changes are detected.
+- Release the migration context and clear migration thread state when a
+  migration callback throws.
+- Seal the lower-level bridge call `remove_sync_channel_state` as well. A
+  failure there is now recorded in the bridge error slot instead of escaping
+  as a native exception.
+
+### Known limits
+- A download entry that fails on every attempt stalls its WebSocket channel.
+  Redials are unbounded by default and back off up to 60 seconds. Set
+  `max_reconnect_attempts` to bound them. Entries after the failed one in the
+  same frame may be applied and acknowledged before the redial. They are
+  delivered again and recognized as already applied.
+- While a download keeps failing on a channel that also uploads, each redial
+  sends unacknowledged uploads again, and acknowledgements that arrive after
+  receiving stopped are dropped. Uploads are not lost, but a large row is
+  sent on every attempt.
+- An observer or download-only channel keeps its replication slot across an
+  explicit disconnect only while a download failure is known in memory. A
+  later complete apply or a process restart clears that state. A disconnect
+  at the wrong moment can still evict the slot and resume from the newest
+  remote row.
+- An upload that a relay refuses stays pending and is sent again on the
+  acknowledgement watchdog's backoff, 10 seconds doubling to 5 minutes. The
+  core does not drop it.
+- A row over the 8 MiB limit holds back the rows behind it on its channel.
+  The core does not skip it. Every refusal names the table. On filtered
+  channels some refusals name a generated event id or an empty id instead of
+  a stored audit id.
+- The bridge returns an empty unmanaged object for a to-one link whose
+  target row is missing. Typed consumers must treat it as no link. A link
+  read is not one snapshot: a concurrent unlink or delete can make a link
+  that was present read as absent.
+- Immutable receive protects only the model tables it is given. Link rows
+  and geo-bounds list rows that belong to such a model follow ordinary rules.
+- With `create_if_missing` false, sync and IPC lock files are still created,
+  and a refused IPC writer open is logged without reaching the sync error
+  handler.
+- A writable open at a path whose file was replaced is unsupported.
+  `main_file_path()` returns a name, not a check that it is still the same
+  file. Do not replace, rename or delete a store's main file
+  while a handle on it is open. Close every handle and move the `-wal` and
+  `-shm` files with the main file.
+
 ## [2.5.1] - 2026-11-02
 
 ### Fixed

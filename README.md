@@ -51,7 +51,7 @@ Sources/
 This package is consumed as a dependency by the [Lattice](https://github.com/jsflax/lattice) Swift ORM. Add it to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/jsflax/LatticeCore.git", from: "0.6.0")
+.package(url: "https://github.com/jsflax/LatticeCore.git", from: "3.0.0")
 ```
 
 ## License

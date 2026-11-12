@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include <set>
 
 // ============================================================================
 // A4 — narrowing must never delete beyond its own bookkeeping
@@ -32,6 +33,23 @@ int64_t scalar(lattice::lattice_db& db, const std::string& sql) {
     if (rows.empty()) return -1;
     auto& val = rows[0].begin()->second;
     return std::holds_alternative<int64_t>(val) ? std::get<int64_t>(val) : -1;
+}
+
+// Membership represents acknowledged delivery. Match actual emitted IDs rather than inventing
+// state or weakening the narrowing expectations below.
+void acknowledge_filtered_rows(lattice::mock_sync_transport& transport) {
+    std::set<std::string> seen;
+    for(int pass=0;pass<8;++pass) {
+        std::vector<std::string> ids;
+        for(const auto& message:transport.get_sent_messages()) {
+            const auto event=lattice::server_sent_event::from_json(message.as_string());
+            if(event && event->event_type==lattice::server_sent_event::type::audit_log)
+                for(const auto& row:event->audit_logs) if(seen.insert(row.global_id).second) ids.push_back(row.global_id);
+        }
+        if(ids.empty()) return;
+        transport.simulate_message(lattice::transport_message::from_string(lattice::server_sent_event::make_ack(ids).to_json()));
+    }
+    FAIL()<<"filtered fixture did not drain its emitted rows";
 }
 
 } // namespace
@@ -96,6 +114,9 @@ TEST(FilterRemovalGate, BookkeepingOnlyNarrowingEmitsNoDeletes) {
     sync.connect();
     sync.sync_now();
 
+    EXPECT_EQ(scalar(reader,
+        "SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id = 'group-chan'"), 0);
+    acknowledge_filtered_rows(*ws);
     ASSERT_EQ(scalar(reader,
         "SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id = 'group-chan'"), 1)
         << "precondition: the row entered the channel's sync set";
@@ -140,6 +161,9 @@ TEST(FilterRemovalGate, DefaultNarrowingStillEmitsRemovals) {
     lattice::synchronizer sync(std::move(db), cfg);
     sync.connect();
     sync.sync_now();
+    EXPECT_EQ(scalar(reader,"SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id = 'personal-chan'"),0);
+    acknowledge_filtered_rows(*mock_factory->last_websocket());
+    ASSERT_EQ(scalar(reader,"SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id = 'personal-chan'"),1);
     sync.update_sync_filter({{"TestPerson", std::string("name = 'NOTHING'")}});
 
     EXPECT_EQ(scalar(reader,

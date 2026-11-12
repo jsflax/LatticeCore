@@ -3,6 +3,7 @@
 
 #include "lattice/lattice.hpp"
 #include "lattice/ipc.hpp"
+#include <nlohmann/json.hpp>
 #include <cstdlib>
 #include <set>
 #include <unordered_set>
@@ -11,6 +12,345 @@
 #include <unistd.h>
 
 namespace lattice {
+
+namespace {
+constexpr const char* current_history_tables_sql =
+    "SELECT name FROM sqlite_master WHERE type='table' "
+    "AND name NOT LIKE 'sqlite_%' "
+    "AND name NOT IN ('AuditLog', '_SyncControl') "
+    "AND name NOT LIKE '\\_lattice\\_%' ESCAPE '\\' "
+    "AND name NOT LIKE '%_vec0' AND name NOT LIKE '%_rtree%' "
+    "AND name NOT LIKE '%\\_fts' ESCAPE '\\' "
+    "AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' "
+    "AND name NOT LIKE '%\\_old' ESCAPE '\\' ORDER BY name";
+
+std::string history_quote(const std::string& value, char delimiter) {
+    std::string result(1, delimiter);
+    for (char c : value) { result += c; if (c == delimiter) result += c; }
+    return result + delimiter;
+}
+} // namespace
+
+bool lattice_db::has_applied_sync_event(const std::string& global_id) {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("Applied-event lookup requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("Applied-event lookup requires a checked transaction on this thread");
+    if (global_id.empty()) return false;
+    auto& reader = *db_;
+    // Metadata probes choose only constant internal table/column names. The
+    // final single SELECT reads the caller's checked snapshot. In particular,
+    // never inspect a sync writer's uncommitted receipt on another thread.
+    // No DDL, model mutation, receipt insertion, or cursor update occurs here.
+    std::string sql = "SELECT 1 FROM AuditLog WHERE globalId = ?1";
+    const bool receipts_exist = !reader.query(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_lattice_applied_receipts'").empty();
+    if (receipts_exist) sql +=
+        " UNION ALL SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1";
+
+    // Receipt retention can remove an old receipt. Only equality with an
+    // actually persisted channel cursor is evidence for that exact event.
+    // A newer UUID, timestamp, local audit id, or cursor ordering is not proof.
+    for (const auto& row : reader.query("PRAGMA table_info(_lattice_replication_slots)")) {
+        auto name = row.find("name");
+        if (name != row.end() && std::holds_alternative<std::string>(name->second) &&
+            std::get<std::string>(name->second) == "last_received_event_id") {
+            sql += " UNION ALL SELECT 1 FROM _lattice_replication_slots WHERE last_received_event_id = ?1";
+            break;
+        }
+    }
+    sql += " LIMIT 1";
+    return !reader.query(sql, {global_id}).empty();
+}
+
+std::string lattice_db::current_identity_snapshot() {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("Identity snapshot requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("Identity snapshot requires a checked transaction");
+    auto result = nlohmann::json::object();
+    result["models"] = nlohmann::json::object();
+    result["links"] = nlohmann::json::object();
+    for (const auto& table_row : db_->query(current_history_tables_sql)) {
+        const auto table = std::get<std::string>(table_row.at("name"));
+        const auto identifier = history_quote(table, '"');
+        const auto columns = db_->query("PRAGMA table_info(" + identifier + ")");
+        bool has_id = false, has_global = false, has_lhs = false, has_rhs = false, has_rhs_type = false;
+        for (const auto& column : columns) {
+            const auto& name = std::get<std::string>(column.at("name"));
+            has_id |= name == "id"; has_global |= name == "globalId";
+            has_lhs |= name == "lhs"; has_rhs |= name == "rhs"; has_rhs_type |= name == "rhs_type";
+        }
+        const bool link = has_lhs && has_rhs && has_global && !has_id;
+        if (!link && !(has_id && has_global)) continue;
+        auto identities = nlohmann::json::array();
+        const auto rows = db_->query("SELECT lower(globalId) AS globalId" +
+            std::string(link ? ",lower(lhs) AS lhs,lower(rhs) AS rhs," + std::string(has_rhs_type ? "rhs_type" : "NULL AS rhs_type") : "") +
+            " FROM " + identifier + " ORDER BY globalId COLLATE NOCASE");
+        auto string_value = [](const auto& row, const char* key) -> std::string {
+            auto found = row.find(key);
+            if (found == row.end() || !std::holds_alternative<std::string>(found->second) || std::get<std::string>(found->second).empty())
+                throw std::runtime_error("Invalid row identity in bootstrap snapshot");
+            return std::get<std::string>(found->second);
+        };
+        for (const auto& row : rows) {
+            const auto global = string_value(row, "globalId");
+            if (link) {
+                auto identity = nlohmann::json::array({global, string_value(row, "lhs"), string_value(row, "rhs")});
+                identity.push_back(has_rhs_type ? nlohmann::json(string_value(row, "rhs_type")) : nlohmann::json(nullptr));
+                identities.push_back(std::move(identity));
+            } else identities.push_back(global);
+        }
+        result[link ? "links" : "models"][table] = std::move(identities);
+    }
+    return result.dump();
+}
+
+int64_t lattice_db::ensure_current_history() {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("History publication requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("History publication requires a checked write transaction");
+
+    // Match generate_history's model/link classification, but never batch-commit
+    // or change sync state: this entire repair belongs to the caller's transaction.
+    const auto tables = db_->query(current_history_tables_sql);
+    // One transient index bounds the per-row baseline lookup. Do not drop an
+    // index owned by a caller, and let rollback remove our DDL on any failure.
+    const bool existing_index = !db_->query(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_lattice_current_history_baseline'").empty();
+    if (!existing_index) db_->execute(
+        "CREATE INDEX idx_lattice_current_history_baseline ON AuditLog(tableName,globalRowId,operation)");
+    int64_t count = 0;
+    for (const auto& table_row : tables) {
+        const auto table = std::get<std::string>(table_row.at("name"));
+        const auto identifier = history_quote(table, '"');
+        const auto columns = db_->query("PRAGMA table_info(" + identifier + ")");
+        bool has_id = false, has_global = false, has_lhs = false, has_rhs = false, has_rhs_type = false;
+        for (const auto& column : columns) {
+            const auto& name = std::get<std::string>(column.at("name"));
+            has_id |= name == "id"; has_global |= name == "globalId";
+            has_lhs |= name == "lhs"; has_rhs |= name == "rhs"; has_rhs_type |= name == "rhs_type";
+        }
+        const bool link = has_lhs && has_rhs && has_global && !has_id;
+        if (!link && !(has_id && has_global)) continue;
+
+        std::string fields, names;
+        for (const auto& column : columns) {
+            const auto name = std::get<std::string>(column.at("name"));
+            if (name == "id" || name == "globalId") continue;
+            if (link && name != "lhs" && name != "rhs" && !(has_rhs_type && name == "rhs_type")) continue;
+            const auto value = "t." + history_quote(name, '"');
+            const auto type = std::get<std::string>(column.at("type"));
+            if (!fields.empty()) { fields += ","; names += ","; }
+            names += history_quote(name, '\'');
+            fields += history_quote(name, '\'') + ",";
+            // Same flat payload as live audit triggers. REAL JSON must retain
+            // all bits, and optional BLOBs must remain NULL (hex(NULL) is '').
+            if (type == "BLOB") fields += "CASE WHEN " + value + " IS NULL THEN NULL ELSE hex(" + value + ") END";
+            else if (type == "REAL") fields += "CASE WHEN " + value + " IS NULL THEN NULL ELSE json(printf('%!.17g'," + value + ")) END";
+            else fields += value;
+        }
+        db_->execute(
+            "INSERT INTO AuditLog(tableName,operation,rowId,globalRowId,changedFields,changedFieldsNames,"
+            "timestamp,isFromRemote,isSynchronized,synthesized) "
+            "SELECT ?,'INSERT'," + std::string(link ? "0" : "t.id") + ",t.globalId,json_object(" + fields + "),json_array(" + names + "),"
+            "unixepoch('subsec'),0,0,0 FROM " + identifier + " t WHERE NOT EXISTS ("
+            "SELECT 1 FROM AuditLog a WHERE a.tableName=? AND a.globalRowId=t.globalId AND a.operation='INSERT') "
+            "ORDER BY " + std::string(link ? "t.rowid" : "t.id"), {table, table});
+        count += sqlite3_changes(db_->handle());
+    }
+    if (!existing_index) db_->execute("DROP INDEX idx_lattice_current_history_baseline");
+    return count;
+}
+
+int64_t lattice_db::append_current_snapshots(const std::vector<std::string>& tables, const std::string& snapshot_key) {
+    if (closed_.load(std::memory_order_acquire))
+        throw std::runtime_error("Snapshot publication requires an open database");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction())
+        throw std::runtime_error("Snapshot publication requires the owning checked write transaction");
+    if (snapshot_key.empty() || snapshot_key.size() > 256) throw std::runtime_error("Invalid snapshot publication key");
+    const auto key = "authoritative_snapshot:" + snapshot_key;
+    if (!db_->query("SELECT value FROM _lattice_meta WHERE key = ?", {key}).empty()) return 0;
+    int64_t count = 0;
+    std::set<std::string> seen;
+    for (const auto& table : tables) {
+        if (!seen.insert(table).second) continue;
+        if (table.empty() || table.front() == '_' || table == "AuditLog" ||
+            table.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+            throw std::runtime_error("Invalid model snapshot table");
+        for (const auto& row : db_->query("SELECT * FROM \"" + table + "\" ORDER BY id")) {
+            auto id = row.find("id"), global = row.find("globalId");
+            if (id == row.end() || global == row.end() || !std::holds_alternative<int64_t>(id->second) ||
+                !std::holds_alternative<std::string>(global->second)) throw std::runtime_error("Snapshot requires a model table");
+            audit_log_entry entry;
+            for (const auto& [name, value] : row) {
+                if (name == "id" || name == "globalId") continue;
+                entry.changed_fields[name] = any_property::from_column_value(value);
+                entry.changed_fields_names.push_back(name);
+            }
+            // Match live trigger JSON: raw scalars and hex BLOB strings. This
+            // preserves exact numbers without introducing the typed DATA
+            // wire format, whose Swift Codable representation is different.
+            auto typed = nlohmann::json::parse(entry.changed_fields_to_json());
+            auto fields = nlohmann::json::object();
+            for (const auto& item : typed.items()) fields[item.key()] = item.value().at("value");
+            db_->execute("INSERT INTO AuditLog (tableName,operation,rowId,globalRowId,changedFields,changedFieldsNames,timestamp,isFromRemote,isSynchronized,synthesized) VALUES (?,'INSERT',?,?,?,?,unixepoch('subsec'),0,0,0)",
+                {table, std::get<int64_t>(id->second), std::get<std::string>(global->second), fields.dump(), entry.changed_fields_names_to_json()});
+            ++count;
+        }
+    }
+    db_->execute("INSERT INTO _lattice_meta(key,value) VALUES(?,?)", {key, std::to_string(count)});
+    return count;
+}
+
+
+namespace {
+bool valid_local_metadata_utf8(const std::string& text) {
+    size_t index = 0;
+    while (index < text.size()) {
+        const auto first = static_cast<unsigned char>(text[index++]);
+        if (first <= 0x7f) continue;
+        size_t trailing = 0;
+        unsigned char second_min = 0x80, second_max = 0xbf;
+        if (first >= 0xc2 && first <= 0xdf) trailing = 1;
+        else if (first >= 0xe0 && first <= 0xef) {
+            trailing = 2;
+            if (first == 0xe0) second_min = 0xa0;  // no overlong forms
+            if (first == 0xed) second_max = 0x9f;  // no UTF-16 surrogates
+        } else if (first >= 0xf0 && first <= 0xf4) {
+            trailing = 3;
+            if (first == 0xf0) second_min = 0x90;
+            if (first == 0xf4) second_max = 0x8f;  // at most U+10FFFF
+        } else return false;
+        if (text.size() - index < trailing) return false;
+        const auto second = static_cast<unsigned char>(text[index]);
+        if (second < second_min || second > second_max) return false;
+        for (size_t offset = 1; offset < trailing; ++offset) {
+            const auto next = static_cast<unsigned char>(text[index + offset]);
+            if (next < 0x80 || next > 0xbf) return false;
+        }
+        index += trailing;
+    }
+    return true;
+}
+
+void validate_local_metadata_key(const std::string& name_space, const std::string& key) {
+    // Fixed SQL identifiers; both inputs are bound values, never SQL syntax.
+    // Namespaces deliberately exclude Lattice's own reserved prefix.
+    if (name_space.empty() || name_space.size() > 64 ||
+        name_space.front() < 'a' || name_space.front() > 'z' ||
+        name_space.rfind("lattice.", 0) == 0 ||
+        !std::all_of(name_space.begin(), name_space.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-';
+        }) || key.empty() || key.size() > 512 || key.find('\0') != std::string::npos ||
+        !valid_local_metadata_utf8(key)) {
+        throw db_error("Invalid local metadata namespace or key");
+    }
+}
+}
+
+std::optional<std::string> lattice_db::local_metadata(const std::string& name_space,
+                                                      const std::string& key) {
+    validate_local_metadata_key(name_space, key);
+    const auto tables = query_read(
+        "SELECT type FROM main.sqlite_master WHERE name = '_lattice_local_metadata_v1' COLLATE NOCASE");
+    if (tables.empty()) return std::nullopt;
+    if (tables.size() != 1 || std::get<std::string>(tables.front().at("type")) != "table")
+        throw db_error("Invalid local metadata storage");
+    const auto rows = query_read(
+        "SELECT CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= 65536 "
+        "THEN value ELSE NULL END AS value FROM main._lattice_local_metadata_v1 "
+        "WHERE namespace = ? AND key = ? LIMIT 2",
+        {name_space, key});
+    if (rows.empty()) return std::nullopt;
+    if (rows.size() != 1 || !std::holds_alternative<std::string>(rows.front().at("value")))
+        throw db_error("Invalid local metadata value");
+    const auto& value = std::get<std::string>(rows.front().at("value"));
+    if (!valid_local_metadata_utf8(value)) throw db_error("Invalid local metadata text");
+    return value;
+}
+
+bool lattice_db::insert_local_metadata_if_absent(const std::string& name_space,
+                                                 const std::string& key,
+                                                 const std::string& value) {
+    validate_local_metadata_key(name_space, key);
+    if (value.size() > 65'536) throw db_error("Local metadata value exceeds its size limit");
+    if (!valid_local_metadata_utf8(value)) throw db_error("Invalid local metadata text");
+    if (txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+        !db_->is_in_transaction()) {
+        throw db_error("Local metadata insertion requires the owning write transaction");
+    }
+    // No globalId, model registration, audit triggers or synchronization state.
+    // Creation is part of the caller's transaction and rolls back with it.
+    db_->execute("CREATE TABLE IF NOT EXISTS main._lattice_local_metadata_v1 ("
+                 "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                 "PRIMARY KEY(namespace, key)) WITHOUT ROWID");
+    db_->execute("INSERT INTO main._lattice_local_metadata_v1(namespace, key, value) VALUES (?, ?, ?) "
+                 "ON CONFLICT(namespace, key) DO NOTHING", {name_space, key, value});
+    return sqlite3_changes(db_->handle()) == 1;
+}
+
+bool lattice_db::prepare_for_audited_writes() {
+    if (config_.read_only) throw db_error("audited writes require a writable connection");
+    return with_audit_prune_transaction_([&]() -> int64_t {
+        // sync_disabled() resolves this name on the connection. A TEMP shadow
+        // would make normalizing main's flag insufficient to enable auditing.
+        if (!db_->query("SELECT 1 FROM temp.sqlite_schema WHERE name = '_SyncControl' COLLATE NOCASE").empty())
+            throw db_error("audited writes reject a temporary sync control shadow");
+        const auto tables = db_->query(
+            "SELECT type, name, sql FROM main.sqlite_schema WHERE name = '_SyncControl' COLLATE NOCASE");
+        if (tables.size() != 1 ||
+            !std::holds_alternative<std::string>(tables[0].at("type")) ||
+            std::get<std::string>(tables[0].at("type")) != "table" ||
+            !std::holds_alternative<std::string>(tables[0].at("name")) ||
+            std::get<std::string>(tables[0].at("name")) != "_SyncControl" ||
+            !std::holds_alternative<std::string>(tables[0].at("sql")))
+            throw db_error("audited writes require the canonical sync control table");
+        // Accept formatting/case differences, but no alternate constraints,
+        // extra columns, generated columns, views or virtual tables.
+        std::string shape;
+        for (unsigned char c : std::get<std::string>(tables[0].at("sql"))) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') continue;
+            shape += c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+        }
+        if (shape != "createtable_synccontrol(idintegerprimarykeycheck(id=1),disabledintegernotnulldefault0)" ||
+            !detail::only_sync_storage_guards(*db_, "_SyncControl") ||
+            !db_->query("SELECT 1 FROM temp.sqlite_schema WHERE type = 'trigger' "
+                        "AND tbl_name = '_SyncControl' COLLATE NOCASE").empty())
+            throw db_error("audited writes require the canonical sync control shape without triggers");
+
+        // SQL whitespace normalization alone cannot distinguish keywords from
+        // a custom declared type such as INTEGERPRIMARYKEY. Check SQLite's
+        // parsed column metadata too, including generated/hidden columns.
+        const std::vector<database::row_t> expected_columns = {
+            {{"cid", int64_t{0}}, {"name", std::string("id")}, {"type", std::string("INTEGER")},
+             {"notnull", int64_t{0}}, {"dflt_value", nullptr}, {"pk", int64_t{1}}, {"hidden", int64_t{0}}},
+            {{"cid", int64_t{1}}, {"name", std::string("disabled")}, {"type", std::string("INTEGER")},
+             {"notnull", int64_t{1}}, {"dflt_value", std::string("0")}, {"pk", int64_t{0}}, {"hidden", int64_t{0}}}
+        };
+        if (db_->query("PRAGMA main.table_xinfo('_SyncControl')") != expected_columns)
+            throw db_error("audited writes require the canonical sync control column metadata");
+
+        const auto rows = db_->query("SELECT id, disabled FROM main._SyncControl");
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("id")) ||
+            std::get<int64_t>(rows[0].at("id")) != 1 ||
+            !std::holds_alternative<int64_t>(rows[0].at("disabled")))
+            throw db_error("audited writes require one integer sync control row with id 1");
+        const auto disabled = std::get<int64_t>(rows[0].at("disabled"));
+        if (disabled != 0 && disabled != 1)
+            throw db_error("audited writes require a zero or one sync control flag");
+        if (disabled == 0) return 0;
+        db_->execute("UPDATE main._SyncControl SET disabled = 0 WHERE id = 1");
+        if (sqlite3_changes64(db_->handle()) != 1 || sync_flag_in_owned_transaction_() != 0)
+            throw db_error("audited writes did not normalize exactly one sync control row");
+        return 1;
+    }) != 0;
+}
 
 // Single definition of the global log level (declared extern in log.hpp).
 // Seed from the LATTICE_LOG_LEVEL env var (0=off..4=debug) so logging can be
@@ -26,9 +366,9 @@ static log_level initial_log_level() {
 }
 std::atomic<log_level> g_log_level{initial_log_level()};
 
-std::unordered_map<const instance_guard*, int>& instance_guard::tls_depths() {
-    thread_local std::unordered_map<const instance_guard*, int> depths;
-    return depths;
+instance_guard::callback_frame*& instance_guard::tls_frames() noexcept {
+    thread_local callback_frame* head = nullptr;
+    return head;
 }
 
 // Singleton instance - defined here to ensure single copy across all translation units
@@ -106,7 +446,8 @@ void lattice_db::setup_change_hook(database& connection) {
 
             // Handle internal tables specially
             std::string table(table_name);
-            if (table == "_SyncControl" || table == "_lattice_sync_set" || table == "_lattice_sync_state") {
+            if (table == "_SyncControl" || table == "_lattice_sync_set" || table == "_lattice_sync_state" ||
+                table == "_lattice_local_metadata_v1") {
                 LOG_DEBUG("update_hook", "Skipping internal table %s", table_name);
                 return;
             }
@@ -121,7 +462,8 @@ void lattice_db::setup_change_hook(database& connection) {
                     self->db_->mark_txn_dirty();
                     // Preserve the in-transaction xproc cursor advance: another
                     // same-path instance must not redispatch our local entries.
-                    if (!self->config_.is_in_memory()) {
+                    if (!self->config_.is_in_memory() &&
+                        !self->defer_early_audit_cursor_.load(std::memory_order_acquire)) {
                         instance_registry::instance().for_each_alive(self->config_.path,
                             [rowid](lattice_db* inst) {
                                 inst->last_seen_audit_id_.store(
@@ -498,7 +840,7 @@ void lattice_db::handle_cross_process_notification() {
 }
 
 // Synchronizer registry — at most one synchronizer per {path, key}
-// Used for both WSS (key = websocket_url) and IPC (key = channel name).
+// Used for WSS (key = effective logical peer identity) and IPC (key = channel name).
 static std::mutex& sync_registry_mutex() {
     // Intentionally leaked: prevents use-after-destroy when destructors
     // run during process teardown (static destruction order is undefined).
@@ -526,7 +868,7 @@ void lattice_db::unregister_sync_key(const std::string& path, const std::string&
 static std::vector<std::string> collect_all_sync_ids(const configuration& config) {
     std::vector<std::string> ids;
     if (config.is_sync_enabled()) {
-        ids.push_back("wss:" + config.websocket_url);
+        ids.push_back("wss:" + config.effective_websocket_sync_identity());
     }
     for (const auto& target : config.ipc_targets) {
         ids.push_back("ipc:" + target.channel);
@@ -557,17 +899,38 @@ lattice_db::sync_borrow::~sync_borrow() {
     state_->cv.notify_all();
 }
 
-bool lattice_db::begin_sync_transition(bool wait) {
+lattice_db::sync_borrow::sync_borrow(lattice_db& owner,
+        const std::optional<std::vector<sync_filter_entry>>& filter)
+    : state_(owner.sync_lifecycle_) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (owner.is_closed()) return;
+    owner.config_.sync_filter = filter;
+    ++state_->filter_revision;
+    // A factory-time request is retained without borrowing a half-built owner.
+    // Once setup publishes its policy target, normal borrow retirement applies.
+    if (state_->transitioning && !state_->policy_ready) return;
+    admitted_ = true;
+    pointer_ = owner.synchronizer_.get();
+    ++state_->borrowers;
+    ++state_->borrower_threads[std::this_thread::get_id()];
+}
+
+bool lattice_db::begin_sync_transition(bool wait, bool retry_setup, bool require_empty_owner) {
     const auto state = sync_lifecycle_;
     std::unique_lock<std::mutex> lock(state->mutex);
     if (state->transitioning) {
+        if (retry_setup) state->setup_retry_requested = true;
         if (!wait || state->transition_thread == std::this_thread::get_id() ||
             state->borrower_threads.count(std::this_thread::get_id()) ||
             (state->worker && state->worker->is_on_thread())) return false;
         state->cv.wait(lock, [&] { return !state->transitioning; });
     }
+    // An ordinary handoff scan may visit an already-live sibling. Its no-op
+    // setup must not close policy admission or strand a concurrent filter.
+    if (require_empty_owner && synchronizer_) return false;
     if (!wait && state->borrower_threads.count(std::this_thread::get_id())) return false;
     state->transitioning = true;
+    state->policy_ready = false;
     state->transition_thread = std::this_thread::get_id();
     // Teardown can retire its owner off-thread if reached inside a borrow.
     // Setup never runs reentrantly and must settle existing borrowers first.
@@ -578,10 +941,16 @@ bool lattice_db::begin_sync_transition(bool wait) {
 
 void lattice_db::end_sync_transition() {
     const auto state = sync_lifecycle_;
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->transitioning = false;
-    state->transition_thread = {};
-    state->cv.notify_all();
+    bool retry;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->transitioning = false;
+        state->transition_thread = {};
+        retry = std::exchange(state->setup_retry_requested, false);
+        state->cv.notify_all();
+    }
+    if (retry && !is_closed() && !config_.background_sync_managed &&
+        current_background_sync_generation() == 0) setup_sync_if_configured(true);
 }
 
 void lattice_db::replay_sync_state_subscription(const std::shared_ptr<sync_lifecycle_state>& state) {
@@ -608,8 +977,8 @@ void lattice_db::replay_sync_state_subscription(const std::shared_ptr<sync_lifec
     });
 }
 
-void lattice_db::setup_sync_if_configured() {
-    if (!begin_sync_transition(false)) return;
+void lattice_db::setup_sync_if_configured(bool retry_setup) {
+    if (!begin_sync_transition(false, retry_setup, true)) return;
     try {
         setup_sync_owned();
         if (is_closed()) {
@@ -631,9 +1000,9 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     // own the WSS synchronizer for a given path. If the lock is held, we
     // distinguish three cases:
     //   1. Held by another *process* — silent skip (today's behavior).
-    //   2. Held by an in-process sibling on the SAME wssEndpoint — silent
+    //   2. Held by an in-process sibling with the SAME URL or logical identity — silent
     //      skip (legitimate dormant duplicate, e.g. cross-actor cache miss).
-    //   3. Held by an in-process sibling on a DIFFERENT wssEndpoint — this
+    //   3. Held by an in-process sibling with a DIFFERENT URL and logical identity — this
     //      is a URL-change scenario (e.g. peer rejoining after host
     //      republished). Kick the sibling and take over.
     //
@@ -654,13 +1023,13 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
 
         if (!try_acquire_lock()) {
             // Try to find a kickable in-process sibling — one that owns
-            // sync (synchronizer_ != nullptr) on a DIFFERENT URL.
+            // sync (synchronizer_ != nullptr) on a DIFFERENT URL and logical peer.
             //
             // The kick must happen INSIDE the registry callback so the
             // registry's notify_refcount keeps the victim alive while
-            // teardown_sync runs. fire_handoff=false prevents the victim's
-            // own teardown from waking another same-URL sibling, which
-            // would re-hold the flock against our new URL.
+            // teardown_sync runs. Its value-only successor request targets
+            // this URL after the old callback releases the flock/key; an
+            // immediate retry alone can miss that deferred release.
             bool kicked = false;
             if (allow_sibling_kick) instance_registry::instance().for_each_alive(config_.path,
                 [&](lattice_db* sibling) {
@@ -672,12 +1041,14 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
                         // Managed lifecycles are never evicted by ordinary URL handoff.
                         if (sibling->current_background_sync_generation() != 0) return;
                     }
-                    if (sibling->config_.websocket_url == config_.websocket_url) return;
+                    if (sibling->config_.websocket_url == config_.websocket_url ||
+                        sibling->config_.effective_websocket_sync_identity() ==
+                        config_.effective_websocket_sync_identity()) return;
                     LOG_INFO("lattice_db",
                              "kicking sibling=%p (URL=%s) for URL change to %s",
                              (void*)sibling, sibling->config_.websocket_url.c_str(),
                              config_.websocket_url.c_str());
-                    sibling->teardown_sync(/*fire_handoff=*/false);
+                    sibling->teardown_sync(/*fire_handoff=*/true, config_.websocket_url);
                     kicked = true;
                 });
             if (!kicked || !try_acquire_lock()) {
@@ -688,8 +1059,8 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     }
 #endif
 
-    // Only one synchronizer per {path, websocket_url} across all instances
-    if (!try_register_sync_key(config_.path, config_.websocket_url)) {
+    // One synchronizer per durable peer, including platforms without the file lock.
+    if (!try_register_sync_key(config_.path, config_.effective_websocket_sync_identity())) {
         LOG_DEBUG("lattice_db", "Synchronizer already active for this path, skipping");
 #ifndef __EMSCRIPTEN__
         if (sync_lock_fd_ >= 0) {
@@ -708,14 +1079,21 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     }
     // Create sync config from our configuration
     sync_config sync_cfg;
+    uint64_t filter_revision;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
-    sync_cfg.sync_filter = config_.sync_filter;
+    sync_cfg.pinned_server_certificate_sha256 = config_.pinned_server_certificate_sha256;
+    sync_cfg.uploads_enabled = config_.uploads_enabled;
+    {
+        std::lock_guard<std::mutex> lock(sync_lifecycle_->mutex);
+        sync_cfg.sync_filter = config_.sync_filter;
+        filter_revision = sync_lifecycle_->filter_revision;
+    }
     sync_cfg.finite_cycle = finite_cycle;
 
     // Always use per-synchronizer sync state
     auto all_ids = collect_all_sync_ids(config_);
-    sync_cfg.sync_id = "wss:" + config_.websocket_url;
+    sync_cfg.sync_id = "wss:" + config_.effective_websocket_sync_identity();
     {
         // Log-only identity (see sync_config::log_label).
         const auto slash = config_.path.find_last_of('/');
@@ -723,7 +1101,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
             (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
     }
     sync_cfg.all_active_sync_ids = all_ids;
-    sync_cfg.is_observer = config_.sync_is_observer;
+    sync_cfg.is_observer = config_.sync_is_observer || !config_.uploads_enabled;
     config_.tuning.apply(sync_cfg);
     // Upload coalescing stays at the library default (0 = legacy immediate
     // dispatch): with the upload floor + classify gating, passes are cheap,
@@ -746,6 +1124,7 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     sync_db_config.busy_timeout_ms = config_.busy_timeout_ms;
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
+    sync_db_config.create_if_missing = config_.create_if_missing;
     sync_db_config.private_sync_cancellation = cancellation;
     auto sync_db = std::make_unique<lattice_db>(sync_db_config);
     {
@@ -820,14 +1199,48 @@ void lattice_db::setup_sync_owned(bool finite_cycle,
     if (cancellation && cancellation->load(std::memory_order_acquire))
         throw db_error("background sync was cancelled during setup");
 
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(callback_state->mutex);
+        // Native setup owns a distinct serial worker. Queue the latest policy
+        // before its first connect; no SQL or user callback runs on this thread.
+        // Publishing the target in the same critical section closes the gap
+        // between retaining a factory-time request and admitting a live borrow.
+        if (filter_revision != callback_state->filter_revision) {
+            if (config_.sync_filter) synchronizer_->update_sync_filter(*config_.sync_filter);
+            else synchronizer_->clear_sync_filter();
+        }
+        callback_state->policy_ready = true;
+    }
+#else
+    // Browser setup is single-threaded and borrows the parent scheduler. Apply
+    // outside the metadata lock because that scheduler may run inline.
+    std::optional<std::vector<sync_filter_entry>> latest_filter;
+    bool filter_changed;
+    {
+        std::lock_guard<std::mutex> lock(callback_state->mutex);
+        latest_filter = config_.sync_filter;
+        filter_changed = filter_revision != callback_state->filter_revision;
+        callback_state->policy_ready = true;
+    }
+    if (filter_changed) {
+        if (latest_filter) synchronizer_->update_sync_filter(*latest_filter);
+        else synchronizer_->clear_sync_filter();
+    }
+#endif
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
     replay_sync_state_subscription(callback_state);
     } catch (...) {
         // Manual start is retryable on the same local handle after setup fails.
         // Do not strand an ownership key/flock or tear down unrelated IPC.
+        {
+            std::unique_lock<std::mutex> lock(sync_lifecycle_->mutex);
+            sync_lifecycle_->policy_ready = false;
+            sync_lifecycle_->cv.wait(lock, [&] { return sync_lifecycle_->borrowers == 0; });
+        }
         synchronizer_.reset();
-        unregister_sync_key(config_.path, config_.websocket_url);
+        unregister_sync_key(config_.path, config_.effective_websocket_sync_identity());
 #ifndef __EMSCRIPTEN__
         if (sync_lock_fd_ >= 0) {
             ::flock(sync_lock_fd_, LOCK_UN); ::close(sync_lock_fd_); sync_lock_fd_ = -1;
@@ -995,7 +1408,7 @@ void lattice_db::restore_parent_after_sync_owned(uint64_t generation) {
     if (prior_retention) start_audit_maintenance();
 }
 
-bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
+bool lattice_db::retire_wss_owned(bool drain, bool handoff, std::optional<std::string> successor_url) {
     const auto state = sync_lifecycle_;
     bool defer;
     uint64_t generation;
@@ -1006,7 +1419,8 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
         if (generation && state->cancellation)
             state->cancellation->store(true, std::memory_order_release);
         defer = state->borrower_threads.count(std::this_thread::get_id()) ||
-                (state->worker && state->worker->is_on_thread());
+                (state->worker && state->worker->is_on_thread()) ||
+                (!generation && successor_url.has_value());
     }
     // Admission is already closed. Moving the owner does not invalidate an
     // existing lease; cleanup waits for every such borrow before destruction.
@@ -1014,7 +1428,25 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
     const int lock_fd = std::exchange(sync_lock_fd_, -1);
     const auto path = config_.path;
     const auto url = config_.websocket_url;
-    auto cleanup = [state, owner = std::move(retired), lock_fd, path, url, generation, drain](bool finish_transition) mutable {
+    const auto registry_key = config_.effective_websocket_sync_identity();
+    const auto next_url = successor_url.value_or(url);
+    const auto notify_successor = [state, path, next_url, handoff, generation] {
+        if (!handoff || generation) return;
+        bool handed_off = false;
+        instance_registry::instance().for_each_alive(path, [&](lattice_db* sibling) {
+            if (handed_off || sibling->sync_lifecycle_ == state || sibling->is_closed() ||
+                !sibling->sync_start_requested_ || sibling->config_.background_sync_managed ||
+                sibling->current_background_sync_generation() != 0 ||
+                !sibling->config_.is_sync_enabled() || sibling->config_.websocket_url != next_url) return;
+            // If its initiating setup has not yet returned, retain exactly one
+            // retry in that transition instead of losing the release edge.
+            sibling->setup_sync_if_configured(true);
+            sync_borrow current(*sibling);
+            handed_off = bool(current);
+        });
+    };
+    auto cleanup = [state, owner = std::move(retired), lock_fd, path, registry_key, generation, drain,
+                    notify_successor](bool finish_transition) mutable {
         {
             std::unique_lock<std::mutex> lock(state->mutex);
             state->cv.wait(lock, [&] { return state->borrowers == 0; });
@@ -1023,7 +1455,7 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
             if (drain) owner->drain(std::chrono::steady_clock::now() + std::chrono::milliseconds(2000));
             if (generation) owner->cancel_finite_cycle();
             owner.reset(); // Fences transport, pacer and queued SQL before releasing ownership.
-            unregister_sync_key(path, url);
+            unregister_sync_key(path, registry_key);
         }
         if (lock_fd >= 0) { ::flock(lock_fd, LOCK_UN); ::close(lock_fd); }
         std::shared_ptr<scheduler> settled_worker;
@@ -1038,9 +1470,16 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
             if (finish_transition) {
                 state->transitioning = false;
                 state->transition_thread = {};
+                state->setup_retry_requested = false;
                 state->cv.notify_all();
             }
         }
+        settled_worker.reset();
+        // This owns only shared lifecycle state and value identities. It is
+        // valid after the primary handle has closed or been destroyed.
+        try { notify_successor(); }
+        catch (const std::exception& error) { LOG_ERROR("sync", "Deferred handoff failed: %s", error.what()); }
+        catch (...) { LOG_ERROR("sync", "Deferred handoff failed with an unknown exception"); }
     };
 #ifndef __EMSCRIPTEN__
     if (defer) {
@@ -1053,147 +1492,76 @@ bool lattice_db::retire_wss_owned(bool drain, bool handoff) {
     cleanup(false);
     restore_parent_after_sync_owned(generation);
     end_sync_transition();
-    if (handoff && !generation) {
-        bool handed_off = false;
-        instance_registry::instance().for_each_alive(path, [&](lattice_db* sibling) {
-            if (handed_off || sibling == this || sibling->is_closed() ||
-                !sibling->sync_start_requested_ || sibling->config_.background_sync_managed ||
-                !sibling->config_.is_sync_enabled() || sibling->config_.websocket_url != url) return;
-            sibling->setup_sync_if_configured();
-            sync_borrow current(*sibling);
-            handed_off = bool(current);
-        });
-    }
     return true;
 }
 
 void lattice_db::setup_ipc_if_configured() {
 #ifndef __EMSCRIPTEN__
-    if (!config_.is_ipc_enabled()) {
-        return;
-    }
-
-    // Only one IPC endpoint per {path, channel} across all instances
-    // (mirrors the WSS dedup via try_register_sync_key).
-    // Filter out channels that are already registered by another instance.
-    std::vector<size_t> active_indices;
-    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
-        const auto& channel = config_.ipc_targets[i].channel;
-        if (try_register_sync_key(config_.path, "ipc:" + channel)) {
-            active_indices.push_back(i);
-        } else {
-            LOG_DEBUG("lattice_db", "IPC synchronizer already active for %s on channel %s, skipping",
-                      config_.path.c_str(), channel.c_str());
+    if(is_closed() || !config_.is_ipc_enabled()) return;
+    const auto config=config_;
+    const auto all_ids=collect_all_sync_ids(config);
+    std::vector<std::shared_ptr<ipc_sync_state>> channels;
+    for(const auto& target:config.ipc_targets) {
+        auto resources=std::make_shared<sync_owner_resources>();
+        resources->key=acquire_sync_key(config.path,"ipc:"+target.channel);
+        if(!resources->key) continue;
+        const auto socket_path=target.socket_path.value_or(resolve_ipc_socket_path(target.channel));
+        const auto lock_path=socket_path+".lock";
+        const int fd=::open(lock_path.c_str(),O_CREAT|O_RDWR,0600);
+        if(fd>=0) {
+            if(::flock(fd,LOCK_EX|LOCK_NB)==0) resources->file=adopt_sync_file(fd);
+            else ::close(fd); // existing IPC role negotiation still works when another process owns this lock
         }
-    }
-    if (active_indices.empty()) return;
-
-    auto all_ids = collect_all_sync_ids(config_);
-
-    // Phase 1: Create all endpoints and store them in the vector.
-    // We must do this BEFORE starting any endpoint, because:
-    // - The server callback fires asynchronously on the accept thread
-    // - Capturing &state.sync from a local that is later moved = dangling pointer
-    // - reserve() ensures push_back won't invalidate references
-    ipc_synchronizers_.reserve(active_indices.size());
-
-    for (size_t idx : active_indices) {
-        ipc_sync_state state;
-        state.endpoint = std::make_unique<ipc_endpoint>(config_.ipc_targets[idx].channel,
-                                                        config_.ipc_targets[idx].socket_path);
-
-        // Acquire per-channel flock — mirrors sync_lock_fd_ for WSS.
-        // Set during construction so is_sync_agent() returns true before
-        // the accept callback creates the synchronizer (avoids timing races).
-        const auto& target_cfg = config_.ipc_targets[idx];
-        std::string sock_path = target_cfg.socket_path.value_or(
-            resolve_ipc_socket_path(target_cfg.channel));
-        std::string lock_path = sock_path + ".lock";
-        int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
-        if (lock_fd >= 0) {
-            if (::flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
-                state.lock_fd = lock_fd;
-                LOG_INFO("ipc_sync", "Acquired IPC lock: %s (fd=%d)", lock_path.c_str(), lock_fd);
-            } else {
-                // Another process holds this channel — still proceed (IPC handles roles via bind)
-                // but don't set lock_fd so is_sync_agent() reflects the true owner.
-                ::close(lock_fd);
-                LOG_INFO("ipc_sync", "IPC lock held by another process: %s", lock_path.c_str());
-            }
-        }
-
-        ipc_synchronizers_.push_back(std::move(state));
-    }
-
-    // Phase 2: Start endpoints using stable references into the vector.
-    for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
-        const auto& target = config_.ipc_targets[active_indices[i]];
-        std::string sync_id = "ipc:" + target.channel;
-        auto& sync_slot = ipc_synchronizers_[i].sync;
-
-        ipc_synchronizers_[i].endpoint->start(
-            [this, sync_id, all_ids, &target, &sync_slot,
-             ep = ipc_synchronizers_[i].endpoint.get()](std::unique_ptr<ipc_socket_client> transport) {
-                LOG_INFO("ipc_sync", "[%s] Accept callback fired (sync_slot=%s, db=%s)",
-                         sync_id.c_str(), sync_slot ? "OCCUPIED" : "empty",
-                         config_.path.c_str());
-
-                sync_config ipc_cfg;
-                ipc_cfg.sync_id = sync_id;
-                // Log-only identity: hub and spoke share the same sync_id on
-                // an IPC channel; role + db basename is what makes their
-                // interleaved lines in one process log tell apart.
-                const auto slash = config_.path.find_last_of('/');
-                ipc_cfg.log_label = sync_id + (ep->is_server() ? "#srv@" : "#cli@") +
-                    (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
-                ipc_cfg.all_active_sync_ids = all_ids;
-                ipc_cfg.is_observer = config_.sync_is_observer;
-                ipc_cfg.sync_filter = target.sync_filter;
-                ipc_cfg.narrowing_emits_removals = target.narrowing_emits_removals;
-                config_.tuning.apply(ipc_cfg);
-                // Coalescing off by default — see the WSS note above.
-
-                // Create dedicated lattice_db for this IPC synchronizer
-                configuration ipc_db_config(config_.path,
-                                            std::make_shared<std_thread_scheduler>());
-                ipc_db_config.busy_timeout_ms = config_.busy_timeout_ms;
-                ipc_db_config.target_schema_version = config_.target_schema_version;
-                ipc_db_config.migration_block = config_.migration_block;
-                auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);
-
-                LOG_INFO("ipc_sync", "[%s] Creating synchronizer (replacing old=%p)",
-                         sync_id.c_str(), sync_slot ? (void*)sync_slot.get() : nullptr);
-
-                auto sync = std::make_unique<synchronizer>(
-                    std::move(ipc_db), ipc_cfg, std::move(transport));
-
-                // Lock ipc_callbacks_mutex_ to synchronize with set_on_sync_progress/
-                // set_on_sync_state_change/set_on_sync_error on the main thread.
-                // Without this, the accept thread and main thread can race: both
-                // check-then-act on {on_sync_progress_, sync_slot} and miss each other.
-                {
-                    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
-
-                    // Apply stored callbacks to the newly-created synchronizer
-                    if (on_sync_progress_) {
-                        sync->set_on_progress(on_sync_progress_);
-                    }
-                    if (on_sync_state_change_) {
-                        sync->set_on_state_change(on_sync_state_change_);
-                    }
-                    if (on_sync_error_) {
-                        sync->set_on_error(on_sync_error_);
-                    }
-
-                    sync->connect();
-                    sync_slot = std::move(sync);
-                }
-
-                LOG_INFO("ipc_sync", "[%s] New synchronizer installed (this=%p)",
-                         sync_id.c_str(), (void*)sync_slot.get());
+        auto channel=std::make_shared<ipc_sync_state>();channel->channel=target.channel;channel->resources=resources;
+        channel->endpoint=std::make_unique<ipc_endpoint>(target.channel,target.socket_path);
+        sync_config settings;settings.sync_id="ipc:"+target.channel;
+        const auto slash=config.path.find_last_of('/');
+        settings.log_label=settings.sync_id+"@"+(slash==std::string::npos ? config.path : config.path.substr(slash+1));
+        settings.all_active_sync_ids=all_ids;settings.is_observer=config.sync_is_observer;
+        settings.uploads_enabled=config.uploads_enabled;
+        settings.owner_active=resources->active;
+        settings.sync_filter=target.sync_filter;settings.narrowing_emits_removals=target.narrowing_emits_removals;
+        config.tuning.apply(settings);
+        configuration database_config(config.path);
+        database_config.busy_timeout_ms=config.busy_timeout_ms;
+        database_config.target_schema_version=config.target_schema_version;
+        database_config.migration_block=config.migration_block;
+        database_config.create_if_missing=config.create_if_missing;
+        channel->publication=std::make_shared<detail::ipc_publication_state>(settings,
+            [database_config,resources](std::unique_ptr<ipc_socket_client> transport,const sync_config& latest) {
+                auto owned_config=database_config;owned_config.sched=std::make_shared<std_thread_scheduler>();
+                auto database=std::make_unique<lattice_db>(owned_config);
+                return synchronizer::create_owned(std::move(database),latest,std::move(transport),resources);
             });
+        channels.push_back(std::move(channel));
     }
-#endif // !__EMSCRIPTEN__
+    if(channels.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+        if(is_closed()) return;
+        for(const auto& channel:channels) {
+            channel->publication->set_progress(on_sync_progress_);
+            channel->publication->set_state(on_sync_state_change_);
+            channel->publication->set_error(on_sync_error_);
+        }
+        ipc_synchronizers_.insert(ipc_synchronizers_.end(),channels.begin(),channels.end());
+    }
+    // Only shared channel state is used after publication. A callback may close its parent while
+    // an endpoint starts; revoke/endpoint_mutex serialize that race without parent/slot captures.
+    try {for(const auto& channel:channels) channel->start();}
+    catch(...) {
+        std::vector<std::shared_ptr<synchronizer>> failed;
+        for(const auto& channel:channels) if(auto sync=channel->publication->revoke()) failed.push_back(std::move(sync));
+        for(const auto& sync:failed) sync->disconnect();
+        for(const auto& channel:channels) channel->stop();
+        {
+            std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+            ipc_synchronizers_.erase(std::remove_if(ipc_synchronizers_.begin(),ipc_synchronizers_.end(),
+                [&](const auto& entry) {return std::find(channels.begin(),channels.end(),entry)!=channels.end();}),ipc_synchronizers_.end());
+        }
+        throw;
+    }
+#endif
 }
 
 static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {
@@ -1291,6 +1659,17 @@ std::vector<database::row_t> lattice_db::query_read(
     return connection->query(sql, params);
 }
 
+std::vector<database::row_t> lattice_db::query_read_checked(
+    const std::string& sql, const std::vector<column_value_t>& params) {
+    auto connection = borrow_read_connection();
+    if (is_closed() || connection->is_closed())
+        throw db_error("Query connection is closed");
+    auto rows = connection->query(sql, params);
+    if (is_closed() || connection->is_closed())
+        throw db_error("Query connection is closed");
+    return rows;
+}
+
 std::vector<database::row_t> lattice_db::query_xproc(
     const std::string& sql, const std::vector<column_value_t>& params) {
     auto connection = borrow_xproc_read_connection();
@@ -1298,6 +1677,8 @@ std::vector<database::row_t> lattice_db::query_xproc(
 }
 
 void lattice_db::close_read_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     std::shared_ptr<database> reader, xproc;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -1310,6 +1691,8 @@ void lattice_db::close_read_db() {
 }
 
 void lattice_db::close_write_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     std::shared_ptr<database> writer;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -1348,6 +1731,8 @@ void lattice_db::restore_attached_views(database& connection) {
 }
 
 void lattice_db::reopen_write_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -1358,7 +1743,8 @@ void lattice_db::reopen_write_db() {
     // Declared before the attach guard: error cleanup and retired-owner
     // destruction must run after that guard is released.
     auto staged = std::make_shared<database>(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms, config_.private_sync_cancellation);
+        database::open_mode::read_write, config_.busy_timeout_ms,
+        config_.private_sync_cancellation, config_.create_if_missing);
     register_sql_functions(*staged);
     // A maintenance caller can already own the writer SQLite mutex. Never
     // wait behind attach while it may be waiting for that writer. A busy
@@ -1378,6 +1764,8 @@ void lattice_db::reopen_write_db() {
 }
 
 void lattice_db::reopen_read_db() {
+    if (config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles require a full close and fresh admission");
     if (config_.is_in_memory() || config_.read_only) return;
     uint64_t revision;
     {
@@ -1409,6 +1797,8 @@ void lattice_db::reopen_read_db() {
 }
 
 void lattice_db::attach(lattice_db &lattice) {
+    if (config_.required_existing_schema_version != 0 || lattice.config_.required_existing_schema_version != 0)
+        throw db_error("Existing schema handles cannot participate in attachments");
     // Serialize attach/detach: the already-attached consult below is
     // check-then-act, and view regeneration must not interleave with a
     // concurrent attach/detach on another thread.

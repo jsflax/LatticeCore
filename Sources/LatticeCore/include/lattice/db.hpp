@@ -11,6 +11,10 @@
 #include <chrono>
 
 namespace lattice {
+class lattice_db;
+namespace detail { bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&); }
+
+struct audit_log_entry;
 
 /// Default statement-level busy timeout. Headless/server processes tolerate long
 /// waits; interactive apps should pass a smaller value (e.g. 5000) via
@@ -23,8 +27,14 @@ public:
 };
 
 class database {
+    // Selected audit capture spans bounded reads on one snapshot and must not
+    // deliver previously sealed observers until its outer statement unlocks.
+    friend std::vector<audit_log_entry> query_audit_log_selected(database&,
+        const std::vector<std::pair<int64_t, std::string>>&, size_t);
     friend class lattice_db;
     friend class synchronizer_base;
+    friend struct detached_read_access;
+    friend bool detail::sync_delivery_transaction(lattice_db&, const std::function<bool()>&);
     // Test-only friend seam: install on the query's calling thread and clear
     // before that thread exits. No public setter, bridge API or instance field.
     friend struct database_query_test_access;
@@ -141,16 +151,21 @@ public:
     /// Open mode for database connections
     enum class open_mode {
         read_write,  ///< Full read/write access (default)
-        read_only    ///< Read-only; joins a concurrent writer's WAL (sees committed WAL rows)
+        read_only,   ///< Read-only; joins a concurrent writer's WAL (sees committed WAL rows)
+        read_write_existing ///< No CREATE, journal-mode changes, automatic optimize or checkpoint.
     };
 
+    /// File creation is independent of writable setup and maintenance. False
+    /// omits SQLITE_OPEN_CREATE; it does not select strict existing-file mode.
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
                       int busy_timeout_ms = kDefaultBusyTimeoutMs,
-                      std::shared_ptr<const std::atomic<bool>> cancellation = {});
+                      std::shared_ptr<const std::atomic<bool>> cancellation = {},
+                      bool create_if_missing = true);
     // Private construction capability; callers cannot manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
              initialization_key key,
-             std::shared_ptr<const std::atomic<bool>> cancellation = {});
+             std::shared_ptr<const std::atomic<bool>> cancellation = {},
+             bool create_if_missing = true);
     ~database();
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.
@@ -277,6 +292,14 @@ public:
     /// Rollback clears only the current transaction, never sealed rows.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back,
                        std::function<void()> sealed);
+
+    /// Checked current-state probe of this exact open main file. No SQL, reopen or metadata writes.
+    /// Throws for a moved/unlinked file, closed/memory database or unsupported VFS.
+    void require_main_file_unmoved(const std::string& expected_path);
+
+    /// Copy SQLite's actual main filename under the connection mutex. No SQL or path resolution.
+    /// Throws for a closed or memory database. This is a name, not a currentness check.
+    std::string main_file_path();
 
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }

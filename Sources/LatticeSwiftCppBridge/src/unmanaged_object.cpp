@@ -45,7 +45,8 @@ swift_dynamic_object::swift_dynamic_object(const std::string& table,
     }
 
 std::shared_ptr<link_list> swift_dynamic_object::get_link_list(const std::string &name) const {
-    return list_values.at(name);
+    auto found = list_values.find(name);
+    return found == list_values.end() ? std::make_shared<link_list>() : found->second;
 }
 
 }

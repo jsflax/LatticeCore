@@ -37,7 +37,7 @@ typedef struct lattice_link_list lattice_link_list_t;
 // Versioning & Introspection
 // =============================================================================
 
-// The C ABI version tracks the LatticeCore release train (see CHANGELOG.md).
+// The C ABI compatibility version is independent of the LatticeCore package version.
 // The surface becomes additive-only at 1.0 (see docs/CAPI-STABILITY.md).
 #define LATTICE_CAPI_VERSION_MAJOR 1
 #define LATTICE_CAPI_VERSION_MINOR 0
@@ -388,7 +388,7 @@ LATTICE_EXPORT void lattice_db_remove_object_observer(lattice_db_t* db, const ch
 LATTICE_EXPORT void lattice_object_set_object(lattice_object_t* obj, const char* field, lattice_object_t* value);
 
 // Get a linked object - wraps dynamic_object_ref::get_object()
-// Returns NULL if no link. Caller must release.
+// Returns NULL if no link or the linked row no longer exists. Caller must release a non-NULL result.
 LATTICE_EXPORT lattice_object_t* lattice_object_get_object(lattice_object_t* obj, const char* field);
 
 // =============================================================================
@@ -396,7 +396,8 @@ LATTICE_EXPORT lattice_object_t* lattice_object_get_object(lattice_object_t* obj
 // =============================================================================
 
 // Get a link list from an object - wraps dynamic_object_ref::get_link_list()
-// Returns NULL on error. Caller must release with lattice_link_list_release.
+// An unmanaged object with no staged list for the field returns an empty list not attached to the object.
+// Returns NULL on error. Caller must release non-NULL results with lattice_link_list_release.
 LATTICE_EXPORT lattice_link_list_t* lattice_object_get_link_list(lattice_object_t* obj, const char* field);
 
 // Release a link list

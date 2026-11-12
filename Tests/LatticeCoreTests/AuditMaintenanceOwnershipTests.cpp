@@ -20,14 +20,7 @@
 #include <csignal>
 #include <unistd.h>
 
-// Friend-only source seam: no public injection, runtime hook or new API.
-namespace lattice {
-struct audit_maintenance_test_access {
-    template<class F> static int64_t owned(lattice_db& owner, F&& body) {
-        return owner.with_audit_prune_transaction_(std::forward<F>(body));
-    }
-};
-}
+#include "AuditMaintenanceTestAccess.hpp"
 
 struct AuditMaintenanceRow { int64_t value = 0; };
 LATTICE_SCHEMA(AuditMaintenanceRow, value);

@@ -1641,13 +1641,24 @@ std::string read_only_attachment_uri(database& source) {
     return uri;
 }
 
-void attach_database(database& connection, const std::string& alias,
+// Return whether this call created the alias, so failure cleanup never
+// detaches an alias that was already present on this connection.
+bool attach_database(database& connection, const std::string& alias,
                      const std::string& target, bool read_only) {
-    connection.execute("ATTACH DATABASE ? AS " + quoted_attach_alias(alias), {target});
+    try {
+        connection.execute("ATTACH DATABASE ? AS " + quoted_attach_alias(alias), {target});
+    } catch (const db_error& error) {
+        // Preserve the released duplicate-alias tolerance for writable
+        // sources. Read-only sources must establish their own checked alias.
+        if (!read_only && std::string(error.what()).find("already in use") != std::string::npos)
+            return false;
+        throw;
+    }
     if (read_only && sqlite3_db_readonly(connection.handle(), alias.c_str()) != 1) {
         connection.execute("DETACH DATABASE " + quoted_attach_alias(alias));
         throw db_error("attach: source alias did not open read-only");
     }
+    return true;
 }
 
 // Model tables only — excludes sqlite internals, _-prefixed virtual/shadow
@@ -1950,8 +1961,8 @@ void lattice_db::attach(lattice_db &lattice) {
     std::vector<std::shared_ptr<database>> attached_handles;
     try {
         for (const auto& handle : handles) {
-            attach_database(*handle, alias, target, read_only_uri.has_value());
-            attached_handles.push_back(handle);
+            if (attach_database(*handle, alias, target, read_only_uri.has_value()))
+                attached_handles.push_back(handle);
         }
     } catch (...) {
         for (const auto& handle : attached_handles) {

@@ -28,8 +28,12 @@
   The one-way storage changes and ordinary-open behavior documented for 3.0.0
   still apply.
 - Compatibility is provided by the SQL union views. Uncached typed-object
-  getters that query the physical source table do not synthesize absent fields
-  from the projected defaults.
+  getters still query the physical source table. Reading a column absent from
+  that table fails with a missing-column SQL error in C++. Sealed bridge
+  getters record the error and return a type fallback, such as zero, false or
+  an empty string; a failed optional-presence check can appear as nil in Swift.
+  These reads do not return the declared default from the union projection.
+  Typed missing-column reads remain separate follow-up work.
 - Read-only attachments require a file-backed source. Memory and temporary
   sources, duplicate URI parameters, and URI parameters other than `mode`,
   `cache` and `vfs` are refused before ATTACH. Writable sources, including named

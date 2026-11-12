@@ -396,7 +396,8 @@ LATTICE_EXPORT lattice_object_t* lattice_object_get_object(lattice_object_t* obj
 // =============================================================================
 
 // Get a link list from an object - wraps dynamic_object_ref::get_link_list()
-// Returns NULL on error. Caller must release with lattice_link_list_release.
+// An unmanaged object with no staged list for the field returns an empty list not attached to the object.
+// Returns NULL on error. Caller must release non-NULL results with lattice_link_list_release.
 LATTICE_EXPORT lattice_link_list_t* lattice_object_get_link_list(lattice_object_t* obj, const char* field);
 
 // Release a link list

@@ -12,7 +12,10 @@
 
 namespace lattice {
 class lattice_db;
-namespace detail { bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&); }
+namespace detail {
+bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&);
+struct checkpoint_access;
+}
 
 struct audit_log_entry;
 
@@ -34,6 +37,7 @@ class database {
     friend class lattice_db;
     friend class synchronizer_base;
     friend struct detached_read_access;
+    friend struct detail::checkpoint_access;
     friend bool detail::sync_delivery_transaction(lattice_db&, const std::function<bool()>&);
     // Test-only friend seam: install on the query's calling thread and clear
     // before that thread exits. No public setter, bridge API or instance field.

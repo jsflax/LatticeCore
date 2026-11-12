@@ -932,42 +932,58 @@ void database::interrupt() {
     if (db_) sqlite3_interrupt(db_);
 }
 
-database::checkpoint_result detail::checkpoint_writable_schemas(database& db, bool truncate) {
-    database::checkpoint_result result;
-    auto* handle = db.handle();
-    if (!handle) return result;
-    auto* mutex = sqlite3_db_mutex(handle);
-    sqlite3_mutex_enter(mutex);
-    struct unlock { sqlite3_mutex* value; ~unlock() { sqlite3_mutex_leave(value); } } held{mutex};
-    // Copy the names before issuing a checkpoint. Holding the connection's
-    // recursive mutex keeps ATTACH/DETACH from changing this list underneath us.
-    const auto schemas = db.query("PRAGMA database_list");
-    // A logically closed wrapper returns no rows. Preserve the previous
-    // unavailable/busy result rather than reporting a successful checkpoint.
-    if (schemas.empty()) return result;
-    result.rc = SQLITE_OK;
-    result.busy = 0;
-    for (const auto& schema : schemas) {
-        const auto& name = std::get<std::string>(schema.at("name"));
-        if (name == "temp" || sqlite3_db_readonly(handle, name.c_str()) != 0) continue;
-        std::string quoted = "\"";
-        for (char c : name) { quoted += c; if (c == '"') quoted += c; }
-        quoted += '"';
-        const auto rows = db.query("PRAGMA " + quoted +
-            (truncate ? ".wal_checkpoint(TRUNCATE)" : ".wal_checkpoint(PASSIVE)"));
-        if (rows.empty()) throw db_error("Checkpoint returned no outcome for schema " + name);
-        auto get = [&](const char* key) -> int64_t {
-            auto it = rows[0].find(key);
-            return it != rows[0].end() && std::holds_alternative<int64_t>(it->second)
-                ? std::get<int64_t>(it->second) : -1;
-        };
-        result.busy |= get("busy") != 0;
-        const auto log = get("log"), checkpointed = get("checkpointed");
-        if (log >= 0) result.log_frames = (result.log_frames < 0 ? 0 : result.log_frames) + log;
-        if (checkpointed >= 0)
-            result.checkpointed = (result.checkpointed < 0 ? 0 : result.checkpointed) + checkpointed;
+struct detail::checkpoint_access {
+    static database::checkpoint_result run(database& db, bool truncate) {
+        database::checkpoint_result result;
+        auto* handle = db.handle();
+        if (!handle || db.is_closed()) return result;
+        try {
+            // Protect the schema list and each read-only check through the
+            // checkpoint, while deferring observer delivery until this outer
+            // scope has unlocked. A raw mutex would be invisible to query's
+            // delivery tail and could run callbacks with SQLite still held.
+            database::statement_scope scope(db);
+            const auto schemas = db.query("PRAGMA database_list");
+            // Logical close can make enumeration unavailable. Keep the old
+            // busy/unavailable outcome rather than reporting success.
+            if (!schemas.empty()) {
+                result.rc = SQLITE_OK;
+                result.busy = 0;
+                for (const auto& schema : schemas) {
+                    const auto& name = std::get<std::string>(schema.at("name"));
+                    if (name == "temp" || sqlite3_db_readonly(handle, name.c_str()) != 0) continue;
+                    std::string quoted = "\"";
+                    for (char c : name) { quoted += c; if (c == '"') quoted += c; }
+                    quoted += '"';
+                    const auto rows = db.query("PRAGMA " + quoted +
+                        (truncate ? ".wal_checkpoint(TRUNCATE)" : ".wal_checkpoint(PASSIVE)"));
+                    if (rows.empty()) throw db_error("Checkpoint returned no outcome for schema " + name);
+                    auto get = [&](const char* key) -> int64_t {
+                        auto it = rows[0].find(key);
+                        return it != rows[0].end() && std::holds_alternative<int64_t>(it->second)
+                            ? std::get<int64_t>(it->second) : -1;
+                    };
+                    result.busy |= get("busy") != 0;
+                    const auto log = get("log"), checkpointed = get("checkpointed");
+                    if (log >= 0)
+                        result.log_frames = (result.log_frames < 0 ? 0 : result.log_frames) + log;
+                    if (checkpointed >= 0)
+                        result.checkpointed = (result.checkpointed < 0 ? 0 : result.checkpointed) + checkpointed;
+                }
+            }
+        } catch (...) {
+            // Match query's error tail: deliver prior committed work after
+            // unlock without replacing the initiating checkpoint exception.
+            try { db.drain_if_settled(); } catch (...) {}
+            throw;
+        }
+        db.drain_if_settled();
+        return result;
     }
-    return result;
+};
+
+database::checkpoint_result detail::checkpoint_writable_schemas(database& db, bool truncate) {
+    return checkpoint_access::run(db, truncate);
 }
 
 database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_budget_ms) {

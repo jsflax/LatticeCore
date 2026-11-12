@@ -260,6 +260,75 @@ TEST(QueryStatementLifetime, CheckpointQueryRetainsMutexUntilStatementFinalizes)
     EXPECT_EQ(count(f.db), 2);
 }
 
+TEST(QueryStatementLifetime, CheckpointFunnelDeliversPendingWritesAfterUnlock) {
+    Fixture f;
+    mark_writes(f.db);
+    int delivered = 0, lock_result = -1;
+    bool no_statement = false;
+    f.db.set_txn_hooks([&] {
+        ++delivered;
+        lock_result = mutex_probe(f.db);
+        no_statement = sqlite3_next_stmt(f.db.handle(), nullptr) == nullptr;
+    }, [] {});
+    // A direct SQLite write runs the update hook without a wrapper statement
+    // tail. Its committed notification is pending when checkpointing starts.
+    ASSERT_EQ(sqlite3_exec(f.db.handle(), "INSERT INTO QueryProbe VALUES(2,2)",
+                          nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(delivered, 0);
+    ASSERT_EQ(sqlite3_get_autocommit(f.db.handle()), 1);
+
+    const auto result = detail::checkpoint_writable_schemas(f.db, true);
+
+    EXPECT_EQ(result.rc, SQLITE_OK);
+    EXPECT_EQ(result.busy, 0);
+    EXPECT_EQ(delivered, 1);
+    EXPECT_EQ(lock_result, SQLITE_OK);
+    EXPECT_TRUE(no_statement);
+    EXPECT_EQ(count(f.db), 2);
+    EXPECT_EQ(delivered, 1) << "A later read must not redeliver the committed write";
+}
+
+TEST(QueryStatementLifetime, FailedCheckpointFunnelDeliversPendingWritesAfterUnlock) {
+    Fixture f;
+    mark_writes(f.db);
+    int delivered = 0, lock_result = -1;
+    bool no_statement = false;
+    f.db.set_txn_hooks([&] {
+        ++delivered;
+        lock_result = mutex_probe(f.db);
+        no_statement = sqlite3_next_stmt(f.db.handle(), nullptr) == nullptr;
+    }, [] {});
+    ASSERT_EQ(sqlite3_exec(f.db.handle(), "INSERT INTO QueryProbe VALUES(2,2)",
+                          nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(delivered, 0);
+    ASSERT_EQ(sqlite3_get_autocommit(f.db.handle()), 1);
+
+    int denied = 0;
+    ASSERT_EQ(sqlite3_set_authorizer(f.db.handle(),
+        [](void* context, int action, const char* name, const char*, const char*, const char*) {
+            if (action == SQLITE_PRAGMA && name && std::string(name) == "wal_checkpoint") {
+                ++*static_cast<int*>(context);
+                return SQLITE_DENY;
+            }
+            return SQLITE_OK;
+        }, &denied), SQLITE_OK);
+    struct ClearAuthorizer {
+        sqlite3* handle;
+        ~ClearAuthorizer() { sqlite3_set_authorizer(handle, nullptr, nullptr); }
+    } clear_authorizer{f.db.handle()};
+    std::string error;
+    try { detail::checkpoint_writable_schemas(f.db, true); }
+    catch (const db_error& failure) { error = failure.what(); }
+
+    EXPECT_EQ(denied, 1);
+    EXPECT_EQ(error, "Failed to prepare query: not authorized");
+    EXPECT_EQ(delivered, 1);
+    EXPECT_EQ(lock_result, SQLITE_OK);
+    EXPECT_TRUE(no_statement);
+    EXPECT_EQ(count(f.db), 2);
+    EXPECT_EQ(delivered, 1) << "The failed checkpoint must still drain exactly once";
+}
+
 TEST(QueryStatementLifetime, ReturningQueryPreventsConcurrentCommitAtRowGap) {
     Fixture f;
     f.db.begin_transaction();

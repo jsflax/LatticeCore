@@ -2830,7 +2830,7 @@ extern "C" lattice_status_t lattice_db_checkpoint(lattice_db_t* db, int32_t mode
             // PASSIVE: checkpoint what can be done without blocking
             // readers/writers. PRAGMA for the same reason the bridge uses it
             // (sqlite3ext.h macro shadowing on Linux TUs).
-            impl->db().query("PRAGMA wal_checkpoint(PASSIVE)", {});
+            lattice::detail::checkpoint_writable_schemas(impl->db(), false);
         }
         return LATTICE_OK;
     } catch (const std::exception& e) {

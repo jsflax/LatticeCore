@@ -4,6 +4,7 @@
 #include <dynamic_object.hpp>   // dynamic_object, dynamic_object_ref
 #include <fstream>
 #include <memory>
+#include <set>
 #include <fcntl.h>
 #include <limits.h>
 
@@ -417,6 +418,113 @@ TEST(Bridge, CombinedNearestL1OrdersByRescoredDistance) {
                   results[i + 1].distances[0].distance)
             << "distances must be non-decreasing at index " << i;
     }
+}
+
+TEST(Bridge, CombinedSearchWithAbsentLegacyFilterReturnsEmptyAndRecordsError) {
+    TempDB receiver_path{"bridge_search_current"};
+    TempDB source_path{"bridge_search_legacy"};
+    const std::string table = "LegacySearchDoc";
+    const lattice::SchemaVector legacy_schemas = {
+        make_schema(table, {
+            {"label", text_prop("label")},
+            {"embedding", blob_prop("embedding")},
+            {"included", int_prop("included")},
+        })
+    };
+    auto current_schemas = legacy_schemas;
+    auto added_flag = int_prop("addedFlag");
+    added_flag.nullable = true;
+    current_schemas[0].properties["addedFlag"] = added_flag;
+
+    auto seed = [&](lattice::swift_lattice& db, const lattice::SwiftSchema& properties,
+                    const std::string& label) {
+        db.ensure_fts5_table(table, "label");
+        auto row = make_sdo(table, properties);
+        row.values["label"] = label;
+        row.values["embedding"] = pack_floats({1.0f, 0.0f, 0.0f, 0.0f});
+        row.values["included"] = int64_t(1);
+        if (properties.count("addedFlag")) row.values["addedFlag"] = int64_t(1);
+        { lattice::dynamic_object object(row); db.add(object); }
+        const auto rows = db.db().query(
+            "SELECT globalId FROM " + table + " WHERE label = ?", {label});
+        ASSERT_EQ(rows.size(), 1u);
+        db.upsert_vec0(table, "embedding",
+            std::get<std::string>(rows[0].at("globalId")),
+            pack_floats({1.0f, 0.0f, 0.0f, 0.0f}));
+    };
+
+    std::unique_ptr<lattice::swift_lattice_ref> receiver_ref(
+        lattice::swift_lattice_ref::create(
+            lattice::swift_configuration(receiver_path.str()), current_schemas));
+    auto& receiver = *receiver_ref->get();
+    ASSERT_NO_FATAL_FAILURE(seed(receiver, current_schemas[0].properties, "receiver quartz"));
+    {
+        std::unique_ptr<lattice::swift_lattice_ref> source_writer(
+            lattice::swift_lattice_ref::create(
+                lattice::swift_configuration(source_path.str()), legacy_schemas));
+        ASSERT_NO_FATAL_FAILURE(seed(
+            *source_writer->get(), legacy_schemas[0].properties, "legacy quartz"));
+    }
+    lattice::swift_configuration source_config(source_path.str());
+    source_config.read_only = true;
+    std::unique_ptr<lattice::swift_lattice_ref> source_ref(
+        lattice::swift_lattice_ref::create(source_config, legacy_schemas));
+
+    const lattice::VectorConstraintVector vectors = {
+        lattice::vector_constraint("embedding",
+            pack_floats({1.0f, 0.0f, 0.0f, 0.0f}), /*k=*/10, /*metric=*/0)
+    };
+    const lattice::TextConstraintVector texts = {
+        lattice::text_constraint("label", "quartz", /*limit=*/10)
+    };
+    auto search = [&](bool vector_search, const std::string& filter) {
+        return receiver.combined_nearest_query(table, {},
+            vector_search ? vectors : lattice::VectorConstraintVector{}, {},
+            vector_search ? lattice::TextConstraintVector{} : texts,
+            filter, lattice::sort_descriptor{}, /*limit=*/10);
+    };
+    auto count = [&](bool vector_search, const std::string& filter) {
+        return receiver.combined_nearest_query_count(table, {},
+            vector_search ? vectors : lattice::VectorConstraintVector{}, {},
+            vector_search ? lattice::TextConstraintVector{} : texts,
+            filter, lattice::sort_descriptor{}, /*limit=*/10);
+    };
+
+    // Both searches match the receiver before the legacy search arm is attached.
+    for (const bool vector_search : {true, false}) {
+        SCOPED_TRACE(vector_search ? "vector" : "full-text");
+        const auto results = search(vector_search, "addedFlag = 1");
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+        ASSERT_EQ(results.size(), 1u);
+        EXPECT_EQ(results[0].object.get_string("label"), "receiver quartz");
+        EXPECT_EQ(count(vector_search, "addedFlag = 1"), 1);
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+    }
+    ASSERT_TRUE(receiver.attach(*source_ref->get()))
+        << receiver.last_attach_error().value_or("");
+
+    for (const bool vector_search : {true, false}) {
+        SCOPED_TRACE(vector_search ? "vector" : "full-text");
+        const auto results = search(vector_search, "included = 1");
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+        ASSERT_EQ(results.size(), 2u);
+        std::set<std::string> labels;
+        for (const auto& result : results) labels.insert(result.object.get_string("label"));
+        EXPECT_EQ(labels, (std::set<std::string>{"receiver quartz", "legacy quartz"}));
+        EXPECT_EQ(count(vector_search, "included = 1"), 2);
+        EXPECT_TRUE(lattice::last_bridge_error().empty());
+
+        // Search filters still use each physical table. An absent legacy column
+        // fails the whole statement, including otherwise matching receiver rows.
+        const auto failed = search(vector_search, "addedFlag = 1");
+        EXPECT_TRUE(failed.empty());
+        EXPECT_EQ(lattice::last_bridge_error(),
+            "Failed to prepare query: no such column: addedFlag");
+        EXPECT_EQ(count(vector_search, "addedFlag = 1"), 0);
+        EXPECT_EQ(lattice::last_bridge_error(),
+            "Failed to prepare query: no such column: addedFlag");
+    }
+    EXPECT_TRUE(receiver.detach(*source_ref->get()));
 }
 
 // ============================================================================

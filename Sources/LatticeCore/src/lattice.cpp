@@ -1594,6 +1594,76 @@ std::string quoted_attach_alias(const std::string& alias) {
     return quoted;
 }
 
+std::string attachment_uri_encode(const std::string& value, bool path) {
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string encoded;
+    for (unsigned char c : value) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' ||
+            (path && c == '/')) {
+            encoded += static_cast<char>(c);
+        } else {
+            encoded += '%';
+            encoded += hex[c >> 4];
+            encoded += hex[c & 15];
+        }
+    }
+    return encoded;
+}
+
+std::string read_only_attachment_uri(database& source) {
+    if (source.is_closed()) throw db_error("attach: the database being attached is closed");
+    auto* handle = source.handle();
+    auto* mutex = sqlite3_db_mutex(handle);
+    sqlite3_mutex_enter(mutex);
+    struct unlock { sqlite3_mutex* value; ~unlock() { sqlite3_mutex_leave(value); } } held{mutex};
+    if (source.is_closed()) throw db_error("attach: the database being attached is closed");
+    // Use SQLite's actual file name, not the configuration's URI text or its
+    // substring-based memory classification. Copy all data while it is owned.
+    const char* filename = sqlite3_db_filename(handle, "main");
+    if (!filename || !*filename)
+        throw db_error("attach: read-only attachments require a file-backed source");
+    std::string uri = "file://" + attachment_uri_encode(filename, true) + "?mode=ro";
+    std::unordered_set<std::string> parameters;
+    for (int i = 0; const char* key = sqlite3_uri_key(filename, i); ++i) {
+        if (!parameters.emplace(key).second)
+            throw db_error("attach: duplicate source URI parameter");
+        if (std::string(key) == "mode") continue;
+        // Preserve the explicit VFS/cache selection. Other options need their
+        // own semantics review; in particular, never introduce immutable or
+        // nolock into an attachment that must see live committed WAL content.
+        if (std::string(key) != "vfs" && std::string(key) != "cache")
+            throw db_error("attach: unsupported read-only source URI parameter");
+        const char* value = sqlite3_uri_parameter(filename, key);
+        uri += "&" + attachment_uri_encode(key, false) + "=" +
+               attachment_uri_encode(value ? value : "", false);
+    }
+    return uri;
+}
+
+// Return whether this call created the alias, so failure cleanup never
+// detaches an alias that was already present on this connection.
+bool attach_database(database& connection, const std::string& alias,
+                     const std::string& target, bool read_only,
+                     bool tolerate_existing = false) {
+    try {
+        connection.execute("ATTACH DATABASE ? AS " + quoted_attach_alias(alias), {target});
+    } catch (const db_error& error) {
+        // Explicit writable attach retains the released duplicate-alias
+        // tolerance. Reopening a connection still requires a fresh alias,
+        // and read-only sources must establish their own checked alias.
+        if (tolerate_existing && !read_only &&
+            std::string(error.what()).find("already in use") != std::string::npos)
+            return false;
+        throw;
+    }
+    if (read_only && sqlite3_db_readonly(connection.handle(), alias.c_str()) != 1) {
+        connection.execute("DETACH DATABASE " + quoted_attach_alias(alias));
+        throw db_error("attach: source alias did not open read-only");
+    }
+    return true;
+}
+
 // Model tables only — excludes sqlite internals, _-prefixed virtual/shadow
 // tables, and Lattice bookkeeping. %s is the sqlite_master to scan.
 constexpr const char* kAttachTableFilter =
@@ -1715,17 +1785,9 @@ std::vector<std::shared_ptr<database>> lattice_db::view_handles() {
 
 void lattice_db::restore_attached_views(database& connection) {
     // Caller holds attach_mutex_; this connection is not published yet.
-    for (const auto& [alias, path] : attached_dbs_) {
-        std::string escaped_path, escaped_alias;
-        for (char c : path) {
-            escaped_path += c;
-            if (c == '\'') escaped_path += '\'';
-        }
-        for (char c : alias) {
-            escaped_alias += c;
-            if (c == '"') escaped_alias += '"';
-        }
-        connection.execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
+    for (const auto& entry : attached_dbs_) {
+        attach_database(connection, entry.alias, entry.read_only_uri.value_or(entry.path),
+                        entry.read_only_uri.has_value());
     }
     for (const auto& [name, sql] : attached_view_sql_) connection.execute(sql);
 }
@@ -1817,12 +1879,16 @@ void lattice_db::attach(lattice_db &lattice) {
 
     // Idempotence: same alias + same path is a no-op; same alias for a
     // different path is a caller error.
-    for (const auto& [existing_alias, existing_path] : attached_dbs_) {
-        if (existing_alias == alias) {
-            if (existing_path == lattice.config_.path) return;
+    for (const auto& entry : attached_dbs_) {
+        if (entry.alias == alias) {
+            if (entry.path == lattice.config_.path) {
+                if (entry.read_only_uri.has_value() != lattice.config_.read_only)
+                    throw std::runtime_error("attach: alias '" + alias + "' already has a different access mode");
+                return;
+            }
             throw std::runtime_error(
                 "attach: alias '" + alias + "' is already attached to a different database (" +
-                existing_path + ")");
+                entry.path + ")");
         }
     }
 
@@ -1840,7 +1906,47 @@ void lattice_db::attach(lattice_db &lattice) {
             if (!main_set.count(table_name)) continue;
             auto main_cols = get_column_names(handles.front().get(), "main", table_name);
             auto other_cols = get_column_names(other.get(), "main", table_name);
-            if (main_cols != other_cols) {
+            // A read-only older schema can omit additive nullable/defaulted
+            // columns. Its identity and required values must still be present;
+            // a writable source always requires the complete current shape.
+            bool compatible_legacy = lattice.config_.read_only &&
+                std::includes(main_cols.begin(), main_cols.end(),
+                              other_cols.begin(), other_cols.end());
+            if (compatible_legacy && main_cols != other_cols) {
+                std::unordered_set<std::string> key_columns{"globalId", "primaryKey"};
+                for (const auto& index : handles.front()->query(
+                         "PRAGMA main.index_list(" + table_name + ")")) {
+                    if (std::get<int64_t>(index.at("unique")) == 0) continue;
+                    const auto& index_name = std::get<std::string>(index.at("name"));
+                    for (const auto& column : handles.front()->query(
+                             "PRAGMA main.index_info(" + history_quote(index_name, '"') + ")")) {
+                        const auto& name = column.at("name");
+                        // An expression key cannot be proven independent of
+                        // the absent columns from column metadata alone.
+                        if (!std::holds_alternative<std::string>(name)) {
+                            compatible_legacy = false;
+                            break;
+                        }
+                        key_columns.insert(std::get<std::string>(name));
+                    }
+                    if (!compatible_legacy) break;
+                }
+                for (const auto& column : handles.front()->query(
+                         "PRAGMA main.table_info(" + table_name + ")")) {
+                    const auto& name = std::get<std::string>(column.at("name"));
+                    if (std::binary_search(other_cols.begin(), other_cols.end(), name)) continue;
+                    const bool key = std::get<int64_t>(column.at("pk")) != 0 ||
+                                     key_columns.count(name) != 0;
+                    const bool required = std::get<int64_t>(column.at("notnull")) != 0;
+                    const bool has_default =
+                        !std::holds_alternative<std::nullptr_t>(column.at("dflt_value"));
+                    if (key || (required && !has_default)) {
+                        compatible_legacy = false;
+                        break;
+                    }
+                }
+            }
+            if (main_cols != other_cols && !compatible_legacy) {
                 LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
                           table_name.c_str(), alias.c_str());
                 throw std::runtime_error(
@@ -1850,33 +1956,29 @@ void lattice_db::attach(lattice_db &lattice) {
         }
     }
 
-    // ATTACH on every view-bearing handle (null-tolerant — sync-enabled and
-    // in-memory lattices have no read_db_; the old code null-dereferenced).
-    // SQLite's own duplicate-alias error is treated as idempotent success:
-    // belt to the bookkeeping check's suspenders.
-    // Escape single quotes in the path for the SQL literal (paths and named-
-    // memory names are caller-controlled strings).
-    std::string escaped_path;
-    escaped_path.reserve(lattice.config_.path.size());
-    for (char c : lattice.config_.path) {
-        escaped_path += c;
-        if (c == '\'') escaped_path += '\'';
-    }
-    for (const auto& handle : handles) {
-        try {
-            std::string escaped_alias;
-            escaped_alias.reserve(alias.size());
-            for (char c : alias) {
-                escaped_alias += c;
-                if (c == '\"') escaped_alias += '\"';
-            }
-            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
-        } catch (const db_error& e) {
-            if (std::string(e.what()).find("already in use") == std::string::npos) throw;
+    // Keep identity separate from SQLite's file URI, and retain this policy
+    // after the source object closes and receiver connections are reopened.
+    const auto read_only_uri = lattice.config_.read_only
+        ? std::optional<std::string>(read_only_attachment_uri(*other)) : std::nullopt;
+    const auto& target = read_only_uri ? *read_only_uri : lattice.config_.path;
+    std::vector<std::shared_ptr<database>> attached_handles;
+    try {
+        for (const auto& handle : handles) {
+            if (attach_database(*handle, alias, target, read_only_uri.has_value(),
+                                /*tolerate_existing=*/true))
+                attached_handles.push_back(handle);
         }
+    } catch (...) {
+        for (const auto& handle : attached_handles) {
+            try { handle->execute("DETACH DATABASE " + quoted_attach_alias(alias)); }
+            catch (const db_error& error) {
+                LOG_ERROR("db", "Failed to unwind attachment '%s': %s", alias.c_str(), error.what());
+            }
+        }
+        throw;
     }
 
-    attached_dbs_.emplace_back(alias, lattice.config_.path);
+    attached_dbs_.push_back({alias, lattice.config_.path, read_only_uri});
     attached_aliases_.push_back(alias);
     rebuild_attached_views(handles);
 }
@@ -1890,9 +1992,9 @@ void lattice_db::detach(lattice_db &lattice) {
     {
         std::lock_guard<std::mutex> attach_lock(attach_mutex_);
         auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
-            [&](const auto& entry) { return entry.second == lattice.config_.path; });
+            [&](const auto& entry) { return entry.path == lattice.config_.path; });
         if (it == attached_dbs_.end()) return;  // not attached: idempotent no-op
-        alias = it->first;
+        alias = it->alias;
     }
     detach_alias(alias);
 }
@@ -1903,7 +2005,7 @@ void lattice_db::detach_alias(const std::string& alias) {
     handles = view_handles();
 
     auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
-        [&](const auto& entry) { return entry.first == alias; });
+        [&](const auto& entry) { return entry.alias == alias; });
     if (it == attached_dbs_.end()) return;  // idempotent no-op
 
     // Views reference the alias — drop them all first (regeneration for the
@@ -1962,8 +2064,8 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
 
         // table → arms. An arm is (schema-qualifier, _source label).
         std::map<std::string, std::vector<std::pair<std::string, std::string>>> arms;
-        for (const auto& [alias, _] : attached_dbs_) {
-            const std::string quoted = quoted_attach_alias(alias);
+        for (const auto& entry : attached_dbs_) {
+            const std::string quoted = quoted_attach_alias(entry.alias);
             char master[600];
             snprintf(master, sizeof(master), "%s.sqlite_master", quoted.c_str());
             for (const auto& table_name : model_tables(handle.get(), master)) {
@@ -1988,28 +2090,43 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
                 // live: a WHERE over the view read an attached row's
                 // modifiedAt as deletedAt and filtered every spoke row out
                 // of recall. Project every arm's columns explicitly, in one
-                // canonical order, so the view maps by NAME. A column
-                // missing from some arm then fails view creation loudly
-                // instead of scrambling silently.
+                // canonical order, so the view maps by NAME. For a validated
+                // legacy source overlapping main, fill only absent columns
+                // with the main schema's default or NULL. Present NULLs stay
+                // NULL, and no source table is altered.
                 const std::string first_schema =
                     in_main ? "main" : alias_arms.front().first;
-                auto ordered_cols = [&]() {
-                    auto rows = handle->query(
-                        "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
+                const auto canonical_columns = handle->query(
+                    "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
+                auto projection_for = [&](const std::string& arm_schema) {
+                    const auto present = get_column_names(handle.get(), arm_schema, table_name);
                     std::string cols;
-                    for (const auto& row : rows) {
-                        auto it = row.find("name");
-                        if (it == row.end() ||
-                            !std::holds_alternative<std::string>(it->second)) continue;
+                    for (const auto& column : canonical_columns) {
+                        const auto& name = std::get<std::string>(column.at("name"));
                         if (!cols.empty()) cols += ", ";
-                        cols += "\"" + std::get<std::string>(it->second) + "\"";
+                        std::string quoted_name = "\"";
+                        for (char c : name) {
+                            quoted_name += c;
+                            if (c == '"') quoted_name += '"';
+                        }
+                        quoted_name += "\"";
+                        // Attached-only tables have not passed main-overlap
+                        // validation. Keep their existing projection contract.
+                        if (!in_main || std::binary_search(present.begin(), present.end(), name)) {
+                            cols += quoted_name;
+                        } else {
+                            const auto& value = column.at("dflt_value");
+                            cols += std::holds_alternative<std::string>(value)
+                                ? "(" + std::get<std::string>(value) + ")" : "NULL";
+                            cols += " AS " + quoted_name;
+                        }
                     }
                     return cols;
-                }();
+                };
                 sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
                 bool first = true;
                 if (in_main) {
-                    sql += "SELECT " + ordered_cols + ", 'main' AS _source FROM main." + table_name;
+                    sql += "SELECT " + projection_for("main") + ", 'main' AS _source FROM main." + table_name;
                     first = false;
                 }
                 for (const auto& [qualifier, label] : alias_arms) {
@@ -2022,7 +2139,7 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
                         escaped_label += c;
                         if (c == '\'') escaped_label += '\'';
                     }
-                    sql += "SELECT " + ordered_cols + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
+                    sql += "SELECT " + projection_for(qualifier) + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
                     first = false;
                 }
             }

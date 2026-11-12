@@ -1,3 +1,6 @@
+#ifndef SQLITE_CORE
+#define SQLITE_CORE 1
+#endif
 #include "TestHelpers.hpp"
 #include <lattice/sync.hpp>
 #include <fstream>
@@ -17,6 +20,35 @@ int64_t person_count(lattice::lattice_db& db) {
     auto rows = db.db().query("SELECT COUNT(*) AS c FROM TestPerson");
     return rows.empty() ? -1 : std::get<int64_t>(rows[0].at("c"));
 }
+
+std::string quoted_alias_for(const TempDB& file) {
+    std::string quoted = "\"";
+    for (char c : file.path.stem().string()) {
+        quoted += c;
+        if (c == '"') quoted += '"';
+    }
+    return quoted + '"';
+}
+
+std::vector<lattice::database::row_t> attachment_topology(lattice::database& db) {
+    db.query("SELECT name FROM sqlite_temp_master");
+    return db.query("PRAGMA database_list");
+}
+
+struct DenyAttach {
+    sqlite3* handle;
+    int attempts = 0;
+    explicit DenyAttach(sqlite3* value) : handle(value) {
+        if (sqlite3_set_authorizer(handle,
+                [](void* context, int action, const char*, const char*, const char*, const char*) {
+                    if (action != SQLITE_ATTACH) return SQLITE_OK;
+                    ++static_cast<DenyAttach*>(context)->attempts;
+                    return SQLITE_DENY;
+                }, this) != SQLITE_OK)
+            throw std::runtime_error("Cannot install attachment refusal");
+    }
+    ~DenyAttach() { sqlite3_set_authorizer(handle, nullptr, nullptr); }
+};
 } // namespace
 
 TEST(Attach, AttachTwiceIsNoOp) {
@@ -34,6 +66,121 @@ TEST(Attach, AttachTwiceIsNoOp) {
     EXPECT_EQ(temp_view_count(a.db()), views_after_first);
     EXPECT_EQ(person_count(a), count_after_first);
     EXPECT_EQ(count_after_first, 2);
+}
+
+TEST(Attach, WritableSourceAdoptsAnExistingSQLiteAlias) {
+    for (bool reader_already_attached : {false, true}) {
+        SCOPED_TRACE(reader_already_attached);
+        TempDB main_file{"writable_existing_main"}, source_file{"writable_existing_source"};
+        lattice::lattice_db receiver{lattice::configuration(main_file.str())};
+        lattice::lattice_db source{lattice::configuration(source_file.str())};
+        receiver.add(TestPerson{"main", 1, std::nullopt});
+        source.add(TestPerson{"source", 2, std::nullopt});
+        const auto alias = quoted_alias_for(source_file);
+        receiver.db().execute("ATTACH DATABASE ? AS " + alias, {source_file.str()});
+        if (reader_already_attached)
+            receiver.read_db().execute("ATTACH DATABASE ? AS " + alias, {source_file.str()});
+
+        ASSERT_NO_THROW(receiver.attach(source));
+        EXPECT_EQ(person_count(receiver), 2);
+        EXPECT_EQ(std::get<int64_t>(receiver.read_db().query(
+            "SELECT COUNT(*) AS c FROM TestPerson")[0].at("c")), 2);
+        receiver.db().execute("UPDATE " + alias + ".TestPerson SET name='updated'");
+        EXPECT_EQ(std::get<std::string>(source.db().query(
+            "SELECT name FROM TestPerson")[0].at("name")), "updated");
+
+        const auto writer_before = attachment_topology(receiver.db());
+        const auto reader_before = attachment_topology(receiver.read_db());
+        ASSERT_NO_THROW(receiver.attach(source));
+        EXPECT_EQ(attachment_topology(receiver.db()), writer_before);
+        EXPECT_EQ(attachment_topology(receiver.read_db()), reader_before);
+        receiver.detach(source);
+        EXPECT_EQ(person_count(receiver), 1);
+        const auto name = source_file.path.stem().string();
+        EXPECT_EQ(sqlite3_db_readonly(receiver.db().handle(), name.c_str()), -1);
+        EXPECT_EQ(sqlite3_db_readonly(receiver.read_db().handle(), name.c_str()), -1);
+    }
+}
+
+TEST(Attach, WritableReservedAliasToleranceDoesNotExtendToReaderReopen) {
+    TempDB directory{"writable_reserved_alias_dir"};
+    ASSERT_TRUE(std::filesystem::create_directory(directory.path));
+    // The child is destroyed before its directory holder, including on failure.
+    TempDB source_file;
+    source_file.path = directory.path / "main.sqlite";
+    struct RemoveFixtureSignal {
+        std::filesystem::path path;
+        ~RemoveFixtureSignal() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } source_signal{source_file.str() + "-signal"};
+    TempDB main_file{"writable_reserved_alias_receiver"};
+    lattice::lattice_db receiver{lattice::configuration(main_file.str())};
+    lattice::lattice_db source{lattice::configuration(source_file.str())};
+    receiver.add(TestPerson{"main", 1, std::nullopt});
+    source.add(TestPerson{"source", 2, std::nullopt});
+    ASSERT_EQ(quoted_alias_for(source_file), "\"main\"");
+
+    // Explicit writable attach retains the released duplicate-alias tolerance.
+    // Restoring that tracked alias onto a fresh reader never had that tolerance.
+    ASSERT_NO_THROW(receiver.attach(source));
+    receiver.close_read_db();
+    std::string error;
+    try { receiver.reopen_read_db(); }
+    catch (const lattice::db_error& failure) { error = failure.what(); }
+    EXPECT_NE(error.find("database main is already in use"), std::string::npos);
+    EXPECT_EQ(std::get<std::string>(receiver.db().query(
+        "SELECT name FROM main.TestPerson")[0].at("name")), "main");
+}
+
+TEST(Attach, WritableAttachFailureUnwindsOnlyNewAliases) {
+    for (bool writer_already_attached : {false, true}) {
+        for (bool reader_already_attached : {false, true}) {
+            SCOPED_TRACE(writer_already_attached);
+            SCOPED_TRACE(reader_already_attached);
+            TempDB main_file{"writable_unwind_main"}, source_file{"writable_unwind_source"};
+            lattice::lattice_db receiver{lattice::configuration(main_file.str())};
+            lattice::lattice_db source{lattice::configuration(source_file.str())};
+            receiver.add(TestPerson{"main", 1, std::nullopt});
+            source.add(TestPerson{"source", 2, std::nullopt});
+            const auto alias = quoted_alias_for(source_file);
+            if (writer_already_attached)
+                receiver.db().execute("ATTACH DATABASE ? AS " + alias, {source_file.str()});
+            if (reader_already_attached)
+                receiver.read_db().execute("ATTACH DATABASE ? AS " + alias, {source_file.str()});
+            const auto writer_before = attachment_topology(receiver.db());
+            const auto reader_before = attachment_topology(receiver.read_db());
+            const auto views_before = temp_view_count(receiver.db());
+
+            {
+                // The authorizer refuses ATTACH even when the reader's alias
+                // already exists. Neither that alias nor an existing writer
+                // alias belongs to this failed attempt's unwind.
+                DenyAttach refusal(receiver.read_db().handle());
+                EXPECT_THROW(receiver.attach(source), lattice::db_error);
+                EXPECT_EQ(refusal.attempts, 1);
+            }
+            EXPECT_EQ(attachment_topology(receiver.db()), writer_before);
+            EXPECT_EQ(attachment_topology(receiver.read_db()), reader_before);
+            EXPECT_EQ(temp_view_count(receiver.db()), views_before);
+            EXPECT_EQ(person_count(receiver), 1);
+            if (writer_already_attached)
+                EXPECT_EQ(std::get<std::string>(receiver.db().query(
+                    "SELECT name FROM " + alias + ".TestPerson")[0].at("name")), "source");
+            if (reader_already_attached)
+                EXPECT_EQ(std::get<std::string>(receiver.read_db().query(
+                    "SELECT name FROM " + alias + ".TestPerson")[0].at("name")), "source");
+
+            // A retry must still build the union: the failed attempt must not
+            // leave attachment bookkeeping that turns it into a no-op.
+            ASSERT_NO_THROW(receiver.attach(source));
+            EXPECT_EQ(person_count(receiver), 2);
+            EXPECT_EQ(std::get<int64_t>(receiver.read_db().query(
+                "SELECT COUNT(*) AS c FROM TestPerson")[0].at("c")), 2);
+            receiver.detach(source);
+        }
+    }
 }
 
 // Pins the null-deref fix: sync-enabled lattices have no read_db_; the old

@@ -5053,9 +5053,11 @@ public:
 
     /// Attach another lattice's database under an alias derived from its
     /// filename, exposing overlapping tables as UNION views and
-    /// attached-only tables as passthrough views. Idempotent: attaching the
-    /// same database again is a no-op; the same alias for a DIFFERENT path
-    /// throws. Schema overlap is validated BEFORE any side effect — a
+    /// attached-only tables as passthrough views. Reattaching a tracked
+    /// database in the same access mode is a no-op; a different access mode
+    /// or the same tracked alias for a DIFFERENT path throws. Read-only
+    /// sources must be live file-backed handles with supported URI options.
+    /// Schema overlap is validated BEFORE any side effect — a
     /// mismatch throws with no dangling ATTACH and no half-created views.
     /// Serialized against detach() by an internal mutex.
     void attach(lattice_db& lattice);
@@ -6715,12 +6717,18 @@ protected:
     std::vector<std::string> attached_aliases_;
 
     // attach/detach bookkeeping — all guarded by attach_mutex_:
-    // (alias, path) pairs for idempotence checks, and the names of every
-    // TEMP view attach created so regeneration can drop exactly what it
+    // Raw configured paths remain the identity used by attach/detach. The
+    // optional URI retains a read-only file alias policy across handle reopen.
+    // Retain every TEMP view name so regeneration can drop exactly what it
     // owns (view names are the bare table names; the set is identical on
     // every view-bearing handle).
     std::mutex attach_mutex_;
-    std::vector<std::pair<std::string, std::string>> attached_dbs_;
+    struct attached_database {
+        std::string alias;
+        std::string path;
+        std::optional<std::string> read_only_uri;
+    };
+    std::vector<attached_database> attached_dbs_;
     std::set<std::string> attached_view_names_;
 
     // Exact TEMP view definitions rebuilt by attach/detach; reopening a handle

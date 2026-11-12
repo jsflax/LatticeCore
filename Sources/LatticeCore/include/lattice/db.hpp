@@ -12,7 +12,10 @@
 
 namespace lattice {
 class lattice_db;
-namespace detail { bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&); }
+namespace detail {
+bool sync_delivery_transaction(lattice_db&, const std::function<bool()>&);
+struct checkpoint_access;
+}
 
 struct audit_log_entry;
 
@@ -34,6 +37,7 @@ class database {
     friend class lattice_db;
     friend class synchronizer_base;
     friend struct detached_read_access;
+    friend struct detail::checkpoint_access;
     friend bool detail::sync_delivery_transaction(lattice_db&, const std::function<bool()>&);
     // Test-only friend seam: install on the query's calling thread and clear
     // before that thread exits. No public setter, bridge API or instance field.
@@ -240,10 +244,9 @@ public:
     /// before the keeper transaction can close (results spec §3.4).
     void interrupt();
 
-    /// Result of a wal_checkpoint() call. rc is the PRAGMA's SQLite result
-    /// code; busy is 1 when the checkpoint could not complete because a
-    /// reader/writer held the WAL; log_frames/checkpointed mirror the PRAGMA
-    /// row (-1 when unavailable).
+    /// Result of a wal_checkpoint() call. rc is the SQLite result code;
+    /// busy is 1 if any writable schema could not complete its checkpoint.
+    /// Frame counts sum the writable schemas with a WAL (-1 if unavailable).
     struct checkpoint_result {
         int rc = 0;
         int busy = 1;
@@ -251,7 +254,8 @@ public:
         int64_t checkpointed = -1;
     };
 
-    /// Run a WAL checkpoint on this (read-write) connection.
+    /// Checkpoint main and writable attachment aliases by name, leaving
+    /// read-only aliases untouched, on this (read-write) connection.
     /// PASSIVE (truncate=false) backfills as far as the oldest live reader
     /// allows and never blocks anyone. TRUNCATE (truncate=true) additionally
     /// resets the -wal file to zero length, but must wait out readers — the
@@ -339,6 +343,13 @@ private:
                                     const char* prepare_error = nullptr, const char* step_error = nullptr);
 
 };
+
+namespace detail {
+// Internal checkpoint funnel shared by core, bridge and C entry points.
+// Keeps the caller's busy policy; throws on query failure. Never checkpoints
+// a read-only alias, even when its WAL is already completely backfilled.
+database::checkpoint_result checkpoint_writable_schemas(database& db, bool truncate);
+}
 
 // RAII transaction guard
 class transaction {

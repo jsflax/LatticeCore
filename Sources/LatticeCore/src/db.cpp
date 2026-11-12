@@ -932,6 +932,60 @@ void database::interrupt() {
     if (db_) sqlite3_interrupt(db_);
 }
 
+struct detail::checkpoint_access {
+    static database::checkpoint_result run(database& db, bool truncate) {
+        database::checkpoint_result result;
+        auto* handle = db.handle();
+        if (!handle || db.is_closed()) return result;
+        try {
+            // Protect the schema list and each read-only check through the
+            // checkpoint, while deferring observer delivery until this outer
+            // scope has unlocked. A raw mutex would be invisible to query's
+            // delivery tail and could run callbacks with SQLite still held.
+            database::statement_scope scope(db);
+            const auto schemas = db.query("PRAGMA database_list");
+            // Logical close can make enumeration unavailable. Keep the old
+            // busy/unavailable outcome rather than reporting success.
+            if (!schemas.empty()) {
+                result.rc = SQLITE_OK;
+                result.busy = 0;
+                for (const auto& schema : schemas) {
+                    const auto& name = std::get<std::string>(schema.at("name"));
+                    if (name == "temp" || sqlite3_db_readonly(handle, name.c_str()) != 0) continue;
+                    std::string quoted = "\"";
+                    for (char c : name) { quoted += c; if (c == '"') quoted += c; }
+                    quoted += '"';
+                    const auto rows = db.query("PRAGMA " + quoted +
+                        (truncate ? ".wal_checkpoint(TRUNCATE)" : ".wal_checkpoint(PASSIVE)"));
+                    if (rows.empty()) throw db_error("Checkpoint returned no outcome for schema " + name);
+                    auto get = [&](const char* key) -> int64_t {
+                        auto it = rows[0].find(key);
+                        return it != rows[0].end() && std::holds_alternative<int64_t>(it->second)
+                            ? std::get<int64_t>(it->second) : -1;
+                    };
+                    result.busy |= get("busy") != 0;
+                    const auto log = get("log"), checkpointed = get("checkpointed");
+                    if (log >= 0)
+                        result.log_frames = (result.log_frames < 0 ? 0 : result.log_frames) + log;
+                    if (checkpointed >= 0)
+                        result.checkpointed = (result.checkpointed < 0 ? 0 : result.checkpointed) + checkpointed;
+                }
+            }
+        } catch (...) {
+            // Match query's error tail: deliver prior committed work after
+            // unlock without replacing the initiating checkpoint exception.
+            try { db.drain_if_settled(); } catch (...) {}
+            throw;
+        }
+        db.drain_if_settled();
+        return result;
+    }
+};
+
+database::checkpoint_result detail::checkpoint_writable_schemas(database& db, bool truncate) {
+    return checkpoint_access::run(db, truncate);
+}
+
 database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_budget_ms) {
     checkpoint_result result;
 #ifdef __EMSCRIPTEN__
@@ -949,21 +1003,7 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
     // cycle) rather than stall every writer behind it.
     configure_busy_timeout(truncate ? busy_budget_ms : 0);
     try {
-        auto rows = query(truncate ? "PRAGMA wal_checkpoint(TRUNCATE)"
-                                   : "PRAGMA wal_checkpoint(PASSIVE)");
-        result.rc = SQLITE_OK;
-        if (!rows.empty()) {
-            auto get = [&](const char* key) -> int64_t {
-                auto it = rows[0].find(key);
-                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    return std::get<int64_t>(it->second);
-                }
-                return -1;
-            };
-            result.busy = static_cast<int>(get("busy"));
-            result.log_frames = get("log");
-            result.checkpointed = get("checkpointed");
-        }
+        result = detail::checkpoint_writable_schemas(*this, truncate);
     } catch (const std::exception& e) {
         result.rc = SQLITE_ERROR;
         LOG_DEBUG("db", "wal_checkpoint(%s) failed: %s, path=%s",

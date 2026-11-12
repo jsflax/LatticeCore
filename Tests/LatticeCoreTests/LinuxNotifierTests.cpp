@@ -15,12 +15,14 @@
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <spawn.h>
 #include <stdexcept>
 #include <string>
 #include <sys/resource.h>
+#include <sys/inotify.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -333,6 +335,122 @@ TEST(LinuxNotifierResources, OpenedFileStoresMustHaveActiveListeners) {
     EXPECT_EQ(reopened->db().query("SELECT sequence FROM NotifierResourceRow WHERE sequence=3").size(), 1u);
     std::cout << "NOTIFIER_RESOURCE reopened_listening=" << restored->is_listening()
               << " recovered_insert_callbacks=" << recovered.inserts() << std::endl;
+}
+
+void repaired_signal_path_retries_setup() {
+    ASSERT_EQ(std::getenv("LATTICE_DISABLE_XPROC"), nullptr);
+    ResourceFiles files;
+    const auto path = files.store(0);
+    const auto signal_path = path + "-signal";
+    {
+        lattice::lattice_db seed(resource_config(path));
+        ASSERT_FALSE(seed.db().wal_checkpoint(true).busy);
+    }
+
+    // This owned loop makes watch setup fail independently of the host's
+    // inotify quota, without obstructing the database file's own open.
+    ASSERT_TRUE(std::filesystem::remove(signal_path));
+    const auto target = std::filesystem::path(signal_path).filename().string();
+    ASSERT_EQ(::symlink(target.c_str(), signal_path.c_str()), 0);
+    const int probe = ::inotify_init1(IN_CLOEXEC);
+    ASSERT_GE(probe, 0);
+    errno = 0;
+    const int watch = ::inotify_add_watch(probe, signal_path.c_str(), IN_CLOSE_WRITE);
+    const int watch_error = errno;
+    const int close_result = ::close(probe);
+    ASSERT_EQ(close_result, 0);
+    ASSERT_EQ(watch, -1);
+    ASSERT_EQ(watch_error, ELOOP);
+    std::fprintf(stderr, "NOTIFIER_SETUP forced_watch_errno=%d expected_errno=%d\n", watch_error, ELOOP);
+
+    auto first = std::make_unique<lattice::lattice_db>(resource_config(path));
+    auto& registry = lattice::instance_registry::instance();
+    auto* initial = registry.get_or_create_notifier(path);
+    ASSERT_NE(initial, nullptr);
+    ASSERT_FALSE(initial->is_listening());
+    std::fprintf(stderr, "NOTIFIER_SETUP first_open_returned=1 initial_listening=0\n");
+
+    // Repair only the fixture fault while keeping the original owner alive.
+    ASSERT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(signal_path)));
+    ASSERT_TRUE(std::filesystem::remove(signal_path));
+    const int signal = ::open(signal_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(signal, 0);
+    ASSERT_EQ(::close(signal), 0);
+    auto sibling = std::make_unique<lattice::lattice_db>(resource_config(path));
+    auto* retried = registry.get_or_create_notifier(path);
+    ASSERT_NE(retried, nullptr);
+    const bool recovered = retried->is_listening();
+    std::fprintf(stderr, "NOTIFIER_SETUP repaired=1 sibling_open_returned=1 same_notifier=%d retry_listening=%d\n",
+                 retried == initial, recovered);
+    EXPECT_TRUE(recovered) << "A new owner must retry failed listener setup after the signal path is repaired";
+    {
+        ResourceObservation observation(*first);
+        ASSERT_NO_FATAL_FAILURE(insert_from_child(files, path, 1));
+        EXPECT_EQ(first->db().query("SELECT sequence FROM NotifierResourceRow WHERE sequence=1").size(), 1u);
+        if (recovered) {
+            EXPECT_TRUE(observation.wait_for_insert(std::chrono::seconds(30)));
+            EXPECT_EQ(observation.inserts(), 1);
+        } else {
+            // The listening-state assertion above is the failing contract;
+            // this bounded wait additionally records the missed external wake.
+            EXPECT_FALSE(observation.wait_for_insert(std::chrono::milliseconds(250)));
+            EXPECT_EQ(observation.inserts(), 0);
+        }
+        std::fprintf(stderr, "NOTIFIER_SETUP repaired_path_insert_callbacks=%d\n", observation.inserts());
+    }
+
+    sibling.reset();
+    first.reset();
+    auto reopened = std::make_unique<lattice::lattice_db>(resource_config(path));
+    auto* fresh = registry.get_or_create_notifier(path);
+    ASSERT_NE(fresh, nullptr);
+    ASSERT_TRUE(fresh->is_listening());
+    ResourceObservation observation(*reopened);
+    ASSERT_NO_FATAL_FAILURE(insert_from_child(files, path, 2));
+    EXPECT_EQ(reopened->db().query("SELECT sequence FROM NotifierResourceRow WHERE sequence=2").size(), 1u);
+    EXPECT_TRUE(observation.wait_for_insert(std::chrono::seconds(30)));
+    EXPECT_EQ(observation.inserts(), 1);
+    std::fprintf(stderr, "NOTIFIER_SETUP full_release_reopened_listening=1 insert_callbacks=%d\n", observation.inserts());
+}
+
+TEST(LinuxNotifierResources, RepairedSignalPathRetriesSetupForAnOpenStore) {
+    struct RestoreStyle {
+        std::string prior = GTEST_FLAG_GET(death_test_style);
+        ~RestoreStyle() { GTEST_FLAG_SET(death_test_style, prior); }
+    } restore_style;
+    // Threadsafe death tests re-exec: the fixture fault and all native owners
+    // belong to a fresh process, not a fork retaining other tests' threads.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR) _exit(2);
+        sigset_t unblocked;
+        if (sigemptyset(&unblocked) != 0 || sigaddset(&unblocked, SIGALRM) != 0 ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        ::alarm(150);
+        try {
+            repaired_signal_path_retries_setup();
+            if (::testing::Test::HasFailure()) {
+                const auto* result = ::testing::UnitTest::GetInstance()->current_test_info()->result();
+                for (int i = 0, emitted = 0; i < result->total_part_count() && emitted < 16; ++i) {
+                    const auto& part = result->GetTestPartResult(i);
+                    if (part.failed()) {
+                        ++emitted;
+                        std::fprintf(stderr, "native_assertion %.512s:%d: %.4096s\n",
+                                     part.file_name() ? part.file_name() : "unknown", part.line_number(), part.summary());
+                    }
+                }
+                std::fflush(stderr);
+                _exit(1);
+            }
+            std::fputs("notifier_setup_probe_complete\n", stderr);
+            std::fflush(stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "notifier_setup_probe_failure: %s\n", error.what());
+            std::fflush(stderr);
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "notifier_setup_probe_complete");
 }
 #endif // Linux resource regression; not Android
 

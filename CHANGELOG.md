@@ -1,6 +1,6 @@
 # Changelog
 
-## [3.1.0] - Unreleased
+## [3.1.0] - 2026-11-12
 
 ### Added
 
@@ -15,9 +15,12 @@
   or migrate the source table.
 - File-backed sources configured read-only retain that policy on the receiver's
   attachment aliases and after connection reopening. SQLite rejects writes
-  through those aliases. Receiver checkpoints target `main` and writable
-  aliases by name, leaving read-only source WAL files untouched even when
-  already fully backfilled. Receiver cleanup retains the read-only policy.
+  through those aliases. Explicit receiver checkpoints target `main` and
+  writable aliases by name, leaving read-only source WAL files untouched even
+  when already fully backfilled. Receiver cleanup retains the read-only policy.
+  The explicit `checkpoint()` result reports frame counts summed over `main`
+  and writable aliases. On a store opened read-only, `checkpoint()` does no work
+  and reports not busy and not complete.
 
 ### Compatibility and limits
 
@@ -29,6 +32,8 @@
   also apply when the schemas have equal columns.
 - Explicit attachment of writable sources retains the 3.0.0 tolerance for
   an SQLite alias that is already in use; connection reopening remains strict.
+  A read-only source does not adopt an SQLite alias already in use; the attach
+  fails with SQLite's alias error.
   If attachment fails on a later connection, cleanup
   detaches only aliases created by that attempt and preserves existing ones.
 - There is no new storage-format epoch or public API change relative to 3.0.0.
@@ -45,14 +50,15 @@
   not be used for columns absent from the attached physical table. None of
   these typed reads supplies the union projection's declared default.
   Typed missing-column reads remain separate follow-up work.
-- Combined vector and full-text searches apply filters to each source's
-  physical table. If a participating legacy source has the corresponding
-  search index but lacks a referenced filter column, the whole search returns
+- Filtered vector searches and filtered full-text searches made through the
+  bridge's combined query apply filters to each source's physical table.
+  If a participating legacy source has the corresponding search index but lacks
+  a referenced filter column, the whole search returns
   no rows and its count is zero, including otherwise matching receiver rows.
   The bridge records the missing-column query error. Per-arm search projection
   remains separate follow-up work.
-- Read-only attachment has four behavior changes from 3.0.0. Each is refused
-  before any ATTACH, with an error identifying the unsupported form:
+- Read-only attachment adds four source-form refusals relative to 3.0.0.
+  Each is refused before any ATTACH, with an error identifying the unsupported form:
   - A source with no backing file: private memory, fileless temporary, or named
     shared-memory databases.
   - A source path with a repeated URI parameter or any parameter other than

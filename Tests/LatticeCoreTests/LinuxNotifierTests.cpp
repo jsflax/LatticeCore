@@ -647,6 +647,145 @@ TEST(LinuxNotifierResources, ACallbackCanReleaseItsLastNotifierOwner) {
         }
     }, ::testing::ExitedWithCode(0), "notifier_callback_release_complete");
 }
+
+bool replace_failed_callback_with_reentrant_capture_cleanup() {
+    ResourceFiles files;
+    const auto path = files.store(0);
+    const auto signal_path = path + "-signal";
+    bool disposed = false;
+    auto listener = lattice::make_cross_process_notifier(path);
+    if (!std::filesystem::remove(signal_path)) return false;
+    const auto target = std::filesystem::path(signal_path).filename().string();
+    if (::symlink(target.c_str(), signal_path.c_str()) != 0) return false;
+    auto capture = std::shared_ptr<int>(new int(1), [&, observed = listener.get()](int* value) {
+        std::fputs("capture_cleanup_entered\n", stderr);
+        std::fflush(stderr);
+        // Destroying a callback capture may query the still-live notifier.
+        // The final copy must therefore be released outside internal locks.
+        (void)observed->is_listening();
+        disposed = true;
+        delete value;
+        std::fputs("capture_cleanup_returned\n", stderr);
+        std::fflush(stderr);
+    });
+    listener->start_listening([capture] {});
+    capture.reset();
+    if (listener->is_listening()) return false;
+    if (!std::filesystem::remove(signal_path)) return false;
+    listener->start_listening([] {});
+    const bool recovered = listener->is_listening();
+    listener->stop_listening();
+    return recovered && disposed;
+}
+
+TEST(LinuxNotifierResources, RetriedCallbackReleasesCapturesOutsideNotifierLocks) {
+    struct RestoreStyle {
+        std::string prior = GTEST_FLAG_GET(death_test_style);
+        ~RestoreStyle() { GTEST_FLAG_SET(death_test_style, prior); }
+    } restore_style;
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR) _exit(2);
+        sigset_t unblocked;
+        if (sigemptyset(&unblocked) != 0 || sigaddset(&unblocked, SIGALRM) != 0 ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        ::alarm(30);
+        try {
+            if (!replace_failed_callback_with_reentrant_capture_cleanup() || ::testing::Test::HasFailure()) _exit(3);
+            std::fputs("notifier_capture_cleanup_complete\n", stderr);
+            std::fflush(stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "notifier_capture_cleanup_failure: %s\n", error.what());
+            std::fflush(stderr);
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "notifier_capture_cleanup_complete");
+}
+
+bool worker_releases_replaced_callback_outside_state_lock() {
+    ResourceFiles files;
+    const auto path = files.store(0);
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false, release = false, disposed = false;
+    auto listener = lattice::make_cross_process_notifier(path);
+    auto sender = lattice::make_cross_process_notifier(path);
+    struct Release {
+        std::mutex& mutex;
+        std::condition_variable& changed;
+        bool& release;
+        ~Release() {
+            std::lock_guard<std::mutex> lock(mutex);
+            release = true;
+            changed.notify_all();
+        }
+    } release_on_exit{mutex, changed, release};
+    auto capture = std::shared_ptr<int>(new int(1), [&, observed = listener.get()](int* value) {
+        std::fputs("worker_capture_cleanup_entered\n", stderr);
+        std::fflush(stderr);
+        observed->stop_listening();
+        delete value;
+        std::lock_guard<std::mutex> lock(mutex);
+        disposed = true;
+        changed.notify_all();
+        std::fputs("worker_capture_cleanup_returned\n", stderr);
+        std::fflush(stderr);
+    });
+    listener->start_listening([&, capture] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release; });
+    });
+    capture.reset();
+    sender->post_notification();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered; })) return false;
+    }
+    std::filesystem::rename(path + "-signal", path + "-old-signal");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (listener->is_listening() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (listener->is_listening()) return false;
+    // Replace the stored copy while the running worker still owns the original.
+    listener->start_listening([] {});
+    if (!listener->is_listening()) return false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        release = true;
+        changed.notify_all();
+        if (!changed.wait_for(lock, std::chrono::seconds(5), [&] { return disposed; })) return false;
+    }
+    return !listener->is_listening();
+}
+
+TEST(LinuxNotifierResources, WorkerCallbackReleasesCapturesOutsideStateLock) {
+    struct RestoreStyle {
+        std::string prior = GTEST_FLAG_GET(death_test_style);
+        ~RestoreStyle() { GTEST_FLAG_SET(death_test_style, prior); }
+    } restore_style;
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR) _exit(2);
+        sigset_t unblocked;
+        if (sigemptyset(&unblocked) != 0 || sigaddset(&unblocked, SIGALRM) != 0 ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        ::alarm(30);
+        try {
+            if (!worker_releases_replaced_callback_outside_state_lock() || ::testing::Test::HasFailure()) _exit(3);
+            std::fputs("worker_capture_cleanup_complete\n", stderr);
+            std::fflush(stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "worker_capture_cleanup_failure: %s\n", error.what());
+            std::fflush(stderr);
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "worker_capture_cleanup_complete");
+}
 #endif // Linux resource regression; not Android
 
 } // namespace

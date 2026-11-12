@@ -15,7 +15,9 @@
   or migrate the source table.
 - File-backed sources configured read-only retain that policy on the receiver's
   attachment aliases and after connection reopening. SQLite rejects writes
-  through those aliases, including writes attempted by receiver cleanup.
+  through those aliases. Receiver checkpoints target `main` and writable
+  aliases by name, leaving read-only source WAL files untouched even when
+  already fully backfilled. Receiver cleanup retains the read-only policy.
 
 ### Compatibility and limits
 

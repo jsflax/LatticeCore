@@ -342,3 +342,72 @@ TEST(ReadOnlyAttachmentWrites, RetainedAliasTeardownPreservesCommittedUncheckpoi
         EXPECT_EQ(SourceSnapshot(source_file), before);
     }
 }
+
+TEST(ReadOnlyAttachmentWrites, ReceiverTruncatePreservesFullyBackfilledReadOnlyWAL) {
+    TempDB main_file{"checkpoint_main"}, source_file{"checkpoint_readonly"},
+        writable_file{"checkpoint_writable_\"alias"};
+    seed(main_file); seed(source_file, true); seed(writable_file);
+    // Keep the source writer alive after FULL: its WAL is backfilled but is
+    // still non-empty, so an unqualified receiver TRUNCATE would cut it.
+    RawFixture source_writer(source_file.str());
+    source_writer.execute("PRAGMA wal_autocheckpoint=0");
+    source_writer.execute("UPDATE AliasItem SET value='backfilled' WHERE id=1");
+    int log = -1, backfilled = -1;
+    ASSERT_EQ(sqlite3_wal_checkpoint_v2(source_writer.db, "main", SQLITE_CHECKPOINT_FULL,
+                                       &log, &backfilled), SQLITE_OK);
+    ASSERT_GT(log, 0); ASSERT_EQ(backfilled, log);
+    auto source_config = lattice::configuration(source_file.str()); source_config.read_only = true;
+    lattice::lattice_db source{source_config}, writable{lattice::configuration(writable_file.str())},
+        receiver{lattice::configuration(main_file.str())};
+    receiver.attach(source); receiver.attach(writable);
+    receiver.db().execute("PRAGMA wal_autocheckpoint=0");
+    writable.db().execute("PRAGMA wal_autocheckpoint=0");
+    receiver.db().execute("UPDATE main.AliasItem SET value='receiver-wal' WHERE id=1");
+    writable.db().execute("UPDATE AliasItem SET value='writable-wal' WHERE id=1");
+    ASSERT_GT(std::filesystem::file_size(main_file.str() + "-wal"), 0u);
+    ASSERT_GT(std::filesystem::file_size(writable_file.str() + "-wal"), 0u);
+    const SourceSnapshot before(source_file);
+    ASSERT_TRUE(before.wal.exists); ASSERT_FALSE(before.wal.bytes.empty());
+
+    const auto result = receiver.db().wal_checkpoint(true);
+
+    EXPECT_EQ(result.rc, SQLITE_OK); EXPECT_EQ(result.busy, 0);
+    EXPECT_EQ(result.log_frames, 0); EXPECT_EQ(result.checkpointed, 0);
+    EXPECT_EQ(SourceSnapshot(source_file), before);
+    // Writable aliases retain their previous checkpoint behavior, including
+    // correct quoting of an alias containing an identifier quote.
+    EXPECT_EQ(std::filesystem::file_size(main_file.str() + "-wal"), 0u);
+    EXPECT_EQ(std::filesystem::file_size(writable_file.str() + "-wal"), 0u);
+    receiver.detach(writable); receiver.detach(source);
+}
+
+TEST(ReadOnlyAttachmentWrites, ReceiverTruncateSucceedsWithUnbackfilledReadOnlyWAL) {
+    TempDB main_file{"checkpoint_pending_main"}, source_file{"checkpoint_pending_source"};
+    seed(main_file); seed(source_file, true);
+    const FileImage source_main(source_file.str());
+    {
+        RawFixture writer(source_file.str());
+        ASSERT_EQ(sqlite3_db_config(writer.db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, nullptr), SQLITE_OK);
+        writer.execute("PRAGMA wal_autocheckpoint=0");
+        writer.execute("UPDATE AliasItem SET value='pending-wal' WHERE id=1");
+    }
+    // The committed row is still in the WAL, not in the source main file.
+    ASSERT_EQ(FileImage(source_file.str()), source_main);
+    auto source_config = lattice::configuration(source_file.str()); source_config.read_only = true;
+    lattice::lattice_db source{source_config}, receiver{lattice::configuration(main_file.str())};
+    receiver.attach(source);
+    receiver.db().execute("PRAGMA wal_autocheckpoint=0");
+    receiver.db().execute("UPDATE main.AliasItem SET value='receiver-wal' WHERE id=1");
+    const SourceSnapshot before(source_file);
+    ASSERT_TRUE(before.wal.exists); ASSERT_FALSE(before.wal.bytes.empty());
+    ASSERT_EQ(before.rows.size(), 1u);
+    ASSERT_EQ(std::get<std::string>(before.rows[0].at("value")), "pending-wal");
+
+    const auto result = receiver.db().wal_checkpoint(true);
+
+    EXPECT_EQ(result.rc, SQLITE_OK); EXPECT_EQ(result.busy, 0);
+    EXPECT_EQ(result.log_frames, 0); EXPECT_EQ(result.checkpointed, 0);
+    EXPECT_EQ(std::filesystem::file_size(main_file.str() + "-wal"), 0u);
+    EXPECT_EQ(SourceSnapshot(source_file), before);
+    receiver.detach(source);
+}

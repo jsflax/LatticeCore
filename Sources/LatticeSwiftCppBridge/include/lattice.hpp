@@ -1023,21 +1023,12 @@ public:
     /// accumulate. `busy` 1 = a reader/writer held the WAL; `checkpointed <
     /// log_frames` = partial.
     checkpoint_outcome checkpoint() {
-        // PRAGMA instead of sqlite3_wal_checkpoint_v2: on Linux this header is
-        // compiled in TUs that include sqlite3ext.h, where the C API names are
-        // macros over the undeclared sqlite3_api extension pointer. The pragma
-        // returns one row: (busy, log-frames, checkpointed-frames).
+        // The core funnel uses schema-qualified PRAGMAs and skips read-only
+        // aliases without changing this connection's full busy timeout.
         long long busy = 1, nLog = -1, nCkpt = -1;
         try {
-            auto rows = db().query("PRAGMA wal_checkpoint(TRUNCATE)", {});
-            if (!rows.empty()) {
-                auto get = [&](const char* k) -> long long {
-                    auto it = rows[0].find(k);
-                    return (it != rows[0].end() && std::holds_alternative<int64_t>(it->second))
-                        ? std::get<int64_t>(it->second) : -1;
-                };
-                busy = get("busy"); nLog = get("log"); nCkpt = get("checkpointed");
-            }
+            const auto result = detail::checkpoint_writable_schemas(db(), true);
+            busy = result.busy; nLog = result.log_frames; nCkpt = result.checkpointed;
         } catch (...) { busy = 1; }
         if (busy != 0 || (nLog >= 0 && nCkpt < nLog)) {
             LOG_INFO("swift_lattice", "checkpoint(TRUNCATE): busy=%lld, frames=%lld, checkpointed=%lld%s",
@@ -1123,7 +1114,7 @@ public:
         // Re-enable auto-checkpoint, refresh read connections, then checkpoint.
         db().execute("PRAGMA wal_autocheckpoint=1000", {});
         close_read_db();
-        try { db().query("PRAGMA wal_checkpoint(TRUNCATE)", {}); } catch (...) {}
+        try { detail::checkpoint_writable_schemas(db(), true); } catch (...) {}
         reopen_read_db();
         LOG_INFO("train_untrained", "Training scan complete");
     }

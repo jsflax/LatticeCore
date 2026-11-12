@@ -36,6 +36,12 @@
   an empty string; a failed optional-presence check can appear as nil in Swift.
   These reads do not return the declared default from the union projection.
   Typed missing-column reads remain separate follow-up work.
+- Combined vector and full-text searches apply filters to each source's
+  physical table. If a participating legacy source has the corresponding
+  search index but lacks a referenced filter column, the whole search returns
+  no rows and its count is zero, including otherwise matching receiver rows.
+  The bridge records the missing-column query error. Per-arm search projection
+  remains separate follow-up work.
 - Read-only attachments require a file-backed source. Memory and temporary
   sources, duplicate URI parameters, and URI parameters other than `mode`,
   `cache` and `vfs` are refused before ATTACH. Writable sources, including named

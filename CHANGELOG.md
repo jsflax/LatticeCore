@@ -1,5 +1,35 @@
 # Changelog
 
+## [3.1.0] - Unreleased
+
+### Added
+
+- SQL union-view queries can include a source opened read-only with an older
+  column subset. Every missing column must be nullable or have a declared
+  default, and no primary, identity or UNIQUE-index key may be missing.
+  Validation reads the source schema through its own connection before any
+  ATTACH operation.
+- Each union arm projects columns by name, so different physical column orders
+  retain their values. A permitted absent column uses its declared SQL default
+  or NULL; an existing NULL remains NULL. Admission and projection do not ALTER
+  or migrate the source table.
+
+### Compatibility and limits
+
+- Writable column-set mismatches, missing keys, extra or renamed columns, and
+  required columns without defaults remain refused. A missing-column subset
+  is also refused when an expression key's dependencies cannot be established
+  from column metadata. Equal-column and attached-only behavior is unchanged.
+- There is no new storage-format epoch or public API change relative to 3.0.0.
+  The one-way storage changes and ordinary-open behavior documented for 3.0.0
+  still apply.
+- Compatibility is provided by the SQL union views. Uncached typed-object
+  getters that query the physical source table do not synthesize absent fields
+  from the projected defaults.
+- The receiver's attachment alias retains its existing write policy. Byte
+  preservation across receiver teardown is not guaranteed: a receiver closed
+  with an attachment still present may optimize or checkpoint that source.
+
 ## [3.0.0] - 2026-11-12
 
 This release changes stored data one way. The first writable open of a store

@@ -13,22 +13,28 @@
   retain their values. A permitted absent column uses its declared SQL default
   or NULL; an existing NULL remains NULL. Admission and projection do not ALTER
   or migrate the source table.
+- File-backed sources configured read-only retain that policy on the receiver's
+  attachment aliases and after connection reopening. SQLite rejects writes
+  through those aliases, including writes attempted by receiver cleanup.
 
 ### Compatibility and limits
 
 - Writable column-set mismatches, missing keys, extra or renamed columns, and
   required columns without defaults remain refused. A missing-column subset
   is also refused when an expression key's dependencies cannot be established
-  from column metadata. Equal-column and attached-only behavior is unchanged.
+  from column metadata. Equal-column and attached-only schema admission and
+  query projection behavior is unchanged.
 - There is no new storage-format epoch or public API change relative to 3.0.0.
   The one-way storage changes and ordinary-open behavior documented for 3.0.0
   still apply.
 - Compatibility is provided by the SQL union views. Uncached typed-object
   getters that query the physical source table do not synthesize absent fields
   from the projected defaults.
-- The receiver's attachment alias retains its existing write policy. Byte
-  preservation across receiver teardown is not guaranteed: a receiver closed
-  with an attachment still present may optimize or checkpoint that source.
+- Read-only attachments require a file-backed source. Memory and temporary
+  sources, duplicate URI parameters, and URI parameters other than `mode`,
+  `cache` and `vfs` are refused before ATTACH. Writable sources, including named
+  memory databases, retain their existing attachment access policy. Reattaching
+  an existing path with a different access mode is refused.
 
 ## [3.0.0] - 2026-11-12
 

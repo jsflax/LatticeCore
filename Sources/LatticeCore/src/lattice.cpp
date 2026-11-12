@@ -1594,6 +1594,62 @@ std::string quoted_attach_alias(const std::string& alias) {
     return quoted;
 }
 
+std::string attachment_uri_encode(const std::string& value, bool path) {
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string encoded;
+    for (unsigned char c : value) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' ||
+            (path && c == '/')) {
+            encoded += static_cast<char>(c);
+        } else {
+            encoded += '%';
+            encoded += hex[c >> 4];
+            encoded += hex[c & 15];
+        }
+    }
+    return encoded;
+}
+
+std::string read_only_attachment_uri(database& source) {
+    if (source.is_closed()) throw db_error("attach: the database being attached is closed");
+    auto* handle = source.handle();
+    auto* mutex = sqlite3_db_mutex(handle);
+    sqlite3_mutex_enter(mutex);
+    struct unlock { sqlite3_mutex* value; ~unlock() { sqlite3_mutex_leave(value); } } held{mutex};
+    if (source.is_closed()) throw db_error("attach: the database being attached is closed");
+    // Use SQLite's actual file name, not the configuration's URI text or its
+    // substring-based memory classification. Copy all data while it is owned.
+    const char* filename = sqlite3_db_filename(handle, "main");
+    if (!filename || !*filename)
+        throw db_error("attach: read-only attachments require a file-backed source");
+    std::string uri = "file://" + attachment_uri_encode(filename, true) + "?mode=ro";
+    std::unordered_set<std::string> parameters;
+    for (int i = 0; const char* key = sqlite3_uri_key(filename, i); ++i) {
+        if (!parameters.emplace(key).second)
+            throw db_error("attach: duplicate source URI parameter");
+        if (std::string(key) == "mode") continue;
+        // Preserve the explicit VFS/cache selection. Other options need their
+        // own semantics review; in particular, never introduce immutable or
+        // nolock into an attachment that must see live committed WAL content.
+        if (std::string(key) != "vfs" && std::string(key) != "cache")
+            throw db_error("attach: unsupported read-only source URI parameter");
+        const char* value = sqlite3_uri_parameter(filename, key);
+        uri += "&" + attachment_uri_encode(key, false) + "=" +
+               attachment_uri_encode(value ? value : "", false);
+    }
+    return uri;
+}
+
+void attach_database(database& connection, const std::string& alias,
+                     const std::string& target, bool read_only) {
+    connection.execute("ATTACH DATABASE ? AS " + quoted_attach_alias(alias), {target});
+    if (read_only && sqlite3_db_readonly(connection.handle(), alias.c_str()) != 1) {
+        connection.execute("DETACH DATABASE " + quoted_attach_alias(alias));
+        throw db_error("attach: source alias did not open read-only");
+    }
+}
+
 // Model tables only — excludes sqlite internals, _-prefixed virtual/shadow
 // tables, and Lattice bookkeeping. %s is the sqlite_master to scan.
 constexpr const char* kAttachTableFilter =
@@ -1715,17 +1771,9 @@ std::vector<std::shared_ptr<database>> lattice_db::view_handles() {
 
 void lattice_db::restore_attached_views(database& connection) {
     // Caller holds attach_mutex_; this connection is not published yet.
-    for (const auto& [alias, path] : attached_dbs_) {
-        std::string escaped_path, escaped_alias;
-        for (char c : path) {
-            escaped_path += c;
-            if (c == '\'') escaped_path += '\'';
-        }
-        for (char c : alias) {
-            escaped_alias += c;
-            if (c == '"') escaped_alias += '"';
-        }
-        connection.execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
+    for (const auto& entry : attached_dbs_) {
+        attach_database(connection, entry.alias, entry.read_only_uri.value_or(entry.path),
+                        entry.read_only_uri.has_value());
     }
     for (const auto& [name, sql] : attached_view_sql_) connection.execute(sql);
 }
@@ -1817,12 +1865,16 @@ void lattice_db::attach(lattice_db &lattice) {
 
     // Idempotence: same alias + same path is a no-op; same alias for a
     // different path is a caller error.
-    for (const auto& [existing_alias, existing_path] : attached_dbs_) {
-        if (existing_alias == alias) {
-            if (existing_path == lattice.config_.path) return;
+    for (const auto& entry : attached_dbs_) {
+        if (entry.alias == alias) {
+            if (entry.path == lattice.config_.path) {
+                if (entry.read_only_uri.has_value() != lattice.config_.read_only)
+                    throw std::runtime_error("attach: alias '" + alias + "' already has a different access mode");
+                return;
+            }
             throw std::runtime_error(
                 "attach: alias '" + alias + "' is already attached to a different database (" +
-                existing_path + ")");
+                entry.path + ")");
         }
     }
 
@@ -1890,33 +1942,28 @@ void lattice_db::attach(lattice_db &lattice) {
         }
     }
 
-    // ATTACH on every view-bearing handle (null-tolerant — sync-enabled and
-    // in-memory lattices have no read_db_; the old code null-dereferenced).
-    // SQLite's own duplicate-alias error is treated as idempotent success:
-    // belt to the bookkeeping check's suspenders.
-    // Escape single quotes in the path for the SQL literal (paths and named-
-    // memory names are caller-controlled strings).
-    std::string escaped_path;
-    escaped_path.reserve(lattice.config_.path.size());
-    for (char c : lattice.config_.path) {
-        escaped_path += c;
-        if (c == '\'') escaped_path += '\'';
-    }
-    for (const auto& handle : handles) {
-        try {
-            std::string escaped_alias;
-            escaped_alias.reserve(alias.size());
-            for (char c : alias) {
-                escaped_alias += c;
-                if (c == '\"') escaped_alias += '\"';
-            }
-            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
-        } catch (const db_error& e) {
-            if (std::string(e.what()).find("already in use") == std::string::npos) throw;
+    // Keep identity separate from SQLite's file URI, and retain this policy
+    // after the source object closes and receiver connections are reopened.
+    const auto read_only_uri = lattice.config_.read_only
+        ? std::optional<std::string>(read_only_attachment_uri(*other)) : std::nullopt;
+    const auto& target = read_only_uri ? *read_only_uri : lattice.config_.path;
+    std::vector<std::shared_ptr<database>> attached_handles;
+    try {
+        for (const auto& handle : handles) {
+            attach_database(*handle, alias, target, read_only_uri.has_value());
+            attached_handles.push_back(handle);
         }
+    } catch (...) {
+        for (const auto& handle : attached_handles) {
+            try { handle->execute("DETACH DATABASE " + quoted_attach_alias(alias)); }
+            catch (const db_error& error) {
+                LOG_ERROR("db", "Failed to unwind attachment '%s': %s", alias.c_str(), error.what());
+            }
+        }
+        throw;
     }
 
-    attached_dbs_.emplace_back(alias, lattice.config_.path);
+    attached_dbs_.push_back({alias, lattice.config_.path, read_only_uri});
     attached_aliases_.push_back(alias);
     rebuild_attached_views(handles);
 }
@@ -1930,9 +1977,9 @@ void lattice_db::detach(lattice_db &lattice) {
     {
         std::lock_guard<std::mutex> attach_lock(attach_mutex_);
         auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
-            [&](const auto& entry) { return entry.second == lattice.config_.path; });
+            [&](const auto& entry) { return entry.path == lattice.config_.path; });
         if (it == attached_dbs_.end()) return;  // not attached: idempotent no-op
-        alias = it->first;
+        alias = it->alias;
     }
     detach_alias(alias);
 }
@@ -1943,7 +1990,7 @@ void lattice_db::detach_alias(const std::string& alias) {
     handles = view_handles();
 
     auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
-        [&](const auto& entry) { return entry.first == alias; });
+        [&](const auto& entry) { return entry.alias == alias; });
     if (it == attached_dbs_.end()) return;  // idempotent no-op
 
     // Views reference the alias — drop them all first (regeneration for the
@@ -2002,8 +2049,8 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
 
         // table → arms. An arm is (schema-qualifier, _source label).
         std::map<std::string, std::vector<std::pair<std::string, std::string>>> arms;
-        for (const auto& [alias, _] : attached_dbs_) {
-            const std::string quoted = quoted_attach_alias(alias);
+        for (const auto& entry : attached_dbs_) {
+            const std::string quoted = quoted_attach_alias(entry.alias);
             char master[600];
             snprintf(master, sizeof(master), "%s.sqlite_master", quoted.c_str());
             for (const auto& table_name : model_tables(handle.get(), master)) {

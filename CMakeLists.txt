@@ -207,6 +207,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
     Tests/LatticeCoreTests/LegacyReadOnlyAttachmentTests.cpp
+    Tests/LatticeCoreTests/ReadOnlyAttachmentWriteTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/LinuxNotifierTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp

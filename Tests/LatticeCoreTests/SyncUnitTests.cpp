@@ -2770,6 +2770,44 @@ TEST(IPCPathLength, EveryEntryPointRefusesBeforeTouchingTheTruncatedSocket) {
         EXPECT_TRUE(accepted.empty());
     });
 }
+
+#ifdef __linux__
+TEST(IPCPathResolution, ExplicitPathsBypassAnUnusableRuntimeDirectory) {
+    bounded_mock_case([] {
+        using sync_child_timeout_regressions::owned_path_cleanup;
+        using sync_child_timeout_regressions::require;
+        TempDB blocked_runtime("ipc-runtime-file");
+        { auto* file = std::fopen(blocked_runtime.str().c_str(), "w"); require(file != nullptr, "create runtime obstruction"); std::fclose(file); }
+        // Only this fresh test child changes its Linux runtime-directory input.
+        // HOME and the parent process's environment remain untouched.
+        require(::setenv("XDG_RUNTIME_DIR", blocked_runtime.str().c_str(), 1) == 0,
+                "set the child's fixture runtime directory");
+        bool default_refused = false;
+        try { (void)lattice::resolve_ipc_socket_path("explicit-path"); }
+        catch (const std::filesystem::filesystem_error&) { default_refused = true; }
+        require(default_refused, "the default resolver must be unusable in this fixture");
+
+        TempDB identity("ipc-explicit");
+        const char* configured = std::getenv("LATTICE_IPC_TEST_DIRECTORY");
+        const auto directory = configured ? std::filesystem::path(configured) : identity.path.parent_path();
+        const auto socket = (directory / (identity.path.stem().string() + ".sock")).string();
+        require(directory.is_absolute() && socket.size() < sizeof(sockaddr_un{}.sun_path) &&
+                !std::filesystem::exists(socket), "use a short fresh explicit socket path");
+        owned_path_cleanup cleanup{socket};
+        std::fputs("explicit_path_stage=endpoint\n", stderr);
+        lattice::ipc_endpoint endpoint("explicit-path", socket);
+        endpoint.start([](auto) {});
+        require(endpoint.is_server() && std::filesystem::is_socket(socket),
+                "the explicit endpoint must start without resolving the default");
+        endpoint.stop();
+        require(!std::filesystem::exists(socket), "the explicit endpoint must clean up its socket");
+
+        std::fputs("explicit_path_stage=hub-and-peer\n", stderr);
+        ipc_path_length_regressions::deliver_or_refuse_between_hub_and_peer(
+            sizeof(sockaddr_un{}.sun_path) - 1);
+    }, 45);
+}
+#endif
 #endif
 
 namespace {

@@ -11,6 +11,7 @@
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #endif
 
 // ============================================================================
@@ -2624,6 +2625,66 @@ TEST(SyncChildTimeout, WSSActualChildInheritsBusyHandlerAndFiniteBeginBudget) {
 
 TEST(SyncChildTimeout, RealIPCBothActualChildrenInheritBusyHandler) {
     bounded_mock_case(sync_child_timeout_regressions::ipc_children_inherit_timeout);
+}
+
+namespace ipc_path_length_regressions {
+void deliver_between_hub_and_peer(size_t socket_bytes) {
+    using sync_child_timeout_regressions::owned_path_cleanup;
+    using sync_child_timeout_regressions::require;
+    TempDB hub_file("ipc-path-hub");
+    TempDB peer_file("ipc-path-peer");
+    const char* configured = std::getenv("LATTICE_IPC_TEST_DIRECTORY");
+    const auto directory = configured ? std::filesystem::path(configured) : hub_file.path.parent_path();
+    const auto prefix = (directory / hub_file.path.stem()).string();
+    constexpr size_t maximum_socket_bytes = sizeof(sockaddr_un{}.sun_path) - 1;
+    require(directory.is_absolute() && std::filesystem::is_directory(directory) &&
+            prefix.size() + 5 <= maximum_socket_bytes,
+            "set LATTICE_IPC_TEST_DIRECTORY to a short existing fixture directory");
+    const auto socket = prefix + std::string(socket_bytes - prefix.size() - 5, 'x') + ".sock";
+    const auto truncated = socket.substr(0, maximum_socket_bytes);
+    const auto lock = socket + ".lock";
+    require(!std::filesystem::exists(socket) && !std::filesystem::exists(truncated) &&
+            !std::filesystem::exists(lock), "IPC fixture paths must all be fresh");
+    owned_path_cleanup socket_cleanup{socket};
+    // The failing implementation leaves the truncated bind pathname behind.
+    owned_path_cleanup truncated_cleanup{truncated};
+    owned_path_cleanup lock_cleanup{lock};
+    std::fprintf(stderr, "ipc_path_bytes=%zu maximum_socket_bytes=%zu\n",
+                 socket.size(), maximum_socket_bytes);
+
+    const auto channel = hub_file.path.stem().string();
+    lattice::configuration hub_config(hub_file.str());
+    hub_config.ipc_targets.push_back({channel, std::nullopt, socket});
+    lattice::configuration peer_config(peer_file.str());
+    peer_config.ipc_targets.push_back({channel, std::nullopt, socket});
+    lattice::lattice_db hub(hub_config);
+    lattice::lattice_db peer(peer_config);
+    const auto sent = hub.add(TestPerson{"socket-path-delivered", 37, std::nullopt});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    bool delivered = false;
+    do {
+        const auto rows = peer.objects<TestPerson>().where("name = 'socket-path-delivered'").limit(2);
+        delivered = rows.size() == 1 && rows[0].age.detach() == 37 &&
+                    rows[0].global_id() == sent.global_id();
+        if (delivered) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    require(delivered, "the peer must receive the exact hub row");
+    peer.close();
+    hub.close();
+    require(!std::filesystem::exists(socket) && !std::filesystem::exists(truncated),
+            "closing the hub and peer must not leave a socket behind");
+}
+} // namespace ipc_path_length_regressions
+
+TEST(IPCPathLength, FreshHubAndPeerDoNotCollideAtTheSocketPathBoundary) {
+    bounded_mock_case([] {
+        // The last representable byte count is a live delivery control. The
+        // next byte currently makes the first hub collide with its own bind.
+        constexpr size_t capacity = sizeof(sockaddr_un{}.sun_path);
+        ipc_path_length_regressions::deliver_between_hub_and_peer(capacity - 1);
+        ipc_path_length_regressions::deliver_between_hub_and_peer(capacity);
+    }, 45);
 }
 #endif
 

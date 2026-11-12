@@ -34,7 +34,11 @@
   that table fails with a missing-column SQL error in C++. Sealed bridge
   getters record the error and return a type fallback, such as zero, false or
   an empty string; a failed optional-presence check can appear as nil in Swift.
-  These reads do not return the declared default from the union projection.
+  Geographic-bounds and union-property bridge getters are not sealed: their
+  missing-column SQL error propagates instead of returning a fallback. A C++
+  exception crossing into Swift can terminate the process. These getters must
+  not be used for columns absent from the attached physical table. None of
+  these typed reads supplies the union projection's declared default.
   Typed missing-column reads remain separate follow-up work.
 - Combined vector and full-text searches apply filters to each source's
   physical table. If a participating legacy source has the corresponding

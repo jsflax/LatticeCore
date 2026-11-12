@@ -5053,9 +5053,11 @@ public:
 
     /// Attach another lattice's database under an alias derived from its
     /// filename, exposing overlapping tables as UNION views and
-    /// attached-only tables as passthrough views. Idempotent: attaching the
-    /// same database again is a no-op; the same alias for a DIFFERENT path
-    /// throws. Schema overlap is validated BEFORE any side effect — a
+    /// attached-only tables as passthrough views. Reattaching a tracked
+    /// database in the same access mode is a no-op; a different access mode
+    /// or the same tracked alias for a DIFFERENT path throws. Read-only
+    /// sources must be live file-backed handles with supported URI options.
+    /// Schema overlap is validated BEFORE any side effect — a
     /// mismatch throws with no dangling ATTACH and no half-created views.
     /// Serialized against detach() by an internal mutex.
     void attach(lattice_db& lattice);

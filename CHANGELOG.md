@@ -24,8 +24,9 @@
 - Writable column-set mismatches, missing keys, extra or renamed columns, and
   required columns without defaults remain refused. A missing-column subset
   is also refused when an expression key's dependencies cannot be established
-  from column metadata. Equal-column and attached-only schema admission and
-  query projection behavior is unchanged.
+  from column metadata. For admitted sources, equal-column and attached-only
+  SQL projection is unchanged. The read-only source-form restrictions below
+  also apply when the schemas have equal columns.
 - Writable sources retain the 3.0.0 tolerance for an SQLite attachment alias
   that is already in use. If attachment fails on a later connection, cleanup
   detaches only aliases created by that attempt and preserves existing ones.
@@ -51,8 +52,10 @@
   remains separate follow-up work.
 - Read-only attachments require a file-backed source. Memory and temporary
   sources, duplicate URI parameters, and URI parameters other than `mode`,
-  `cache` and `vfs` are refused before ATTACH. Writable sources, including named
-  memory databases, retain their existing attachment access policy. Reattaching
+  `cache` and `vfs`, and logically closed read-only source handles are refused
+  before ATTACH. These source-form refusals differ from 3.0.0. Writable sources,
+  including named memory databases, retain their existing attachment access
+  policy. Reattaching
   an existing path with a different access mode is refused.
 
 ## [3.0.0] - 2026-11-12

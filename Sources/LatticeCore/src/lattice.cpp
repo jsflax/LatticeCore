@@ -1840,7 +1840,47 @@ void lattice_db::attach(lattice_db &lattice) {
             if (!main_set.count(table_name)) continue;
             auto main_cols = get_column_names(handles.front().get(), "main", table_name);
             auto other_cols = get_column_names(other.get(), "main", table_name);
-            if (main_cols != other_cols) {
+            // A read-only older schema can omit additive nullable/defaulted
+            // columns. Its identity and required values must still be present;
+            // a writable source always requires the complete current shape.
+            bool compatible_legacy = lattice.config_.read_only &&
+                std::includes(main_cols.begin(), main_cols.end(),
+                              other_cols.begin(), other_cols.end());
+            if (compatible_legacy && main_cols != other_cols) {
+                std::unordered_set<std::string> key_columns{"globalId", "primaryKey"};
+                for (const auto& index : handles.front()->query(
+                         "PRAGMA main.index_list(" + table_name + ")")) {
+                    if (std::get<int64_t>(index.at("unique")) == 0) continue;
+                    const auto& index_name = std::get<std::string>(index.at("name"));
+                    for (const auto& column : handles.front()->query(
+                             "PRAGMA main.index_info(" + history_quote(index_name, '"') + ")")) {
+                        const auto& name = column.at("name");
+                        // An expression key cannot be proven independent of
+                        // the absent columns from column metadata alone.
+                        if (!std::holds_alternative<std::string>(name)) {
+                            compatible_legacy = false;
+                            break;
+                        }
+                        key_columns.insert(std::get<std::string>(name));
+                    }
+                    if (!compatible_legacy) break;
+                }
+                for (const auto& column : handles.front()->query(
+                         "PRAGMA main.table_info(" + table_name + ")")) {
+                    const auto& name = std::get<std::string>(column.at("name"));
+                    if (std::binary_search(other_cols.begin(), other_cols.end(), name)) continue;
+                    const bool key = std::get<int64_t>(column.at("pk")) != 0 ||
+                                     key_columns.count(name) != 0;
+                    const bool required = std::get<int64_t>(column.at("notnull")) != 0;
+                    const bool has_default =
+                        !std::holds_alternative<std::nullptr_t>(column.at("dflt_value"));
+                    if (key || (required && !has_default)) {
+                        compatible_legacy = false;
+                        break;
+                    }
+                }
+            }
+            if (main_cols != other_cols && !compatible_legacy) {
                 LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
                           table_name.c_str(), alias.c_str());
                 throw std::runtime_error(
@@ -1988,28 +2028,43 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
                 // live: a WHERE over the view read an attached row's
                 // modifiedAt as deletedAt and filtered every spoke row out
                 // of recall. Project every arm's columns explicitly, in one
-                // canonical order, so the view maps by NAME. A column
-                // missing from some arm then fails view creation loudly
-                // instead of scrambling silently.
+                // canonical order, so the view maps by NAME. For a validated
+                // legacy source overlapping main, fill only absent columns
+                // with the main schema's default or NULL. Present NULLs stay
+                // NULL, and no source table is altered.
                 const std::string first_schema =
                     in_main ? "main" : alias_arms.front().first;
-                auto ordered_cols = [&]() {
-                    auto rows = handle->query(
-                        "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
+                const auto canonical_columns = handle->query(
+                    "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
+                auto projection_for = [&](const std::string& arm_schema) {
+                    const auto present = get_column_names(handle.get(), arm_schema, table_name);
                     std::string cols;
-                    for (const auto& row : rows) {
-                        auto it = row.find("name");
-                        if (it == row.end() ||
-                            !std::holds_alternative<std::string>(it->second)) continue;
+                    for (const auto& column : canonical_columns) {
+                        const auto& name = std::get<std::string>(column.at("name"));
                         if (!cols.empty()) cols += ", ";
-                        cols += "\"" + std::get<std::string>(it->second) + "\"";
+                        std::string quoted_name = "\"";
+                        for (char c : name) {
+                            quoted_name += c;
+                            if (c == '"') quoted_name += '"';
+                        }
+                        quoted_name += "\"";
+                        // Attached-only tables have not passed main-overlap
+                        // validation. Keep their existing projection contract.
+                        if (!in_main || std::binary_search(present.begin(), present.end(), name)) {
+                            cols += quoted_name;
+                        } else {
+                            const auto& value = column.at("dflt_value");
+                            cols += std::holds_alternative<std::string>(value)
+                                ? "(" + std::get<std::string>(value) + ")" : "NULL";
+                            cols += " AS " + quoted_name;
+                        }
                     }
                     return cols;
-                }();
+                };
                 sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
                 bool first = true;
                 if (in_main) {
-                    sql += "SELECT " + ordered_cols + ", 'main' AS _source FROM main." + table_name;
+                    sql += "SELECT " + projection_for("main") + ", 'main' AS _source FROM main." + table_name;
                     first = false;
                 }
                 for (const auto& [qualifier, label] : alias_arms) {
@@ -2022,7 +2077,7 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
                         escaped_label += c;
                         if (c == '\'') escaped_label += '\'';
                     }
-                    sql += "SELECT " + ordered_cols + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
+                    sql += "SELECT " + projection_for(qualifier) + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
                     first = false;
                 }
             }

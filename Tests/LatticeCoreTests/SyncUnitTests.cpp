@@ -2628,7 +2628,12 @@ TEST(SyncChildTimeout, RealIPCBothActualChildrenInheritBusyHandler) {
 }
 
 namespace ipc_path_length_regressions {
-void deliver_between_hub_and_peer(size_t socket_bytes) {
+std::string length_error(size_t bytes) {
+    return "ipc: socket path is " + std::to_string(bytes) + " bytes; maximum is " +
+           std::to_string(sizeof(sockaddr_un{}.sun_path) - 1) + " bytes";
+}
+
+void deliver_or_refuse_between_hub_and_peer(size_t socket_bytes) {
     using sync_child_timeout_regressions::owned_path_cleanup;
     using sync_child_timeout_regressions::require;
     TempDB hub_file("ipc-path-hub");
@@ -2657,6 +2662,19 @@ void deliver_between_hub_and_peer(size_t socket_bytes) {
     hub_config.ipc_targets.push_back({channel, std::nullopt, socket});
     lattice::configuration peer_config(peer_file.str());
     peer_config.ipc_targets.push_back({channel, std::nullopt, socket});
+    if (socket_bytes > maximum_socket_bytes) {
+        std::string error;
+        try {
+            lattice::lattice_db hub(hub_config);
+            lattice::lattice_db peer(peer_config);
+        } catch (const std::runtime_error& failure) {
+            error = failure.what();
+        }
+        EXPECT_EQ(error, length_error(socket_bytes));
+        EXPECT_FALSE(std::filesystem::exists(socket));
+        EXPECT_FALSE(std::filesystem::exists(truncated));
+        return;
+    }
     lattice::lattice_db hub(hub_config);
     lattice::lattice_db peer(peer_config);
     const auto sent = hub.add(TestPerson{"socket-path-delivered", 37, std::nullopt});
@@ -2680,11 +2698,77 @@ void deliver_between_hub_and_peer(size_t socket_bytes) {
 TEST(IPCPathLength, FreshHubAndPeerDoNotCollideAtTheSocketPathBoundary) {
     bounded_mock_case([] {
         // The last representable byte count is a live delivery control. The
-        // next byte currently makes the first hub collide with its own bind.
+        // next byte must be refused before a truncated socket can be created.
         constexpr size_t capacity = sizeof(sockaddr_un{}.sun_path);
-        ipc_path_length_regressions::deliver_between_hub_and_peer(capacity - 1);
-        ipc_path_length_regressions::deliver_between_hub_and_peer(capacity);
+        ipc_path_length_regressions::deliver_or_refuse_between_hub_and_peer(capacity - 1);
+        ipc_path_length_regressions::deliver_or_refuse_between_hub_and_peer(capacity);
     }, 45);
+}
+
+TEST(IPCPathLength, EveryEntryPointRefusesBeforeTouchingTheTruncatedSocket) {
+    bounded_mock_case([] {
+        using sync_child_timeout_regressions::owned_path_cleanup;
+        using sync_child_timeout_regressions::require;
+        TempDB identity("ipc-path-entry");
+        const char* configured = std::getenv("LATTICE_IPC_TEST_DIRECTORY");
+        const auto directory = configured ? std::filesystem::path(configured) : identity.path.parent_path();
+        const auto prefix = (directory / identity.path.stem()).string();
+        constexpr size_t maximum = sizeof(sockaddr_un{}.sun_path) - 1;
+        require(directory.is_absolute() && std::filesystem::is_directory(directory) &&
+                prefix.size() < maximum, "set LATTICE_IPC_TEST_DIRECTORY to a short fixture directory");
+        const auto valid_path = prefix + std::string(maximum - prefix.size(), 'x');
+        const auto invalid_path = valid_path + "x";
+        require(!std::filesystem::exists(valid_path) && !std::filesystem::exists(invalid_path),
+                "entry-point fixture paths must be fresh");
+        owned_path_cleanup valid_cleanup{valid_path}, invalid_cleanup{invalid_path};
+        { auto* marker = std::fopen(invalid_path.c_str(), "w"); require(marker != nullptr, "create full-path marker"); std::fclose(marker); }
+
+        std::mutex accepted_mutex;
+        std::vector<std::unique_ptr<lattice::ipc_socket_client>> accepted;
+        lattice::ipc_server sentinel(valid_path);
+        sentinel.start([&](auto client) {
+            std::lock_guard<std::mutex> lock(accepted_mutex);
+            accepted.push_back(std::move(client));
+        });
+        struct stat before{};
+        require(::lstat(valid_path.c_str(), &before) == 0, "stat the valid sentinel socket");
+        const auto expected = ipc_path_length_regressions::length_error(invalid_path.size());
+
+        std::string client_error;
+        int client_errors = 0;
+        std::atomic<bool> opened{false};
+        lattice::ipc_socket_client client(invalid_path);
+        client.set_on_error([&](const auto& error) { client_error = error; ++client_errors; });
+        client.set_on_open([&] { opened = true; });
+        client.connect("");
+        EXPECT_EQ(client_error, expected);
+        EXPECT_EQ(client_errors, 1);
+        EXPECT_FALSE(opened.load());
+        EXPECT_EQ(client.state(), lattice::transport_state::closed);
+        client.disconnect();
+
+        std::string server_error;
+        lattice::ipc_server server(invalid_path);
+        try { server.start([](auto) {}); }
+        catch (const std::runtime_error& error) { server_error = error.what(); }
+        EXPECT_EQ(server_error, expected);
+        EXPECT_FALSE(server.is_listening());
+        EXPECT_TRUE(std::filesystem::is_regular_file(invalid_path));
+
+        std::string endpoint_error;
+        bool endpoint_ready = false;
+        lattice::ipc_endpoint endpoint("path-entry", invalid_path);
+        try { endpoint.start([&](auto) { endpoint_ready = true; }); }
+        catch (const std::runtime_error& error) { endpoint_error = error.what(); }
+        EXPECT_EQ(endpoint_error, expected);
+        EXPECT_FALSE(endpoint_ready);
+        struct stat after{};
+        EXPECT_EQ(::lstat(valid_path.c_str(), &after), 0);
+        EXPECT_EQ(before.st_dev, after.st_dev);
+        EXPECT_EQ(before.st_ino, after.st_ino);
+        sentinel.stop(); // joins the accept thread before inspecting its callbacks
+        EXPECT_TRUE(accepted.empty());
+    });
 }
 #endif
 

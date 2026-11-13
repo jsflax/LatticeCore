@@ -130,6 +130,9 @@ class instance_registry {
             : notifier(std::move(value)) {}
         std::mutex lifecycle_mutex;
         bool retired = false;
+#if !defined(__linux__) && !defined(__ANDROID__)
+        bool initial_start_attempted = false;
+#endif
         std::unique_ptr<cross_process_notifier> notifier;
     };
 

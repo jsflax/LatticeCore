@@ -393,9 +393,11 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
             if (it != shared_notifiers_.end()) {
                 slot = it->second;
             } else {
+#if defined(__linux__) || defined(__ANDROID__)
                 // A last-owner close may have removed a slot since this lookup
                 // began. Do not start an orphan listener after that retirement.
                 if (instances_.find(path) == instances_.end()) return nullptr;
+#endif
                 auto notifier = make_cross_process_notifier(path);
                 if (!notifier) return nullptr;
                 slot = std::make_shared<notifier_slot>(std::move(notifier));
@@ -405,13 +407,23 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
         std::unique_lock<std::mutex> lifecycle(slot->lifecycle_mutex);
         if (slot->retired) {
             lifecycle.unlock();
+#if defined(__linux__) || defined(__ANDROID__)
             std::lock_guard<std::mutex> lock(mutex_);
             if (instances_.find(path) == instances_.end()) return nullptr;
+#endif
             continue;
         }
+#if !defined(__linux__) && !defined(__ANDROID__)
+        // Keep existing registrations sticky, including failed or explicitly
+        // stopped ones. The slot lock also serializes the first attempt when
+        // another lookup reaches a newly published slot before its creator.
+        if (slot->initial_start_attempted) return slot->notifier.get();
+        slot->initial_start_attempted = true;
+#endif
         // Retain and serialize the slot without holding the registry mutex.
-        // A failed cached setup is retried on the next owner; a healthy listener
-        // returns immediately. Startup must not join a path's callback worker.
+        // Linux and Android retry a failed cached setup on the next owner;
+        // a healthy listener returns immediately. Other platforms start once.
+        // Startup must not join a path's callback worker.
         slot->notifier->start_listening([path] {
             int notified = 0;
             instance_registry::instance().for_each_alive(path,

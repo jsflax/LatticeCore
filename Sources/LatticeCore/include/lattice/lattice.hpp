@@ -125,6 +125,17 @@ struct instance_guard {
 };
 
 class instance_registry {
+    struct notifier_slot {
+        explicit notifier_slot(std::unique_ptr<cross_process_notifier> value)
+            : notifier(std::move(value)) {}
+        std::mutex lifecycle_mutex;
+        bool retired = false;
+#if !defined(__linux__) && !defined(__ANDROID__)
+        bool initial_start_attempted = false;
+#endif
+        std::unique_ptr<cross_process_notifier> notifier;
+    };
+
 public:
     struct entry {
         lattice_db* ptr;
@@ -141,10 +152,9 @@ public:
     }
 
     void unregister_instance(const std::string& path, lattice_db* db) {
-        // Move the notifier out under the lock, destroy it AFTER releasing —
-        // the notifier destructor joins the inotify thread, which may be
-        // waiting for mutex_ inside for_each_alive → get_entries.
-        std::unique_ptr<cross_process_notifier> notifier_to_destroy;
+        // Retain the removed slot until startup has finished, then retire it.
+        // No registry or slot lock may be held while joining a callback worker.
+        std::shared_ptr<notifier_slot> notifier_to_retire;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = instances_.find(path);
@@ -156,13 +166,19 @@ public:
                     instances_.erase(it);
                     auto nit = shared_notifiers_.find(path);
                     if (nit != shared_notifiers_.end()) {
-                        notifier_to_destroy = std::move(nit->second);
+                        notifier_to_retire = std::move(nit->second);
                         shared_notifiers_.erase(nit);
                     }
                 }
             }
         }
-        // Notifier destroyed here, outside the lock — safe to join its thread.
+        if (notifier_to_retire) {
+            {
+                std::lock_guard<std::mutex> lock(notifier_to_retire->lifecycle_mutex);
+                notifier_to_retire->retired = true;
+            }
+            notifier_to_retire->notifier->stop_listening();
+        }
     }
 
     /// Iterate alive instances for a path with guard protection.
@@ -190,12 +206,16 @@ public:
     }
 
     /// Get or create a shared cross-process notifier for a path.
-    /// Only ONE Darwin listener is registered per path per process,
+    /// Only ONE listener is registered per path per process,
     /// preventing N^2 notification amplification when multiple lattice_db
     /// instances share the same path. The listener distributes to all
     /// instances via for_each_alive.
     /// Returns a raw pointer (owned by the registry) for post_notification,
-    /// or nullptr for in-memory DBs.
+    /// or nullptr for in-memory DBs or an unavailable platform backend.
+    /// Linux and Android also return nullptr when no store owns the path;
+    /// a lookup for an owned path retries a registration that is not listening.
+    /// Other platforms return cached registrations without restarting them,
+    /// and retain the ability to create a listener for an unowned file path.
     cross_process_notifier* get_or_create_notifier(const std::string& path);
 
     /// Per-path write gate for SHARED-CACHE stores (Live Results item A spec,
@@ -253,9 +273,9 @@ private:
 
     std::mutex mutex_;
     std::map<std::string, std::vector<entry>> instances_;
-    /// One Darwin listener per unique DB path — prevents N^2 notification
+    /// One listener per unique DB path — prevents N^2 notification
     /// amplification when multiple lattice_db instances share the same path.
-    std::map<std::string, std::unique_ptr<cross_process_notifier>> shared_notifiers_;
+    std::map<std::string, std::shared_ptr<notifier_slot>> shared_notifiers_;
     /// Per-path shared-cache write gates (see write_gate above).
     std::map<std::string, std::shared_ptr<std::recursive_timed_mutex>> write_gates_;
     /// Per-path WAL eviction thresholds (see the accessors above).
@@ -9763,10 +9783,10 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "~dtor: shutting down scheduler");
     if (scheduler_) scheduler_->shutdown();
     LOG_INFO("lattice_db", "~dtor: scheduler shutdown done");
-    // 5. Unregister. Do NOT hold xproc_callback_mutex_ during unregister —
-    //    unregister_instance takes registry mutex_, and may destroy the notifier
-    //    (stop_listening → thread join). The notifier callback also takes
-    //    registry mutex_ via for_each_alive → deadlock if we hold both.
+    // 5. Unregister. The registry removes and retires the slot before stopping
+    //    its notifier, with neither the registry nor slot lock held at stop.
+    //    Do NOT hold xproc_callback_mutex_ while draining a callback worker:
+    //    an in-flight callback may need that mutex before it can return.
     LOG_INFO("lattice_db", "~dtor: calling unregister_instance");
     instance_registry::instance().unregister_instance(config_.path, this);
     LOG_INFO("lattice_db", "~dtor: unregister done");

@@ -763,3 +763,65 @@ READER_CASE(SymlinkVfsPathMatchesReadOnlyOpen, 24)
 #endif
 #undef READER_CASE
 #endif
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__ANDROID__)
+TEST(NotifierPlatform, SamePathOpenAndUnownedLookupKeepTheirPlatformContracts) {
+    ASSERT_EQ(std::getenv("LATTICE_DISABLE_XPROC"), nullptr);
+    struct Files {
+        std::filesystem::path directory;
+        Files() {
+            auto pattern = (std::filesystem::temp_directory_path() / "notifier-platform-XXXXXX").string();
+            std::vector<char> bytes(pattern.begin(), pattern.end());
+            bytes.push_back('\0');
+            const auto* made = ::mkdtemp(bytes.data());
+            if (!made) throw std::runtime_error("Cannot create notifier platform fixture directory");
+            directory = made;
+        }
+        ~Files() {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+            EXPECT_FALSE(error) << error.message();
+        }
+    } files;
+    auto& registry = lattice::instance_registry::instance();
+    const auto owned_path = (files.directory / "owned.sqlite").string();
+    lattice::configuration config(owned_path);
+    config.audit_retention_seconds = 0;
+    auto first = std::make_unique<lattice::lattice_db>(config);
+    auto* initial = registry.get_or_create_notifier(owned_path);
+    ASSERT_NE(initial, nullptr);
+    ASSERT_TRUE(initial->is_listening());
+    initial->stop_listening();
+    ASSERT_FALSE(initial->is_listening());
+
+    auto second = std::make_unique<lattice::lattice_db>(config);
+    // Read the retained pointer before another lookup can attempt a retry.
+#if defined(__linux__) || defined(__ANDROID__)
+    EXPECT_TRUE(initial->is_listening());
+#else
+    EXPECT_FALSE(initial->is_listening());
+#endif
+    EXPECT_EQ(registry.get_or_create_notifier(owned_path), initial);
+#if defined(__APPLE__)
+    EXPECT_FALSE(initial->is_listening()) << "A lookup must keep an explicit stop sticky on Apple platforms";
+#endif
+
+    const auto unowned_path = (files.directory / "unowned.sqlite").string();
+    auto* unowned = registry.get_or_create_notifier(unowned_path);
+#if defined(__linux__) || defined(__ANDROID__)
+    EXPECT_EQ(unowned, nullptr);
+#else
+    EXPECT_NE(unowned, nullptr);
+    if (unowned) EXPECT_TRUE(unowned->is_listening());
+#endif
+    // Adopt the Apple lookup's listener, then let the last real owner retire
+    // it before removing the fixture files. This also cleans a failing Linux
+    // implementation that incorrectly creates a listener for an unowned path.
+    {
+        lattice::configuration adopted_config(unowned_path);
+        adopted_config.audit_retention_seconds = 0;
+        lattice::lattice_db adopter(adopted_config);
+        if (unowned) EXPECT_EQ(registry.get_or_create_notifier(unowned_path), unowned);
+    }
+}
+#endif

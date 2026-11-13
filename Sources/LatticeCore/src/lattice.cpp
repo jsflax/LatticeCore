@@ -385,28 +385,56 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
     // delivery rides the instance registry (keyed on the canonical URI).
     if (configuration::path_is_memory(path)) return nullptr;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = shared_notifiers_.find(path);
-    if (it != shared_notifiers_.end()) {
-        return it->second.get();
+    for (;;) {
+        std::shared_ptr<notifier_slot> slot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = shared_notifiers_.find(path);
+            if (it != shared_notifiers_.end()) {
+                slot = it->second;
+            } else {
+#if defined(__linux__) || defined(__ANDROID__)
+                // A last-owner close may have removed a slot since this lookup
+                // began. Do not start an orphan listener after that retirement.
+                if (instances_.find(path) == instances_.end()) return nullptr;
+#endif
+                auto notifier = make_cross_process_notifier(path);
+                if (!notifier) return nullptr;
+                slot = std::make_shared<notifier_slot>(std::move(notifier));
+                shared_notifiers_[path] = slot;
+            }
+        }
+        std::unique_lock<std::mutex> lifecycle(slot->lifecycle_mutex);
+        if (slot->retired) {
+            lifecycle.unlock();
+#if defined(__linux__) || defined(__ANDROID__)
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (instances_.find(path) == instances_.end()) return nullptr;
+#endif
+            continue;
+        }
+#if !defined(__linux__) && !defined(__ANDROID__)
+        // Keep existing registrations sticky, including failed or explicitly
+        // stopped ones. The slot lock also serializes the first attempt when
+        // another lookup reaches a newly published slot before its creator.
+        if (slot->initial_start_attempted) return slot->notifier.get();
+        slot->initial_start_attempted = true;
+#endif
+        // Retain and serialize the slot without holding the registry mutex.
+        // Linux and Android retry a failed cached setup on the next owner;
+        // a healthy listener returns immediately. Other platforms start once.
+        // Startup must not join a path's callback worker.
+        slot->notifier->start_listening([path] {
+            int notified = 0;
+            instance_registry::instance().for_each_alive(path,
+                [&notified](lattice_db* inst) {
+                    inst->handle_cross_process_notification();
+                    ++notified;
+                });
+            LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
+        });
+        return slot->notifier.get();
     }
-
-    auto notifier = make_cross_process_notifier(path);
-    if (!notifier) return nullptr;
-
-    notifier->start_listening([path] {
-        int notified = 0;
-        instance_registry::instance().for_each_alive(path,
-            [&notified](lattice_db* inst) {
-                inst->handle_cross_process_notification();
-                ++notified;
-            });
-        LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
-    });
-
-    auto* raw = notifier.get();
-    shared_notifiers_[path] = std::move(notifier);
-    return raw;
 }
 
 void lattice_db::setup_change_hook(database& connection) {
@@ -547,9 +575,10 @@ void lattice_db::setup_change_hook(database& connection) {
 }
 void lattice_db::setup_cross_process_notifier() {
     // Use the shared per-path notifier from instance_registry.
-    // Only ONE Darwin listener per path per process — prevents N^2
-    // notification amplification when multiple lattice_db instances
-    // share the same DB file (e.g. via LatticeThreadSafeReference.resolve()).
+    // One notifier per path distributes to all local owners, avoiding N^2
+    // amplification when they share a file. Linux and Android share the
+    // underlying inotify service across paths and retry inactive registrations
+    // here; other platforms retain their first registration attempt.
     shared_xproc_notifier_ = instance_registry::instance().get_or_create_notifier(config_.path);
     if (!shared_xproc_notifier_) return;
 

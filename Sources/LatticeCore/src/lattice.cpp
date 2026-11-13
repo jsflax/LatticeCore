@@ -1534,7 +1534,7 @@ void lattice_db::setup_ipc_if_configured() {
         auto resources=std::make_shared<sync_owner_resources>();
         resources->key=acquire_sync_key(config.path,"ipc:"+target.channel);
         if(!resources->key) continue;
-        const auto socket_path=target.socket_path.value_or(resolve_ipc_socket_path(target.channel));
+        const auto socket_path=target.socket_path ? *target.socket_path : resolve_ipc_socket_path(target.channel);
         const auto lock_path=socket_path+".lock";
         const int fd=::open(lock_path.c_str(),O_CREAT|O_RDWR,0600);
         if(fd>=0) {

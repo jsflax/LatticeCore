@@ -50,6 +50,14 @@ std::string resolve_ipc_socket_path(const std::string& channel) {
 // Socket helpers
 // ============================================================================
 
+// Unix socket addresses must never silently alias a truncated pathname.
+static std::string ipc_socket_path_error(const std::string& path) {
+    constexpr size_t maximum = sizeof(sockaddr_un{}.sun_path) - 1;
+    if (path.size() <= maximum) return {};
+    return "ipc: socket path is " + std::to_string(path.size()) +
+           " bytes; maximum is " + std::to_string(maximum) + " bytes";
+}
+
 /// Suppress SIGPIPE on a socket.  Without this, writing to a closed peer
 /// kills the process instead of returning an error from write()/send().
 static void suppress_sigpipe(int fd) {
@@ -151,6 +159,12 @@ void ipc_socket_client::connect(const std::string& /*url*/,
         state_ = transport_state::open;
         start_read_loop();
         if (on_open_) on_open_();
+        return;
+    }
+
+    if (const auto error = ipc_socket_path_error(socket_path_); !error.empty()) {
+        state_ = transport_state::closed;
+        if (on_error_) on_error_(error);
         return;
     }
 
@@ -314,6 +328,10 @@ ipc_server::~ipc_server() {
 void ipc_server::start(accept_callback callback) {
     if (is_listening_) return;
 
+    if (const auto error = ipc_socket_path_error(socket_path_); !error.empty()) {
+        throw std::runtime_error(error);
+    }
+
     // Remove stale socket file if it exists
     ::unlink(socket_path_.c_str());
 
@@ -390,13 +408,17 @@ void ipc_server::stop() {
 ipc_endpoint::ipc_endpoint(const std::string& channel,
                            const std::optional<std::string>& socket_path)
     : channel_(channel)
-    , socket_path_(socket_path.value_or(resolve_ipc_socket_path(channel))) {}
+    , socket_path_(socket_path ? *socket_path : resolve_ipc_socket_path(channel)) {}
 
 ipc_endpoint::~ipc_endpoint() {
     stop();
 }
 
 void ipc_endpoint::start(transport_ready_callback callback) {
+    if (const auto error = ipc_socket_path_error(socket_path_); !error.empty()) {
+        throw std::runtime_error(error);
+    }
+
     // Ensure parent directory exists (needed for explicit socket paths)
     std::filesystem::create_directories(
         std::filesystem::path(socket_path_).parent_path());

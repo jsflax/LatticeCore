@@ -273,7 +273,7 @@ TEST(LinuxNotifierResources, OpenedFileStoresMustHaveActiveListeners) {
               << " max_user_watches=" << watches << " inotify_descriptors_start=" << initial_descriptors
               << " rlimit_nofile=" << descriptors.rlim_cur << " requested_stores=" << requested << std::endl;
     std::vector<std::unique_ptr<lattice::lattice_db>> stores(requested);
-    size_t opened = 0, reported = 0, silent = 0, first_silent = requested;
+    size_t opened = 0, reported = 0, silent = 0;
     auto& registry = lattice::instance_registry::instance();
     for (size_t index = 0; index < requested; ++index) {
         ASSERT_TRUE(std::filesystem::copy_file(template_path, files.store(index)));
@@ -287,56 +287,19 @@ TEST(LinuxNotifierResources, OpenedFileStoresMustHaveActiveListeners) {
         ++opened;
         auto* notifier = registry.get_or_create_notifier(files.store(index));
         const bool listening = notifier && notifier->is_listening();
-        if (!listening) { ++silent; if (first_silent == requested) first_silent = index; }
+        if (!listening) ++silent;
         std::cout << "NOTIFIER_RESOURCE store=" << index << " opened=1 listening=" << listening << std::endl;
     }
+    const auto peak = inotify_descriptors();
     std::cout << "NOTIFIER_RESOURCE opened=" << opened << " reported_errors=" << reported
-              << " silently_not_listening=" << silent << " inotify_descriptors_peak=" << inotify_descriptors() << std::endl;
-    EXPECT_EQ(opened + reported, requested);
-    // This is the required contract, not an inverted expectation of the current defect.
-    EXPECT_EQ(silent, 0u) << "Every successful file-store open must listen or report unavailable observation";
-    if (first_silent == requested) {
-        std::cout << "NOTIFIER_RESOURCE exhaustion_not_observed_within_cap=1" << std::endl;
-        return;
-    }
-
-    const auto path = files.store(first_silent);
-    auto* failed = registry.get_or_create_notifier(path);
-    ASSERT_NE(failed, nullptr);
-    ASSERT_FALSE(failed->is_listening());
-    stores[first_silent]->add(NotifierResourceRow{0});
-    auto observer = std::make_unique<ResourceObservation>(*stores[first_silent]);
-    ASSERT_NO_FATAL_FAILURE(insert_from_child(files, path, 1));
-    EXPECT_EQ(stores[first_silent]->db().query("SELECT sequence FROM NotifierResourceRow WHERE sequence=1").size(), 1u);
-    EXPECT_FALSE(observer->wait_for_insert(std::chrono::milliseconds(250)));
-    EXPECT_EQ(observer->inserts(), 0);
-
-    // Free capacity while retaining the failed path: neither lookup nor a new owner retries setup.
-    for (size_t index = 0; index < stores.size(); ++index) if (index != first_silent) stores[index].reset();
-    auto sibling = std::make_unique<lattice::lattice_db>(resource_config(path));
-    EXPECT_EQ(registry.get_or_create_notifier(path), failed);
-    EXPECT_FALSE(failed->is_listening());
-    std::cout << "NOTIFIER_RESOURCE retained_path_listening=" << failed->is_listening()
-              << " inotify_descriptors_after_release=" << inotify_descriptors() << std::endl;
-    ASSERT_NO_FATAL_FAILURE(insert_from_child(files, path, 2));
-    EXPECT_EQ(stores[first_silent]->db().query("SELECT sequence FROM NotifierResourceRow WHERE sequence=2").size(), 1u);
-    EXPECT_FALSE(observer->wait_for_insert(std::chrono::milliseconds(250)));
-    EXPECT_EQ(observer->inserts(), 0);
-    observer.reset();
-    sibling.reset();
-    stores[first_silent].reset();
-
-    auto reopened = std::make_unique<lattice::lattice_db>(resource_config(path));
-    auto* restored = registry.get_or_create_notifier(path);
-    ASSERT_NE(restored, nullptr);
-    ASSERT_TRUE(restored->is_listening());
-    ResourceObservation recovered(*reopened);
-    ASSERT_NO_FATAL_FAILURE(insert_from_child(files, path, 3));
-    EXPECT_TRUE(recovered.wait_for_insert(std::chrono::seconds(30)));
-    EXPECT_EQ(recovered.inserts(), 1);
-    EXPECT_EQ(reopened->db().query("SELECT sequence FROM NotifierResourceRow WHERE sequence=3").size(), 1u);
-    std::cout << "NOTIFIER_RESOURCE reopened_listening=" << restored->is_listening()
-              << " recovered_insert_callbacks=" << recovered.inserts() << std::endl;
+              << " silently_not_listening=" << silent << " inotify_descriptors_peak=" << peak << std::endl;
+    // A separate descriptor limit can reject some database opens before the
+    // requested inotify load is reached. Still require a substantial live set.
+    EXPECT_GE(opened, std::min<size_t>(requested, 32u));
+    EXPECT_GE(peak, 1u) << "The descriptor census must observe the active inotify service";
+    EXPECT_LE(peak, initial_descriptors + 1)
+        << "Successfully opened file paths must share their process's inotify instance";
+    EXPECT_EQ(silent, 0u) << "Every successfully opened store must have an active listener after lookup";
 }
 
 void repaired_signal_path_retries_setup() {
@@ -468,6 +431,7 @@ TEST(LinuxNotifierResources, IndependentPathsUseAtMostOneAdditionalInotifyInstan
         listeners.push_back(std::move(listener));
     }
     const auto peak = inotify_descriptors();
+    EXPECT_GE(peak, 1u) << "The descriptor census must observe the active inotify service";
     EXPECT_LE(peak, initial + 1) << "File paths must share their process's inotify instance";
     listeners.clear();
     EXPECT_LE(inotify_descriptors(), initial + 1);

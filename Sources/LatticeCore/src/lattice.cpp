@@ -575,9 +575,10 @@ void lattice_db::setup_change_hook(database& connection) {
 }
 void lattice_db::setup_cross_process_notifier() {
     // Use the shared per-path notifier from instance_registry.
-    // Only ONE Darwin listener per path per process — prevents N^2
-    // notification amplification when multiple lattice_db instances
-    // share the same DB file (e.g. via LatticeThreadSafeReference.resolve()).
+    // One notifier per path distributes to all local owners, avoiding N^2
+    // amplification when they share a file. Linux and Android share the
+    // underlying inotify service across paths and retry inactive registrations
+    // here; other platforms retain their first registration attempt.
     shared_xproc_notifier_ = instance_registry::instance().get_or_create_notifier(config_.path);
     if (!shared_xproc_notifier_) return;
 

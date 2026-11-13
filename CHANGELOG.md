@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Linux and Android file paths share one process-wide inotify instance and
+  polling thread instead of allocating an instance per path. Each path retains
+  its own callback worker, so a blocked callback does not block the poller or
+  callbacks for other paths. Subscriptions sharing a signal-file watch retire
+  independently; the watch ends when its last subscriber stops.
+- On Linux and Android, a later open of the same path retries an inactive
+  listener, including failed setup or an explicitly stopped listener. A direct
+  registry lookup for an owned path can also retry it. A registry lookup with
+  no open store now returns null rather than creating an orphan listener.
+  Invalidated watches and failed poll/read generations stop reporting that
+  they are listening. Apple keeps the 3.1.0 behavior: existing registrations
+  are not restarted by lookup or another open, and an unowned file-path lookup
+  may create a listener.
+- Linux callback capture cleanup runs outside notifier lifecycle and worker
+  state locks. Final-owner retirement does not join a callback while holding
+  the registry or slot lock.
+
+### Compatibility and limits
+
+- Linux and Android still require one watch and callback worker per active
+  path. Watch quotas, file-descriptor limits, memory and event queues remain
+  relevant. The shared descriptor and poll thread last for the process lifetime.
+- Recovery requires a later same-path open or explicit registry lookup; it is
+  not automatic for a lone long-lived store. Successful retry does not queue
+  catch-up or promise replay of notifications missed while unavailable. Store
+  open does not raise a new error for failed listener setup; native
+  `is_listening()` remains the availability check.
+- Fork without exec is unsupported after the process has initialized the Linux
+  or Android notification service. The child inherits service state without
+  its poll thread and must exec before opening or using stores. Closing all
+  parent stores before the fork does not reset the process-lifetime service.
+
 ## [3.1.0] - 2026-11-12
 
 ### Added

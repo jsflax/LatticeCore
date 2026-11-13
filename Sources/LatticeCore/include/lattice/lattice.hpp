@@ -211,7 +211,11 @@ public:
     /// instances share the same path. The listener distributes to all
     /// instances via for_each_alive.
     /// Returns a raw pointer (owned by the registry) for post_notification,
-    /// or nullptr for in-memory DBs.
+    /// or nullptr for in-memory DBs or an unavailable platform backend.
+    /// Linux and Android also return nullptr when no store owns the path;
+    /// a lookup for an owned path retries a registration that is not listening.
+    /// Other platforms return cached registrations without restarting them,
+    /// and retain the ability to create a listener for an unowned file path.
     cross_process_notifier* get_or_create_notifier(const std::string& path);
 
     /// Per-path write gate for SHARED-CACHE stores (Live Results item A spec,
@@ -9779,10 +9783,10 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "~dtor: shutting down scheduler");
     if (scheduler_) scheduler_->shutdown();
     LOG_INFO("lattice_db", "~dtor: scheduler shutdown done");
-    // 5. Unregister. Do NOT hold xproc_callback_mutex_ during unregister —
-    //    unregister_instance takes registry mutex_, and may destroy the notifier
-    //    (stop_listening → thread join). The notifier callback also takes
-    //    registry mutex_ via for_each_alive → deadlock if we hold both.
+    // 5. Unregister. The registry removes and retires the slot before stopping
+    //    its notifier, with neither the registry nor slot lock held at stop.
+    //    Do NOT hold xproc_callback_mutex_ while draining a callback worker:
+    //    an in-flight callback may need that mutex before it can return.
     LOG_INFO("lattice_db", "~dtor: calling unregister_instance");
     instance_registry::instance().unregister_instance(config_.path, this);
     LOG_INFO("lattice_db", "~dtor: unregister done");

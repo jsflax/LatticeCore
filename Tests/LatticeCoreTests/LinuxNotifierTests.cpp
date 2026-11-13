@@ -342,6 +342,10 @@ void repaired_signal_path_retries_setup() {
     ASSERT_GE(signal, 0);
     ASSERT_EQ(::close(signal), 0);
     auto sibling = std::make_unique<lattice::lattice_db>(resource_config(path));
+    // A registry lookup can itself retry. Credit recovery to the owner open
+    // only after reading the notifier retained from the failed first open.
+    ASSERT_TRUE(initial->is_listening())
+        << "The sibling open must restore listening before another registry lookup";
     auto* retried = registry.get_or_create_notifier(path);
     ASSERT_NE(retried, nullptr);
     const bool recovered = retried->is_listening();

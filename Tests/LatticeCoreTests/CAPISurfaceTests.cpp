@@ -177,7 +177,8 @@ std::set<std::string> difference(const std::set<std::string>& a, const std::set<
 }  // namespace
 
 TEST(CAPISurfaceTests, HeaderCompilesAndLinksAsC11) {
-    // The real assertion is that capi_header_compiles.c BUILT (as pure C11).
+    // The real assertion is that capi_header_compiles.c BUILT (as pure C11,
+    // including _Static_assert pins on frozen v1 struct sizes).
     // Calling its probe proves the TU is still part of the test target.
     EXPECT_EQ(lattice_capi_header_compiles_as_c11(), 1);
 }

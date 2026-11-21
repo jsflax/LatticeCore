@@ -55,10 +55,18 @@ inline void log_write(const char* fmt, Args... args) {
     std::lock_guard<std::mutex> lock(g_log_mutex());
     auto* f = g_log_file.load(std::memory_order_acquire);
     if (f) {
-        std::fprintf(f, fmt, args...);
+        if constexpr (sizeof...(Args) == 0) {
+            std::fprintf(f, "%s", fmt);
+        } else {
+            std::fprintf(f, fmt, args...);
+        }
         std::fflush(f);
     } else {
-        std::fprintf(stderr, fmt, args...);
+        if constexpr (sizeof...(Args) == 0) {
+            std::fprintf(stderr, "%s", fmt);
+        } else {
+            std::fprintf(stderr, fmt, args...);
+        }
     }
 }
 }

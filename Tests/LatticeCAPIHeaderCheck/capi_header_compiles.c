@@ -22,6 +22,13 @@
 #error "lattice.h must compile under C11 (or newer)"
 #endif
 
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+_Static_assert(sizeof(lattice_property_t) == 48, "Frozen v1 lattice_property_t size changed");
+_Static_assert(sizeof(lattice_unique_constraint_t) == 32, "Frozen v1 lattice_unique_constraint_t size changed");
+_Static_assert(sizeof(lattice_schema_t) == 24, "Frozen v1 lattice_schema_t size changed");
+_Static_assert(sizeof(lattice_knn_result_t) == 16, "Frozen v1 lattice_knn_result_t size changed");
+#endif
+
 int lattice_capi_header_compiles_as_c11(void) {
     // Touch representative public surface so the compiler fully type-checks
     // it. No lattice_* function is CALLED — this target does not link
@@ -30,10 +37,15 @@ int lattice_capi_header_compiles_as_c11(void) {
     lattice_unique_constraint_t constraint = {0};
     lattice_schema_t schema = {0};
     lattice_knn_result_t knn = {0};
+    lattice_union_case_value_t ucv = {0};
+    lattice_union_case_t uc = {0};
+    lattice_union_descriptor_t udesc = {0};
+    lattice_property_ext_t prop_ext = {0};
+    lattice_schema_ext_t schema_ext = {0};
 
     lattice_status_t status = LATTICE_OK;
     lattice_column_type_t col = LATTICE_TYPE_BLOB;
-    lattice_property_kind_t kind = LATTICE_KIND_VIRTUAL_LINK;
+    lattice_property_kind_t kind = LATTICE_KIND_UNION;
     lattice_distance_metric_t metric = LATTICE_DISTANCE_L1;
     lattice_websocket_state_t ws_state = LATTICE_WS_CLOSED;
     lattice_websocket_msg_type_t ws_msg = LATTICE_WS_MSG_BINARY;
@@ -42,20 +54,26 @@ int lattice_capi_header_compiles_as_c11(void) {
     lattice_table_observer_fn table_obs = 0;
     lattice_object_observer_fn object_obs = 0;
     lattice_migration_row_fn migration = 0;
+    lattice_migration_table_row_fn migration_v2 = 0;
     lattice_create_websocket_fn create_ws = 0;
     lattice_ws_on_message_fn on_message = 0;
+    lattice_ws_configure_pin_fn cfg_pin = 0;
+    lattice_ws_on_destroy_fn on_destroy = 0;
 
     lattice_db_t* db = 0;
     lattice_object_t* obj = 0;
     lattice_results_t* results = 0;
     lattice_link_list_t* list = 0;
+    lattice_union_value_t* uval = 0;
     lattice_scheduler_t* sched = 0;
     lattice_websocket_client_t* ws = 0;
     lattice_network_factory_t* factory = 0;
 
     (void)prop; (void)constraint; (void)schema; (void)col; (void)kind;
+    (void)ucv; (void)uc; (void)udesc; (void)prop_ext; (void)schema_ext;
     (void)metric; (void)ws_state; (void)ws_msg; (void)db; (void)obj;
-    (void)results; (void)list; (void)sched; (void)ws; (void)factory;
+    (void)results; (void)list; (void)uval; (void)sched; (void)ws; (void)factory;
+    (void)migration_v2; (void)cfg_pin; (void)on_destroy;
 
     int ok = (status == 0)
         && (LATTICE_ERROR_DATABASE == -4)

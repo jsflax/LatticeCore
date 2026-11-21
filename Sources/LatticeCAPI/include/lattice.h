@@ -32,6 +32,7 @@ typedef struct lattice_db lattice_db_t;
 typedef struct lattice_object lattice_object_t;
 typedef struct lattice_results lattice_results_t;
 typedef struct lattice_link_list lattice_link_list_t;
+typedef struct lattice_union_value lattice_union_value_t;
 
 // =============================================================================
 // Versioning & Introspection
@@ -40,7 +41,7 @@ typedef struct lattice_link_list lattice_link_list_t;
 // The C ABI compatibility version is independent of the LatticeCore package version.
 // The surface becomes additive-only at 1.0 (see docs/CAPI-STABILITY.md).
 #define LATTICE_CAPI_VERSION_MAJOR 1
-#define LATTICE_CAPI_VERSION_MINOR 0
+#define LATTICE_CAPI_VERSION_MINOR 1
 #define LATTICE_CAPI_VERSION_PATCH 0
 
 // Single-integer encoding: MAJOR*1000000 + MINOR*1000 + PATCH (sqlite-style).
@@ -49,7 +50,7 @@ typedef struct lattice_link_list lattice_link_list_t;
      LATTICE_CAPI_VERSION_MINOR * 1000 + \
      LATTICE_CAPI_VERSION_PATCH)
 
-#define LATTICE_CAPI_VERSION_STRING "1.0.0"
+#define LATTICE_CAPI_VERSION_STRING "1.1.0"
 
 // Runtime version of the linked library (compare against LATTICE_CAPI_VERSION
 // to detect header/library skew).
@@ -117,6 +118,7 @@ typedef enum {
     LATTICE_KIND_LINK_LIST = 2,
     LATTICE_KIND_VIRTUAL_LIST = 3,
     LATTICE_KIND_VIRTUAL_LINK = 4,
+    LATTICE_KIND_UNION = 5,
 } lattice_property_kind_t;
 
 typedef struct {
@@ -539,6 +541,8 @@ typedef void (*lattice_ws_on_message_fn)(void* user_data, lattice_websocket_msg_
                                           const uint8_t* data, size_t data_size);
 typedef void (*lattice_ws_on_error_fn)(void* user_data, const char* error);
 typedef void (*lattice_ws_on_close_fn)(void* user_data, int code, const char* reason);
+typedef bool (*lattice_ws_configure_pin_fn)(void* user_data, const char* sha256_hex);
+typedef void (*lattice_ws_on_destroy_fn)(void* user_data);
 
 // Create a WebSocket client with platform-provided callbacks
 // Returns opaque pointer that must be released with lattice_websocket_client_release
@@ -568,6 +572,14 @@ LATTICE_EXPORT void lattice_websocket_client_set_on_error(lattice_websocket_clie
                                             void* user_data, lattice_ws_on_error_fn fn);
 LATTICE_EXPORT void lattice_websocket_client_set_on_close(lattice_websocket_client_t* client,
                                             void* user_data, lattice_ws_on_close_fn fn);
+// Configure TLS leaf-certificate SHA-256 hex pin on this WebSocket client.
+// Invoked by C++ synchronizer before connect() whenever a non-empty pin is configured;
+// return true if the platform WebSocket client enforces the pin (or sha256_hex is empty).
+LATTICE_EXPORT void lattice_websocket_client_set_configure_pin(lattice_websocket_client_t* client,
+                                                 void* user_data, lattice_ws_configure_pin_fn fn);
+// Optional destructor hook invoked when C++ destroys this WebSocket client instance.
+LATTICE_EXPORT void lattice_websocket_client_set_on_destroy(lattice_websocket_client_t* client,
+                                              void* user_data, lattice_ws_on_destroy_fn fn);
 
 // Trigger events from platform to C++ (platform calls these when WebSocket events occur)
 // Call these from your platform WebSocket implementation when events happen
@@ -861,6 +873,17 @@ typedef struct {
     // (read-only dials excluded from compaction floors). Tri-state:
     // 1 = on, 0 = off, -1 = keep default.
     int32_t sync_is_observer;
+
+    // --- appended in 3.1.2 / CAPI 1.1.0 (older callers' struct_size stops before here) ---
+
+    int32_t target_schema_version;               // applies when >= 1; sentinel -1 (= 1)
+    int32_t busy_timeout_ms;                     // applies when > 0; sentinel -1 (= 30000)
+    int32_t uploads_enabled;                     // tri-state: 1 = on, 0 = download-only, -1 = keep default (1)
+    int32_t sync_authentication_mode;            // 0 = bearer_token, 1 = transport_managed, -1 = keep default
+    const char* websocket_sync_identity;         // stable peer identity (< 4092 bytes), NULL = derive from URL
+    const char* pinned_server_certificate_sha256; // lowercase 64-hex SHA-256 of leaf DER, NULL = none
+    int32_t create_if_missing;                   // tri-state: 1 = true, 0 = false, -1 = keep default (1)
+    int32_t read_only;                           // tri-state: 1 = read-only, 0 = writable, -1 = keep default (0)
 } lattice_sync_options_t;
 
 // Fill defaults: struct_size = sizeof(lattice_sync_options_t), every knob at
@@ -1065,6 +1088,115 @@ LATTICE_EXPORT int64_t lattice_db_read_upload_floor(lattice_db_t* db, const char
 // Returns a malloc'd NUL-terminated string - free with lattice_string_free.
 // Returns NULL on error (see lattice_last_error()).
 LATTICE_EXPORT char* lattice_object_to_json(lattice_object_t* obj, int32_t max_depth);
+
+// =============================================================================
+// Extended Schema v2 (@NoHistory, @Union, Compound Constraints) & Union Access
+// =============================================================================
+//
+// NOTE (docs/CAPI-STABILITY.md rule 3): lattice_property_t and lattice_schema_t
+// are frozen without struct_size and are indexed as contiguous C arrays; NEVER
+// append fields to them. Extended attributes (no_history, union_desc, compound
+// constraints) ride these size-prefixed, stride-indexed v2 descriptors instead.
+
+typedef struct {
+    size_t struct_size;             // sizeof(lattice_union_case_value_t)
+    const char* param_name;         // NULL or "" for unlabeled single payload
+    lattice_column_type_t type;     // SQL column type (TEXT for embedded/links, native for scalars)
+    bool is_link;                   // true = globalId reference to link_target
+    const char* link_target;        // Target model table if is_link (else NULL)
+} lattice_union_case_value_t;
+
+typedef struct {
+    size_t struct_size;             // sizeof(lattice_union_case_t)
+    const char* case_name;
+    const lattice_union_case_value_t* values;
+    size_t value_count;
+    size_t value_stride;            // sizeof(lattice_union_case_value_t)
+} lattice_union_case_t;
+
+typedef struct {
+    size_t struct_size;             // sizeof(lattice_union_descriptor_t)
+    const char* union_table_name;   // e.g. "_RoutingSignal", "_DistributedExecutionState"
+    const lattice_union_case_t* cases;
+    size_t case_count;
+    size_t case_stride;             // sizeof(lattice_union_case_t)
+} lattice_union_descriptor_t;
+
+typedef struct {
+    size_t struct_size;                         // sizeof(lattice_property_ext_t)
+    lattice_property_t base;                    // Frozen v1 prefix
+    bool no_history;                            // Maps to property_descriptor::no_history
+    const lattice_union_descriptor_t* union_desc; // Non-NULL when base.kind == LATTICE_KIND_UNION
+} lattice_property_ext_t;
+
+typedef struct {
+    size_t struct_size;                         // sizeof(lattice_schema_ext_t)
+    const char* table_name;
+    const lattice_property_ext_t* properties;   // Indexed via idx * property_stride
+    size_t property_count;
+    size_t property_stride;                     // sizeof(lattice_property_ext_t)
+    const lattice_unique_constraint_t* constraints; // Optional compound / allows_upsert constraints
+    size_t constraint_count;
+} lattice_schema_ext_t;
+
+typedef void (*lattice_migration_table_row_fn)(
+    void* context,
+    const char* table_name,
+    const char* old_values_json,
+    char** new_values_json
+);
+
+LATTICE_EXPORT void lattice_union_case_value_init(lattice_union_case_value_t* val);
+LATTICE_EXPORT void lattice_union_case_init(lattice_union_case_t* uc);
+LATTICE_EXPORT void lattice_union_descriptor_init(lattice_union_descriptor_t* desc);
+LATTICE_EXPORT void lattice_property_ext_init(lattice_property_ext_t* prop);
+LATTICE_EXPORT void lattice_schema_ext_init(lattice_schema_ext_t* schema);
+
+LATTICE_EXPORT lattice_db_t* lattice_db_open_v2(
+    const char* path,
+    const lattice_schema_ext_t* schemas,
+    size_t schema_count,
+    size_t schema_stride,
+    lattice_scheduler_t* scheduler,
+    const char* wss_endpoint,
+    const char* authorization_token,
+    const lattice_sync_options_t* sync_options,
+    const char* const* migration_tables,
+    size_t migration_table_count,
+    void* migration_context,
+    lattice_migration_table_row_fn migration_fn
+);
+
+LATTICE_EXPORT lattice_object_t* lattice_object_create_with_schema_v2(
+    const char* table_name,
+    const lattice_property_ext_t* properties,
+    size_t property_count,
+    size_t property_stride
+);
+
+// Opaque union value builder & snapshot accessor (executes a single query per union read/write)
+LATTICE_EXPORT lattice_union_value_t* lattice_union_value_create(const char* case_name);
+LATTICE_EXPORT void lattice_union_value_release(lattice_union_value_t* uv);
+LATTICE_EXPORT const char* lattice_union_value_get_case(const lattice_union_value_t* uv);
+LATTICE_EXPORT bool lattice_union_value_has_field(const lattice_union_value_t* uv, const char* key);
+LATTICE_EXPORT int64_t lattice_union_value_get_int(const lattice_union_value_t* uv, const char* key);
+LATTICE_EXPORT double lattice_union_value_get_double(const lattice_union_value_t* uv, const char* key);
+LATTICE_EXPORT const char* lattice_union_value_get_string(const lattice_union_value_t* uv, const char* key);
+LATTICE_EXPORT size_t lattice_union_value_get_blob(const lattice_union_value_t* uv, const char* key,
+                                                   uint8_t* buffer, size_t buffer_size);
+LATTICE_EXPORT lattice_object_t* lattice_union_value_get_link(const lattice_union_value_t* uv, const char* key);
+LATTICE_EXPORT void lattice_union_value_set_int(lattice_union_value_t* uv, const char* key, int64_t value);
+LATTICE_EXPORT void lattice_union_value_set_double(lattice_union_value_t* uv, const char* key, double value);
+LATTICE_EXPORT void lattice_union_value_set_string(lattice_union_value_t* uv, const char* key, const char* value);
+LATTICE_EXPORT void lattice_union_value_set_blob(lattice_union_value_t* uv, const char* key,
+                                                 const uint8_t* data, size_t size);
+LATTICE_EXPORT void lattice_union_value_set_link(lattice_union_value_t* uv, const char* key, lattice_object_t* obj);
+
+// Returns a newly allocated union value snapshot (NULL if unset / empty case_name); free with lattice_union_value_release.
+LATTICE_EXPORT lattice_union_value_t* lattice_object_get_union(lattice_object_t* obj, const char* field);
+LATTICE_EXPORT lattice_status_t lattice_object_set_union(lattice_object_t* obj, const char* field,
+                                                         const lattice_union_value_t* uv);
+LATTICE_EXPORT lattice_status_t lattice_object_clear_union(lattice_object_t* obj, const char* field);
 
 #ifdef __cplusplus
 }

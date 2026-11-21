@@ -1,5 +1,32 @@
 # Changelog
 
+## [3.1.2] - 2026-11-21
+
+### Added
+
+- Additive `LatticeCAPI` `1.1.0` (`LATTICE_CAPI_VERSION = 10100`) surface for
+  Kotlin/Native and Android JNI bindings while keeping `sizeof(lattice_property_t)`
+  and `sizeof(lattice_schema_t)` frozen:
+  - Sum-type unions (`LATTICE_KIND_UNION = 5`, `lattice_union_descriptor_t`,
+    `lattice_union_value_create` / `release` / `get_case` / typed field getters
+    and setters, `lattice_object_get_union` / `set_union`).
+  - Parallel schema extensions (`lattice_property_ext_t` with `no_history`,
+    `column_name`, and `union_type`; `lattice_schema_ext_t` with compound unique
+    `lattice_unique_constraint_t`; `lattice_db_open_v2`; and
+    `lattice_object_create_with_schema_v2`).
+  - Additive tail fields on `lattice_sync_options_t` (`replication_slot`,
+    `audit_log_retention_entries`, `wss_pinned_cert_sha256`, `read_only`,
+    `target_schema_version`, `migration_callback`, `migration_user_data`, and
+    `allow_blessed_file_reads`).
+  - Pluggable WebSocket leaf-certificate SHA-256 pinning and deterministic
+    lifecycle teardown callbacks (`lattice_websocket_client_set_configure_pin`,
+    `lattice_websocket_client_set_on_destroy`).
+
+### Fixed
+
+- Guard zero-argument format strings in `lattice::log_impl` with `"%s"` so
+  Android NDK Clang 18 (`-Werror=format-security`) compiles `LatticeCore` cleanly.
+
 ## [3.1.1] - 2026-11-13
 
 ### Fixed

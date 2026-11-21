@@ -116,6 +116,7 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
     // lattice.h and docs/CAPI-STABILITY.md.
     static const char* const kFeatures[] = {
         "attach",
+        "certificate_pin",
         "checkpoint",
         "cross_process_observation",
         "detach",
@@ -124,9 +125,11 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
         "ipc",
         "knn",
         "migration",
+        "no_history",
         "observation",
         "rollback",
         "row_cache",
+        "schema_v2",
         "statement_counters",
         "sync",
         "sync_filter",
@@ -134,6 +137,7 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
         "sync_tuning",
         "to_json",
         "transactions",
+        "union",
     };
     for (const char* const f : kFeatures) {
         if (std::strcmp(feature, f) == 0) return true;
@@ -1373,6 +1377,11 @@ struct lattice_websocket_client_internal : public lattice::sync_transport {
     lattice_ws_on_error_fn on_error_fn_ = nullptr;
     lattice_ws_on_close_fn on_close_fn_ = nullptr;
 
+    void* configure_pin_user_data_ = nullptr;
+    lattice_ws_configure_pin_fn configure_pin_fn_ = nullptr;
+    void* on_destroy_user_data_ = nullptr;
+    lattice_ws_on_destroy_fn on_destroy_fn_ = nullptr;
+
     // C++ handlers from sync layer (set via set_on_* methods)
     on_open_handler cpp_on_open_handler_;
     on_message_handler cpp_on_message_handler_;
@@ -1392,7 +1401,24 @@ struct lattice_websocket_client_internal : public lattice::sync_transport {
       , send_fn_(send_fn)
     {}
 
-    ~lattice_websocket_client_internal() override = default;
+    ~lattice_websocket_client_internal() override {
+        if (on_destroy_fn_) {
+            on_destroy_fn_(on_destroy_user_data_);
+        }
+    }
+
+    bool configure_certificate_pin(const std::string& sha256_hex) override {
+        if (sha256_hex.empty()) {
+            if (configure_pin_fn_) {
+                configure_pin_fn_(configure_pin_user_data_, "");
+            }
+            return true;
+        }
+        if (!configure_pin_fn_) {
+            return false;
+        }
+        return configure_pin_fn_(configure_pin_user_data_, sha256_hex.c_str());
+    }
 
     void connect(const std::string& url,
                  const std::map<std::string, std::string>& headers = {}) override {
@@ -1563,6 +1589,28 @@ extern "C" void lattice_websocket_client_set_on_close(
     auto* ws = reinterpret_cast<lattice_websocket_client_internal*>(client);
     ws->on_close_user_data_ = user_data;
     ws->on_close_fn_ = fn;
+}
+
+extern "C" void lattice_websocket_client_set_configure_pin(
+    lattice_websocket_client_t* client,
+    void* user_data,
+    lattice_ws_configure_pin_fn fn
+) {
+    if (!client) return;
+    auto* ws = reinterpret_cast<lattice_websocket_client_internal*>(client);
+    ws->configure_pin_user_data_ = user_data;
+    ws->configure_pin_fn_ = fn;
+}
+
+extern "C" void lattice_websocket_client_set_on_destroy(
+    lattice_websocket_client_t* client,
+    void* user_data,
+    lattice_ws_on_destroy_fn fn
+) {
+    if (!client) return;
+    auto* ws = reinterpret_cast<lattice_websocket_client_internal*>(client);
+    ws->on_destroy_user_data_ = user_data;
+    ws->on_destroy_fn_ = fn;
 }
 
 extern "C" void lattice_websocket_client_trigger_on_open(lattice_websocket_client_t* client) {
@@ -2273,6 +2321,88 @@ extern "C" void lattice_sync_options_init(lattice_sync_options_t* options) {
     // writer slots), which is also what an older, shorter caller struct means.
     options->audit_retention_seconds = -1;
     options->sync_is_observer = -1;
+    // 3.1.2 / CAPI 1.1.0 tail fields — sentinels keep library defaults.
+    options->target_schema_version = -1;
+    options->busy_timeout_ms = -1;
+    options->uploads_enabled = -1;
+    options->sync_authentication_mode = -1;
+    options->websocket_sync_identity = nullptr;
+    options->pinned_server_certificate_sha256 = nullptr;
+    options->create_if_missing = -1;
+    options->read_only = -1;
+}
+
+static bool apply_sync_options_to_config(
+    const lattice_sync_options_t* options,
+    lattice::swift_configuration& config
+) {
+    lattice_sync_options_t opts;
+    lattice_sync_options_init(&opts);
+    if (options) {
+        if (options->struct_size == 0) {
+            set_error("lattice_sync_options_t.struct_size is 0 - "
+                      "initialize the struct with lattice_sync_options_init()");
+            return false;
+        }
+        std::memcpy(&opts, options,
+                    std::min(options->struct_size, sizeof(lattice_sync_options_t)));
+    }
+    if (opts.sync_id) {
+        set_error("lattice_sync_options_t.sync_id is reserved and must be NULL "
+                  "(sync ids are derived by the library; see lattice.h)");
+        return false;
+    }
+
+    config.set_sync_chunk_size(opts.chunk_size);
+    config.set_sync_max_reconnect_attempts(opts.max_reconnect_attempts);
+    config.set_sync_base_delay_seconds(opts.base_delay_seconds);
+    config.set_sync_max_delay_seconds(opts.max_delay_seconds);
+    config.set_sync_stable_connection_ms(opts.stable_connection_ms);
+    config.set_sync_upload_coalesce_ms(opts.upload_coalesce_ms);
+    config.set_sync_checkpoint_passive_interval_ms(opts.checkpoint_passive_interval_ms);
+    config.set_sync_checkpoint_truncate_interval_ms(opts.checkpoint_truncate_interval_ms);
+    if (opts.use_upload_floor >= 0) {
+        config.set_sync_use_upload_floor(opts.use_upload_floor != 0);
+    }
+    if (opts.audit_retention_seconds >= 0) {
+        config.audit_retention_seconds = opts.audit_retention_seconds;
+    }
+    if (opts.sync_is_observer >= 0) {
+        config.sync_is_observer = opts.sync_is_observer != 0;
+    }
+    if (opts.target_schema_version >= 1) {
+        config.target_schema_version = opts.target_schema_version;
+    }
+    if (opts.busy_timeout_ms > 0) {
+        config.busy_timeout_ms = opts.busy_timeout_ms;
+    }
+    if (opts.uploads_enabled >= 0) {
+        config.set_uploads_enabled(opts.uploads_enabled != 0);
+    }
+    if (opts.sync_authentication_mode == 0) {
+        config.sync_authentication_mode = lattice::sync_authentication::bearer_token;
+    } else if (opts.sync_authentication_mode == 1) {
+        config.sync_authentication_mode = lattice::sync_authentication::transport_managed;
+    } else if (opts.sync_authentication_mode > 1) {
+        set_error("invalid lattice_sync_options_t.sync_authentication_mode");
+        return false;
+    }
+    if (opts.websocket_sync_identity) {
+        config.set_websocket_sync_identity(opts.websocket_sync_identity);
+    }
+    if (opts.pinned_server_certificate_sha256) {
+        config.set_certificate_pin(opts.pinned_server_certificate_sha256);
+    }
+    if (opts.create_if_missing >= 0) {
+        config.create_if_missing = opts.create_if_missing != 0;
+    }
+    if (opts.read_only >= 0) {
+        config.read_only = opts.read_only != 0;
+    }
+    if (opts.sync_filter_json) {
+        config.sync_filter = parse_sync_filter_json(opts.sync_filter_json);
+    }
+    return true;
 }
 
 extern "C" lattice_db_t* lattice_db_create_with_sync_options(
@@ -2285,27 +2415,6 @@ extern "C" lattice_db_t* lattice_db_create_with_sync_options(
     const lattice_sync_options_t* options
 ) {
     try {
-        // Size-prefixed copy: read min(caller_size, sizeof) bytes onto a
-        // defaults-initialized local, so callers built against an older
-        // (shorter) struct keep working as fields are appended
-        // (docs/CAPI-STABILITY.md rule 3).
-        lattice_sync_options_t opts;
-        lattice_sync_options_init(&opts);
-        if (options) {
-            if (options->struct_size == 0) {
-                set_error("lattice_sync_options_t.struct_size is 0 - "
-                          "initialize the struct with lattice_sync_options_init()");
-                return nullptr;
-            }
-            std::memcpy(&opts, options,
-                        std::min(options->struct_size, sizeof(lattice_sync_options_t)));
-        }
-        if (opts.sync_id) {
-            set_error("lattice_sync_options_t.sync_id is reserved and must be NULL "
-                      "(sync ids are derived by the library; see lattice.h)");
-            return nullptr;
-        }
-
         std::string db_path = path ? std::string(path) : ":memory:";
         auto schema_vec = convert_schemas(schemas, schema_count);
         std::string ws_url = wss_endpoint ? std::string(wss_endpoint) : "";
@@ -2318,34 +2427,8 @@ extern "C" lattice_db_t* lattice_db_create_with_sync_options(
             config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
         }
 
-        // Wire the knobs through configuration::sync_tuning via the bridge
-        // setters, so the validation semantics are literally the bridge's:
-        // nonsensical values are ignored and the knob keeps sync.hpp's
-        // default (0 stays meaningful where it means "disabled").
-        config.set_sync_chunk_size(opts.chunk_size);
-        config.set_sync_max_reconnect_attempts(opts.max_reconnect_attempts);
-        config.set_sync_base_delay_seconds(opts.base_delay_seconds);
-        config.set_sync_max_delay_seconds(opts.max_delay_seconds);
-        config.set_sync_stable_connection_ms(opts.stable_connection_ms);
-        config.set_sync_upload_coalesce_ms(opts.upload_coalesce_ms);
-        config.set_sync_checkpoint_passive_interval_ms(opts.checkpoint_passive_interval_ms);
-        config.set_sync_checkpoint_truncate_interval_ms(opts.checkpoint_truncate_interval_ms);
-        if (opts.use_upload_floor >= 0) {
-            config.set_sync_use_upload_floor(opts.use_upload_floor != 0);
-        }
-        // 1.5.0 tail fields: -1 (the init sentinel, and what an older caller's
-        // shorter struct leaves behind) keeps the library defaults.
-        if (opts.audit_retention_seconds >= 0) {
-            config.audit_retention_seconds = opts.audit_retention_seconds;
-        }
-        if (opts.sync_is_observer >= 0) {
-            config.sync_is_observer = opts.sync_is_observer != 0;
-        }
-
-        if (opts.sync_filter_json) {
-            // Same JSON contract as lattice_db_set_sync_filter. NOTE: an
-            // empty array is an explicit empty whitelist (sync nothing).
-            config.sync_filter = parse_sync_filter_json(opts.sync_filter_json);
+        if (!apply_sync_options_to_config(options, config)) {
+            return nullptr;
         }
 
         auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
@@ -2883,5 +2966,469 @@ extern "C" char* lattice_object_to_json(lattice_object_t* obj, int32_t max_depth
     } catch (...) {
         set_error("unknown error in lattice_object_to_json");
         return nullptr;
+    }
+}
+
+// =============================================================================
+// Extended Schema v2 (@NoHistory, @Union, Compound Constraints) & Union Access
+// =============================================================================
+
+struct lattice_union_value {
+    lattice::union_value val;
+};
+
+extern "C" void lattice_union_case_value_init(lattice_union_case_value_t* val) {
+    if (!val) return;
+    std::memset(val, 0, sizeof(*val));
+    val->struct_size = sizeof(lattice_union_case_value_t);
+}
+
+extern "C" void lattice_union_case_init(lattice_union_case_t* uc) {
+    if (!uc) return;
+    std::memset(uc, 0, sizeof(*uc));
+    uc->struct_size = sizeof(lattice_union_case_t);
+    uc->value_stride = sizeof(lattice_union_case_value_t);
+}
+
+extern "C" void lattice_union_descriptor_init(lattice_union_descriptor_t* desc) {
+    if (!desc) return;
+    std::memset(desc, 0, sizeof(*desc));
+    desc->struct_size = sizeof(lattice_union_descriptor_t);
+    desc->case_stride = sizeof(lattice_union_case_t);
+}
+
+extern "C" void lattice_property_ext_init(lattice_property_ext_t* prop) {
+    if (!prop) return;
+    std::memset(prop, 0, sizeof(*prop));
+    prop->struct_size = sizeof(lattice_property_ext_t);
+}
+
+extern "C" void lattice_schema_ext_init(lattice_schema_ext_t* schema) {
+    if (!schema) return;
+    std::memset(schema, 0, sizeof(*schema));
+    schema->struct_size = sizeof(lattice_schema_ext_t);
+    schema->property_stride = sizeof(lattice_property_ext_t);
+}
+
+static lattice::union_descriptor convert_union_descriptor(const lattice_union_descriptor_t* raw_desc) {
+    lattice::union_descriptor udesc;
+    if (!raw_desc) return udesc;
+    lattice_union_descriptor_t d;
+    lattice_union_descriptor_init(&d);
+    size_t d_sz = raw_desc->struct_size ? raw_desc->struct_size : sizeof(d);
+    std::memcpy(&d, raw_desc, std::min(d_sz, sizeof(d)));
+
+    if (d.union_table_name) udesc.union_table_name = d.union_table_name;
+    if (d.cases && d.case_count > 0) {
+        size_t c_stride = d.case_stride ? d.case_stride : sizeof(lattice_union_case_t);
+        const auto* cases_bytes = reinterpret_cast<const char*>(d.cases);
+        udesc.cases.reserve(d.case_count);
+        for (size_t ci = 0; ci < d.case_count; ci++) {
+            const auto* raw_c = reinterpret_cast<const lattice_union_case_t*>(cases_bytes + ci * c_stride);
+            lattice_union_case_t c;
+            lattice_union_case_init(&c);
+            size_t c_sz = raw_c->struct_size ? raw_c->struct_size : sizeof(c);
+            std::memcpy(&c, raw_c, std::min(c_sz, sizeof(c)));
+            if (!c.case_name) continue;
+
+            lattice::union_case uc;
+            uc.case_name = c.case_name;
+            if (c.values && c.value_count > 0) {
+                size_t v_stride = c.value_stride ? c.value_stride : sizeof(lattice_union_case_value_t);
+                const auto* vals_bytes = reinterpret_cast<const char*>(c.values);
+                uc.values.reserve(c.value_count);
+                for (size_t vi = 0; vi < c.value_count; vi++) {
+                    const auto* raw_v = reinterpret_cast<const lattice_union_case_value_t*>(vals_bytes + vi * v_stride);
+                    lattice_union_case_value_t v;
+                    lattice_union_case_value_init(&v);
+                    size_t v_sz = raw_v->struct_size ? raw_v->struct_size : sizeof(v);
+                    std::memcpy(&v, raw_v, std::min(v_sz, sizeof(v)));
+
+                    lattice::union_case_value ucv;
+                    if (v.param_name) ucv.param_name = v.param_name;
+                    ucv.type = static_cast<lattice::column_type>(v.type);
+                    ucv.is_link = v.is_link;
+                    if (v.is_link && v.link_target) ucv.link_target = v.link_target;
+                    uc.values.push_back(std::move(ucv));
+                }
+            }
+            udesc.cases.push_back(std::move(uc));
+        }
+    }
+    return udesc;
+}
+
+static lattice::property_descriptor convert_property_ext(const lattice_property_ext_t& raw_p) {
+    lattice_property_ext_t p;
+    lattice_property_ext_init(&p);
+    size_t p_sz = raw_p.struct_size ? raw_p.struct_size : sizeof(p);
+    std::memcpy(&p, &raw_p, std::min(p_sz, sizeof(p)));
+
+    lattice::property_descriptor desc = convert_property(p.base);
+    desc.no_history = p.no_history;
+    if (p.base.kind == LATTICE_KIND_UNION) {
+        desc.kind = lattice::property_kind::union_type;
+        desc.type = lattice::column_type::text;
+        desc.nullable = true; // Parent union reference column stores nullable globalId TEXT (matches Swift Model.swift:796)
+        desc.is_union = true;
+        if (p.union_desc) {
+            desc.union_desc = convert_union_descriptor(p.union_desc);
+            if (desc.target_table.empty() && !desc.union_desc.union_table_name.empty()) {
+                desc.target_table = desc.union_desc.union_table_name;
+            }
+        }
+    }
+    return desc;
+}
+
+static lattice::SchemaVector convert_schemas_ext(
+    const lattice_schema_ext_t* schemas,
+    size_t schema_count,
+    size_t schema_stride
+) {
+    lattice::SchemaVector schema_vec;
+    if (!schemas || schema_count == 0) return schema_vec;
+    size_t s_stride = schema_stride ? schema_stride : sizeof(lattice_schema_ext_t);
+    const auto* schemas_bytes = reinterpret_cast<const char*>(schemas);
+
+    schema_vec.reserve(schema_count);
+    for (size_t i = 0; i < schema_count; i++) {
+        const auto* raw_s = reinterpret_cast<const lattice_schema_ext_t*>(schemas_bytes + i * s_stride);
+        lattice_schema_ext_t s;
+        lattice_schema_ext_init(&s);
+        size_t s_sz = raw_s->struct_size ? raw_s->struct_size : sizeof(s);
+        std::memcpy(&s, raw_s, std::min(s_sz, sizeof(s)));
+        if (!s.table_name) continue;
+
+        size_t p_stride = s.property_stride ? s.property_stride : sizeof(lattice_property_ext_t);
+        const auto* props_bytes = reinterpret_cast<const char*>(s.properties);
+
+        // Collect single-column explicit constraints so we don't duplicate them
+        std::set<std::string> explicit_single_uniques;
+        if (s.constraints && s.constraint_count > 0) {
+            for (size_t k = 0; k < s.constraint_count; k++) {
+                const auto& c = s.constraints[k];
+                if (c.property_count == 1 && c.property_names && c.property_names[0]) {
+                    explicit_single_uniques.insert(c.property_names[0]);
+                }
+            }
+        }
+
+        lattice::SwiftSchema props;
+        lattice::ConstraintVector constraints;
+        if (props_bytes && s.property_count > 0) {
+            for (size_t j = 0; j < s.property_count; j++) {
+                const auto* raw_p = reinterpret_cast<const lattice_property_ext_t*>(props_bytes + j * p_stride);
+                if (!raw_p->base.name) continue;
+                auto desc = convert_property_ext(*raw_p);
+                if (desc.is_unique && !explicit_single_uniques.count(desc.name)) {
+                    constraints.push_back(
+                        lattice::swift_constraint({desc.name}, /*upsert=*/false));
+                }
+                props[desc.name] = std::move(desc);
+            }
+        }
+
+        if (s.constraints && s.constraint_count > 0) {
+            for (size_t k = 0; k < s.constraint_count; k++) {
+                const auto& c = s.constraints[k];
+                if (!c.property_names || c.property_count == 0) continue;
+                std::vector<std::string> cols;
+                cols.reserve(c.property_count);
+                for (size_t m = 0; m < c.property_count; m++) {
+                    if (c.property_names[m]) cols.emplace_back(c.property_names[m]);
+                }
+                if (!cols.empty()) {
+                    constraints.push_back(lattice::swift_constraint(cols, c.allows_upsert));
+                }
+            }
+        }
+
+        schema_vec.emplace_back(s.table_name, std::move(props), std::move(constraints));
+    }
+    return schema_vec;
+}
+
+extern "C" lattice_db_t* lattice_db_open_v2(
+    const char* path,
+    const lattice_schema_ext_t* schemas,
+    size_t schema_count,
+    size_t schema_stride,
+    lattice_scheduler_t* scheduler,
+    const char* wss_endpoint,
+    const char* authorization_token,
+    const lattice_sync_options_t* sync_options,
+    const char* const* migration_tables,
+    size_t migration_table_count,
+    void* migration_context,
+    lattice_migration_table_row_fn migration_fn
+) {
+    try {
+        std::string db_path = path ? std::string(path) : ":memory:";
+        auto schema_vec = convert_schemas_ext(schemas, schema_count, schema_stride);
+        std::string ws_url = wss_endpoint ? std::string(wss_endpoint) : "";
+        std::string auth_token = authorization_token ? std::string(authorization_token) : "";
+
+        lattice::swift_configuration config(db_path, ws_url, auth_token);
+
+        if (scheduler) {
+            auto* sched = reinterpret_cast<lattice_scheduler_internal*>(scheduler);
+            config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
+        }
+
+        if (!apply_sync_options_to_config(sync_options, config)) {
+            return nullptr;
+        }
+
+        if (migration_fn && migration_tables && migration_table_count > 0) {
+            std::vector<std::string> tables;
+            tables.reserve(migration_table_count);
+            for (size_t ti = 0; ti < migration_table_count; ti++) {
+                if (!migration_tables[ti]) continue;
+                std::string tname = migration_tables[ti];
+                for (const auto& entry : schema_vec) {
+                    if (entry.table_name != tname) continue;
+                    for (const auto& [prop_name, desc] : entry.properties) {
+                        if (desc.kind == lattice::property_kind::primitive &&
+                            desc.type == lattice::column_type::blob) {
+                            set_error(std::string("lattice_db_open_v2: table '") +
+                                      tname + "' has BLOB column '" + prop_name +
+                                      "' - JSON row migration cannot represent BLOB values.");
+                            return nullptr;
+                        }
+                    }
+                }
+                tables.push_back(std::move(tname));
+            }
+            if (!tables.empty()) {
+                config.migration_block = [migration_context, migration_fn, tables](
+                    lattice::migration_context& ctx) {
+                    for (const auto& table_name : tables) {
+                        ctx.enumerate_objects(table_name, [&](const lattice::migration_row& old_row,
+                                                               lattice::migration_row& new_row) {
+                            nlohmann::json old_json;
+                            for (const auto& [k, v] : old_row) {
+                                if (std::holds_alternative<std::nullptr_t>(v)) {
+                                    old_json[k] = nullptr;
+                                } else if (std::holds_alternative<int64_t>(v)) {
+                                    old_json[k] = std::get<int64_t>(v);
+                                } else if (std::holds_alternative<double>(v)) {
+                                    old_json[k] = std::get<double>(v);
+                                } else if (std::holds_alternative<std::string>(v)) {
+                                    old_json[k] = std::get<std::string>(v);
+                                } else if (std::holds_alternative<std::vector<uint8_t>>(v)) {
+                                    throw std::runtime_error(
+                                        "lattice_db_open_v2: row in table '" +
+                                        table_name + "' carries BLOB column '" + k + "'");
+                                }
+                            }
+                            char* new_json_str = nullptr;
+                            migration_fn(migration_context, table_name.c_str(),
+                                         old_json.dump().c_str(), &new_json_str);
+                            if (new_json_str) {
+                                try {
+                                    auto new_json = nlohmann::json::parse(new_json_str);
+                                    for (auto& [key, val] : new_json.items()) {
+                                        if (val.is_null()) {
+                                            new_row[key] = nullptr;
+                                        } else if (val.is_number_integer()) {
+                                            new_row[key] = val.get<int64_t>();
+                                        } else if (val.is_number_float()) {
+                                            new_row[key] = val.get<double>();
+                                        } else if (val.is_string()) {
+                                            new_row[key] = val.get<std::string>();
+                                        }
+                                    }
+                                } catch (...) {}
+                                free(new_json_str);
+                            }
+                        });
+                    }
+                };
+            }
+        }
+
+        auto* ref = adopt_capi_ref(lattice::swift_lattice_ref::create(config, schema_vec));
+        return reinterpret_cast<lattice_db_t*>(ref);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" lattice_object_t* lattice_object_create_with_schema_v2(
+    const char* table_name,
+    const lattice_property_ext_t* properties,
+    size_t property_count,
+    size_t property_stride
+) {
+    if (!table_name) {
+        set_error("table_name is null");
+        return nullptr;
+    }
+    try {
+        std::string table_str(table_name);
+        std::unordered_map<std::string, lattice::property_descriptor> props;
+        if (properties && property_count > 0) {
+            size_t p_stride = property_stride ? property_stride : sizeof(lattice_property_ext_t);
+            const auto* props_bytes = reinterpret_cast<const char*>(properties);
+            for (size_t i = 0; i < property_count; i++) {
+                const auto* raw_p = reinterpret_cast<const lattice_property_ext_t*>(props_bytes + i * p_stride);
+                if (!raw_p->base.name) continue;
+                props[raw_p->base.name] = convert_property_ext(*raw_p);
+            }
+        }
+        lattice::swift_dynamic_object swift_obj(table_str, props);
+        auto dyn_obj = std::make_shared<lattice::dynamic_object>(swift_obj);
+        auto* ref = adopt_capi_ref(lattice::dynamic_object_ref::wrap(dyn_obj));
+        return reinterpret_cast<lattice_object_t*>(ref);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" lattice_union_value_t* lattice_union_value_create(const char* case_name) {
+    if (!case_name) {
+        set_error("case_name is null");
+        return nullptr;
+    }
+    try {
+        auto* uv = new lattice_union_value();
+        uv->val.case_name = case_name;
+        return uv;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" void lattice_union_value_release(lattice_union_value_t* uv) {
+    delete uv;
+}
+
+extern "C" const char* lattice_union_value_get_case(const lattice_union_value_t* uv) {
+    if (!uv || uv->val.case_name.empty()) return nullptr;
+    return uv->val.case_name.c_str();
+}
+
+extern "C" bool lattice_union_value_has_field(const lattice_union_value_t* uv, const char* key) {
+    if (!uv || !key) return false;
+    return uv->val.has_field(key) || uv->val.has_link_ref(key);
+}
+
+extern "C" int64_t lattice_union_value_get_int(const lattice_union_value_t* uv, const char* key) {
+    if (!uv || !key) return 0;
+    return uv->val.get_int(key);
+}
+
+extern "C" double lattice_union_value_get_double(const lattice_union_value_t* uv, const char* key) {
+    if (!uv || !key) return 0.0;
+    return uv->val.get_double(key);
+}
+
+extern "C" const char* lattice_union_value_get_string(const lattice_union_value_t* uv, const char* key) {
+    if (!uv || !key || !uv->val.has_string(key)) return nullptr;
+    g_returned_string = uv->val.get_string(key);
+    return g_returned_string.c_str();
+}
+
+extern "C" size_t lattice_union_value_get_blob(const lattice_union_value_t* uv, const char* key,
+                                               uint8_t* buffer, size_t buffer_size) {
+    if (!uv || !key || !uv->val.has_blob(key)) return 0;
+    auto data = uv->val.get_blob(key);
+    if (buffer && buffer_size > 0) {
+        size_t copy_len = std::min(data.size(), buffer_size);
+        std::memcpy(buffer, data.data(), copy_len);
+    }
+    return data.size();
+}
+
+extern "C" lattice_object_t* lattice_union_value_get_link(const lattice_union_value_t* uv, const char* key) {
+    if (!uv || !key || !uv->val.has_link_ref(key)) return nullptr;
+    try {
+        auto* ref = adopt_capi_ref(uv->val.get_link_ref(key));
+        return reinterpret_cast<lattice_object_t*>(ref);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" void lattice_union_value_set_int(lattice_union_value_t* uv, const char* key, int64_t value) {
+    if (!uv || !key) return;
+    uv->val.set_int(key, value);
+}
+
+extern "C" void lattice_union_value_set_double(lattice_union_value_t* uv, const char* key, double value) {
+    if (!uv || !key) return;
+    uv->val.set_double(key, value);
+}
+
+extern "C" void lattice_union_value_set_string(lattice_union_value_t* uv, const char* key, const char* value) {
+    if (!uv || !key || !value) return;
+    uv->val.set_string(key, value);
+}
+
+extern "C" void lattice_union_value_set_blob(lattice_union_value_t* uv, const char* key,
+                                             const uint8_t* data, size_t size) {
+    if (!uv || !key) return;
+    std::vector<uint8_t> vec;
+    if (data && size > 0) vec.assign(data, data + size);
+    uv->val.set_blob(key, vec);
+}
+
+extern "C" void lattice_union_value_set_link(lattice_union_value_t* uv, const char* key, lattice_object_t* obj) {
+    if (!uv || !key || !obj) return;
+    auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
+    uv->val.set_link_ref(key, bridge_ref(obj_ref));
+}
+
+extern "C" lattice_union_value_t* lattice_object_get_union(lattice_object_t* obj, const char* field) {
+    if (!obj || !field) return nullptr;
+    auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
+    try {
+        auto uval = bridge_ref(ref).get_union(field);
+        if (uval.case_name.empty()) return nullptr;
+        auto* out = new lattice_union_value();
+        out->val = std::move(uval);
+        return out;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" lattice_status_t lattice_object_set_union(lattice_object_t* obj, const char* field,
+                                                     const lattice_union_value_t* uv) {
+    if (!obj || !field) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
+    try {
+        if (!uv) {
+            bridge_ref(ref).set_union(field, lattice::union_value{});
+        } else {
+            bridge_ref(ref).set_union(field, uv->val);
+        }
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" lattice_status_t lattice_object_clear_union(lattice_object_t* obj, const char* field) {
+    if (!obj || !field) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
+    try {
+        bridge_ref(ref).set_union(field, lattice::union_value{});
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
     }
 }

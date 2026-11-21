@@ -1622,3 +1622,222 @@ TEST(CAPIGeoBounds, DynamicAddExpandsGeoBoundsColumns) {
     lattice_db_close(db);
     lattice_db_release(db);
 }
+
+// ============================================================================
+// CAPI 1.1.0: Schema v2 (@Union, @NoHistory, Compound @Unique) & Sync Options
+// ============================================================================
+
+TEST(CAPIFeatures, V110FeatureStringsAreTrue) {
+    for (const char* f : {"certificate_pin", "no_history", "schema_v2", "union"}) {
+        EXPECT_TRUE(lattice_capi_has_feature(f)) << f;
+    }
+    EXPECT_GE(lattice_capi_version(), 1001000u);
+    EXPECT_FALSE(lattice_capi_has_feature("unified_open"));
+}
+
+TEST(CAPISchemaV2, UnionRoundTripAndSyncReceive) {
+    TempPath writer_path("capi_union_writer");
+    TempPath reader_path("capi_union_reader");
+
+    // 7-case RoutingSignal union matching OrbitalStore v31 (including unlabeled single-value verdict)
+    lattice_union_case_value_t handoff_vals[2];
+    lattice_union_case_value_init(&handoff_vals[0]);
+    handoff_vals[0].param_name = "target";
+    handoff_vals[0].type = LATTICE_TYPE_TEXT;
+    lattice_union_case_value_init(&handoff_vals[1]);
+    handoff_vals[1].param_name = "note";
+    handoff_vals[1].type = LATTICE_TYPE_TEXT;
+
+    lattice_union_case_value_t verdict_val;
+    lattice_union_case_value_init(&verdict_val);
+    verdict_val.param_name = ""; // unlabeled single value -> column "verdict", key "_0"
+    verdict_val.type = LATTICE_TYPE_TEXT;
+
+    lattice_union_case_t cases[3];
+    lattice_union_case_init(&cases[0]);
+    cases[0].case_name = "none";
+    lattice_union_case_init(&cases[1]);
+    cases[1].case_name = "handoff";
+    cases[1].values = handoff_vals;
+    cases[1].value_count = 2;
+    lattice_union_case_init(&cases[2]);
+    cases[2].case_name = "verdict";
+    cases[2].values = &verdict_val;
+    cases[2].value_count = 1;
+
+    lattice_union_descriptor_t routing_desc;
+    lattice_union_descriptor_init(&routing_desc);
+    routing_desc.union_table_name = "_RoutingSignal";
+    routing_desc.cases = cases;
+    routing_desc.case_count = 3;
+
+    lattice_property_ext_t action_props[2];
+    lattice_property_ext_init(&action_props[0]);
+    action_props[0].base.name = "tool";
+    action_props[0].base.type = LATTICE_TYPE_TEXT;
+    action_props[0].base.kind = LATTICE_KIND_PRIMITIVE;
+    lattice_property_ext_init(&action_props[1]);
+    action_props[1].base.name = "signal";
+    action_props[1].base.type = LATTICE_TYPE_TEXT;
+    action_props[1].base.kind = LATTICE_KIND_UNION;
+    action_props[1].base.target_table = "_RoutingSignal";
+    action_props[1].union_desc = &routing_desc;
+
+    lattice_schema_ext_t action_schema;
+    lattice_schema_ext_init(&action_schema);
+    action_schema.table_name = "AgentAction";
+    action_schema.properties = action_props;
+    action_schema.property_count = 2;
+
+    lattice_sync_options_t opts;
+    lattice_sync_options_init(&opts);
+    opts.target_schema_version = 31;
+    opts.busy_timeout_ms = 5000;
+
+    lattice_db_t* writer = lattice_db_open_v2(
+        writer_path.str().c_str(), &action_schema, 1, sizeof(action_schema),
+        nullptr, nullptr, nullptr, &opts, nullptr, 0, nullptr, nullptr);
+    ASSERT_NE(writer, nullptr) << lattice_last_error();
+
+    // Verify unlabeled single-value column is named "verdict" (not "verdict___0")
+    EXPECT_EQ(lattice_db_count(writer, "pragma_table_info('_RoutingSignal')", "name = 'verdict'"), 1u);
+    EXPECT_EQ(lattice_db_count(writer, "pragma_table_info('_RoutingSignal')", "name = 'handoff__target'"), 1u);
+
+    // Create unmanaged AgentAction with v2 schema, set union value, add to writer
+    lattice_object_t* obj = lattice_object_create_with_schema_v2(
+        "AgentAction", action_props, 2, sizeof(lattice_property_ext_t));
+    ASSERT_NE(obj, nullptr) << lattice_last_error();
+    lattice_object_set_string(obj, "tool", "route");
+
+    lattice_union_value_t* uv = lattice_union_value_create("verdict");
+    ASSERT_NE(uv, nullptr);
+    lattice_union_value_set_string(uv, "_0", "{\"pass\":true,\"notes\":\"ok\"}");
+    ASSERT_EQ(lattice_object_set_union(obj, "signal", uv), LATTICE_OK);
+    lattice_union_value_release(uv);
+
+    lattice_object_t* managed = lattice_db_add(writer, obj);
+    ASSERT_NE(managed, nullptr) << lattice_last_error();
+    lattice_object_release(managed);
+    lattice_object_release(obj);
+
+    // Export writer audit events as sync message and apply into reader_db (must NOT fail on _RoutingSignal!)
+    char* events = lattice_db_events_after(writer, nullptr);
+    ASSERT_NE(events, nullptr);
+    char* sync_msg = lattice_create_sync_message(events);
+    ASSERT_NE(sync_msg, nullptr);
+
+    opts.uploads_enabled = 0; // download-only replica
+    lattice_db_t* reader = lattice_db_open_v2(
+        reader_path.str().c_str(), &action_schema, 1, sizeof(action_schema),
+        nullptr, nullptr, nullptr, &opts, nullptr, 0, nullptr, nullptr);
+    ASSERT_NE(reader, nullptr) << lattice_last_error();
+
+    char* applied = lattice_db_receive_sync_data(
+        reader, reinterpret_cast<const uint8_t*>(sync_msg), std::strlen(sync_msg));
+    ASSERT_NE(applied, nullptr) << "union sync receive failed: " << lattice_last_error();
+    lattice_string_free(applied);
+    lattice_string_free(sync_msg);
+    lattice_string_free(events);
+
+    lattice_results_t* res = lattice_db_query(reader, "AgentAction", nullptr, nullptr, 0, 0);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(lattice_results_count(res), 1u);
+    lattice_object_t* row = lattice_results_get(res, 0);
+    lattice_union_value_t* r_uv = lattice_object_get_union(row, "signal");
+    ASSERT_NE(r_uv, nullptr);
+    EXPECT_STREQ(lattice_union_value_get_case(r_uv), "verdict");
+    EXPECT_STREQ(lattice_union_value_get_string(r_uv, "_0"), "{\"pass\":true,\"notes\":\"ok\"}");
+    lattice_union_value_release(r_uv);
+
+    // Mutate to bare case "none" and clear
+    lattice_union_value_t* none_uv = lattice_union_value_create("none");
+    ASSERT_EQ(lattice_object_set_union(row, "signal", none_uv), LATTICE_OK);
+    lattice_union_value_release(none_uv);
+    r_uv = lattice_object_get_union(row, "signal");
+    ASSERT_NE(r_uv, nullptr);
+    EXPECT_STREQ(lattice_union_value_get_case(r_uv), "none");
+    lattice_union_value_release(r_uv);
+
+    ASSERT_EQ(lattice_object_clear_union(row, "signal"), LATTICE_OK);
+    EXPECT_EQ(lattice_object_get_union(row, "signal"), nullptr);
+
+    lattice_object_release(row);
+    lattice_results_free(res);
+    lattice_db_close(reader);
+    lattice_db_release(reader);
+    lattice_db_close(writer);
+    lattice_db_release(writer);
+}
+
+TEST(CAPISchemaV2, NoHistoryStreamingAndSyncNullGuard) {
+    TempPath writer_path("capi_nohist_writer");
+    TempPath reader_path("capi_nohist_reader");
+
+    lattice_property_ext_t msg_props[2];
+    lattice_property_ext_init(&msg_props[0]);
+    msg_props[0].base.name = "status";
+    msg_props[0].base.type = LATTICE_TYPE_TEXT;
+    msg_props[0].base.kind = LATTICE_KIND_PRIMITIVE;
+    lattice_property_ext_init(&msg_props[1]);
+    msg_props[1].base.name = "text";
+    msg_props[1].base.type = LATTICE_TYPE_TEXT;
+    msg_props[1].base.kind = LATTICE_KIND_PRIMITIVE;
+    msg_props[1].base.nullable = false;
+    msg_props[1].no_history = true;
+
+    lattice_schema_ext_t msg_schema;
+    lattice_schema_ext_init(&msg_schema);
+    msg_schema.table_name = "ChatMessage";
+    msg_schema.properties = msg_props;
+    msg_schema.property_count = 2;
+
+    lattice_db_t* writer = lattice_db_open_v2(
+        writer_path.str().c_str(), &msg_schema, 1, sizeof(msg_schema),
+        nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr);
+    ASSERT_NE(writer, nullptr) << lattice_last_error();
+
+    // Verify _lattice_meta records trigger_flags:ChatMessage = 'text'
+    EXPECT_EQ(lattice_db_count(
+        writer, "_lattice_meta",
+        "key = 'trigger_flags:ChatMessage' AND value = 'text'"), 1u);
+
+    lattice_object_t* msg = lattice_object_create_with_schema_v2(
+        "ChatMessage", msg_props, 2, sizeof(lattice_property_ext_t));
+    lattice_object_set_string(msg, "status", "streaming");
+    lattice_object_set_string(msg, "text", "tok1");
+    lattice_object_t* managed = lattice_db_add(writer, msg);
+    ASSERT_NE(managed, nullptr);
+    lattice_object_set_string(managed, "text", "tok1 tok2 tok3");
+    lattice_object_release(managed);
+    lattice_object_release(msg);
+
+    // Late-bound events_after must carry the final streamed text to reader cleanly
+    char* events = lattice_db_events_after(writer, nullptr);
+    ASSERT_NE(events, nullptr);
+    char* sync_msg = lattice_create_sync_message(events);
+    ASSERT_NE(sync_msg, nullptr);
+
+    lattice_db_t* reader = lattice_db_open_v2(
+        reader_path.str().c_str(), &msg_schema, 1, sizeof(msg_schema),
+        nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr);
+    ASSERT_NE(reader, nullptr);
+
+    char* applied = lattice_db_receive_sync_data(
+        reader, reinterpret_cast<const uint8_t*>(sync_msg), std::strlen(sync_msg));
+    ASSERT_NE(applied, nullptr) << lattice_last_error();
+    lattice_string_free(applied);
+    lattice_string_free(sync_msg);
+    lattice_string_free(events);
+
+    lattice_results_t* res = lattice_db_query(reader, "ChatMessage", nullptr, nullptr, 0, 0);
+    ASSERT_EQ(lattice_results_count(res), 1u);
+    lattice_object_t* r_msg = lattice_results_get(res, 0);
+    EXPECT_STREQ(lattice_object_get_string(r_msg, "text"), "tok1 tok2 tok3");
+    lattice_object_release(r_msg);
+    lattice_results_free(res);
+
+    lattice_db_close(reader);
+    lattice_db_release(reader);
+    lattice_db_close(writer);
+    lattice_db_release(writer);
+}

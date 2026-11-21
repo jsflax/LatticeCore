@@ -32,7 +32,6 @@
 #include <vector>
 
 #include "capi_header_check.h"  // LatticeCAPIHeaderCheck (the C11 pin target)
-#include "lattice.h"
 
 namespace {
 
@@ -178,21 +177,10 @@ std::set<std::string> difference(const std::set<std::string>& a, const std::set<
 }  // namespace
 
 TEST(CAPISurfaceTests, HeaderCompilesAndLinksAsC11) {
-    // The real assertion is that capi_header_compiles.c BUILT (as pure C11).
+    // The real assertion is that capi_header_compiles.c BUILT (as pure C11,
+    // including _Static_assert pins on frozen v1 struct sizes).
     // Calling its probe proves the TU is still part of the test target.
     EXPECT_EQ(lattice_capi_header_compiles_as_c11(), 1);
-}
-
-TEST(CAPISurfaceTests, FrozenV1StructLayoutsAreImmutable) {
-    // docs/CAPI-STABILITY.md rule 3: pre-policy structs without struct_size
-    // are indexed as contiguous C arrays and must never change sizeof.
-    static_assert(sizeof(void*) == 4 || sizeof(void*) == 8, "unexpected pointer size");
-    if constexpr (sizeof(void*) == 8) {
-        EXPECT_EQ(sizeof(lattice_property_t), 48u);
-        EXPECT_EQ(sizeof(lattice_unique_constraint_t), 32u);
-        EXPECT_EQ(sizeof(lattice_schema_t), 24u);
-        EXPECT_EQ(sizeof(lattice_knn_result_t), 16u);
-    }
 }
 
 TEST(CAPISurfaceTests, EveryDeclaredFunctionIsImplemented) {

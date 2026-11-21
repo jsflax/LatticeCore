@@ -22,6 +22,13 @@
 #error "lattice.h must compile under C11 (or newer)"
 #endif
 
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+_Static_assert(sizeof(lattice_property_t) == 48, "Frozen v1 lattice_property_t size changed");
+_Static_assert(sizeof(lattice_unique_constraint_t) == 32, "Frozen v1 lattice_unique_constraint_t size changed");
+_Static_assert(sizeof(lattice_schema_t) == 24, "Frozen v1 lattice_schema_t size changed");
+_Static_assert(sizeof(lattice_knn_result_t) == 16, "Frozen v1 lattice_knn_result_t size changed");
+#endif
+
 int lattice_capi_header_compiles_as_c11(void) {
     // Touch representative public surface so the compiler fully type-checks
     // it. No lattice_* function is CALLED — this target does not link

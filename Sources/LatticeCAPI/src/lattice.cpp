@@ -6,7 +6,13 @@
 #include <lattice/network.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <map>
 #include <memory>
@@ -116,6 +122,7 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
     // lattice.h and docs/CAPI-STABILITY.md.
     static const char* const kFeatures[] = {
         "attach",
+        "background_sync",
         "certificate_pin",
         "checkpoint",
         "cross_process_observation",
@@ -2330,6 +2337,9 @@ extern "C" void lattice_sync_options_init(lattice_sync_options_t* options) {
     options->pinned_server_certificate_sha256 = nullptr;
     options->create_if_missing = -1;
     options->read_only = -1;
+    // 3.1.3 / CAPI 1.2.0 tail fields — sentinels keep library defaults.
+    options->background_sync_managed = -1;
+    options->sync_autostart = -1;
 }
 
 static bool apply_sync_options_to_config(
@@ -2398,6 +2408,12 @@ static bool apply_sync_options_to_config(
     }
     if (opts.read_only >= 0) {
         config.read_only = opts.read_only != 0;
+    }
+    if (opts.background_sync_managed >= 0) {
+        config.background_sync_managed = opts.background_sync_managed != 0;
+    }
+    if (opts.sync_autostart >= 0) {
+        config.sync_autostart = opts.sync_autostart != 0;
     }
     if (opts.sync_filter_json) {
         config.sync_filter = parse_sync_filter_json(opts.sync_filter_json);
@@ -3430,5 +3446,369 @@ extern "C" lattice_status_t lattice_object_clear_union(lattice_object_t* obj, co
     } catch (const std::exception& e) {
         set_error(e.what());
         return LATTICE_ERROR_DATABASE;
+    }
+}
+
+// =============================================================================
+// Managed Background Sync Lifecycle & Finite Sync (3.1.3 / CAPI 1.2.0)
+// =============================================================================
+
+namespace {
+
+struct capi_sync_cancellation_state {
+    std::mutex mutex;
+    std::atomic<bool> cancelled{false};
+    std::function<void()> on_cancel;
+};
+
+struct capi_poll_wake_state {
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    void notify() {
+        std::lock_guard<std::mutex> lock(mutex);
+        cv.notify_all();
+    }
+
+    template <typename Pred>
+    void wait_for(std::chrono::steady_clock::duration slice, Pred&& pred) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait_for(lock, slice, std::forward<Pred>(pred));
+    }
+};
+
+struct capi_sync_once_watchdog {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stopped = false;
+    std::thread worker;
+
+    capi_sync_once_watchdog(std::chrono::steady_clock::time_point deadline,
+                            std::function<void()> on_expire)
+        : worker([this, deadline, on_expire = std::move(on_expire)]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!cv.wait_until(lock, deadline, [this] { return stopped; })) {
+                lock.unlock();
+                on_expire();
+            }
+        }) {}
+
+    ~capi_sync_once_watchdog() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopped = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+};
+
+}  // namespace
+
+struct lattice_sync_cancellation {
+    std::shared_ptr<capi_sync_cancellation_state> state =
+        std::make_shared<capi_sync_cancellation_state>();
+};
+
+extern "C" lattice_sync_cancellation_t* lattice_sync_cancellation_create(void) {
+    try {
+        return new lattice_sync_cancellation();
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" void lattice_sync_cancellation_cancel(lattice_sync_cancellation_t* token) {
+    if (!token || !token->state) return;
+    std::function<void()> callback;
+    {
+        std::lock_guard<std::mutex> lock(token->state->mutex);
+        const bool first = !token->state->cancelled.exchange(true, std::memory_order_acq_rel);
+        if (first) callback = token->state->on_cancel;
+    }
+    if (callback) callback();
+}
+
+extern "C" bool lattice_sync_cancellation_is_cancelled(const lattice_sync_cancellation_t* token) {
+    if (!token || !token->state) return false;
+    return token->state->cancelled.load(std::memory_order_acquire);
+}
+
+extern "C" void lattice_sync_cancellation_release(lattice_sync_cancellation_t* token) {
+    delete token;
+}
+
+extern "C" bool lattice_db_is_background_sync_managed(lattice_db_t* db) {
+    if (!db) return false;
+    try {
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
+        return impl->config().background_sync_managed;
+    } catch (...) {
+        return false;
+    }
+}
+
+extern "C" uint64_t lattice_db_current_background_sync_generation(lattice_db_t* db) {
+    if (!db) return 0;
+    try {
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
+        return impl->current_background_sync_generation();
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" lattice_status_t lattice_db_sync_once(
+    lattice_db_t* db,
+    double maximum_duration_seconds,
+    lattice_sync_cancellation_t* cancellation,
+    lattice_sync_once_result_t* out_result
+) {
+    if (!db || !out_result) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    *out_result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+    if (!(std::isfinite(maximum_duration_seconds) && maximum_duration_seconds > 0.0)) {
+        set_error("maximum_duration_seconds must be finite and greater than zero");
+        return LATTICE_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
+        std::shared_ptr<capi_sync_cancellation_state> ext_cancel =
+            cancellation ? cancellation->state : nullptr;
+        if (ext_cancel && ext_cancel->cancelled.load(std::memory_order_acquire)) {
+            *out_result = LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED;
+            return LATTICE_OK;
+        }
+
+        auto wake_state = std::make_shared<capi_poll_wake_state>();
+        auto attempt_token = std::make_shared<std::atomic<bool>>(false);
+        std::atomic<bool> budget_expired{false};
+
+        const double clamped_secs = std::min(maximum_duration_seconds, 86400.0 * 365.0);
+        const auto budget_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(clamped_secs));
+        const auto deadline = std::chrono::steady_clock::now() + budget_ns;
+
+        if (ext_cancel) {
+            std::lock_guard<std::mutex> lock(ext_cancel->mutex);
+            if (ext_cancel->cancelled.load(std::memory_order_acquire)) {
+                *out_result = LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED;
+                return LATTICE_OK;
+            }
+            ext_cancel->on_cancel = [attempt_token, wake_state, impl]() {
+                attempt_token->store(true, std::memory_order_release);
+                const uint64_t g = impl->current_background_sync_generation();
+                if (g != 0) (void)impl->cancel_background_sync(g);
+                wake_state->notify();
+            };
+        }
+        struct cancel_listener_guard {
+            std::shared_ptr<capi_sync_cancellation_state> state;
+            ~cancel_listener_guard() {
+                if (!state) return;
+                std::function<void()> retired;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    retired = std::move(state->on_cancel);
+                }
+            }
+        } listener_guard{ext_cancel};
+
+        capi_sync_once_watchdog watchdog(deadline, [&budget_expired, attempt_token, wake_state, impl]() {
+            budget_expired.store(true, std::memory_order_release);
+            attempt_token->store(true, std::memory_order_release);
+            const uint64_t g = impl->current_background_sync_generation();
+            if (g != 0) (void)impl->cancel_background_sync(g);
+            wake_state->notify();
+        });
+
+        const auto start = impl->resume_background_sync(attempt_token, /*finite_cycle=*/true);
+        switch (start.admission) {
+            case lattice::lattice_db::background_sync_admission::started:
+                break;
+            case lattice::lattice_db::background_sync_admission::already_running:
+                *out_result = LATTICE_SYNC_ONCE_ALREADY_RUNNING;
+                return LATTICE_OK;
+            case lattice::lattice_db::background_sync_admission::cancelled:
+                *out_result = LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED;
+                return LATTICE_OK;
+            case lattice::lattice_db::background_sync_admission::not_owner:
+            case lattice::lattice_db::background_sync_admission::closed:
+                *out_result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+                return LATTICE_OK;
+            case lattice::lattice_db::background_sync_admission::unsupported:
+                set_error("Finite background sync requires a writable file store, a WSS endpoint and authorization credentials, and no unmanaged IPC targets.");
+                *out_result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+                return LATTICE_ERROR_INVALID_ARGUMENT;
+        }
+
+        bool needs_settlement = true;
+        struct settlement_guard {
+            lattice::swift_lattice* impl;
+            uint64_t generation;
+            bool& active;
+            ~settlement_guard() {
+                if (active && generation != 0) {
+                    try { (void)impl->suspend_background_sync(generation); } catch (...) {}
+                }
+            }
+        } settle_guard{impl, start.generation, needs_settlement};
+
+        lattice_sync_once_result_t outcome = LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED;
+        bool cycle_failed = false;
+        while (true) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                budget_expired.store(true, std::memory_order_release);
+                attempt_token->store(true, std::memory_order_release);
+            }
+            if (attempt_token->load(std::memory_order_acquire)) {
+                (void)impl->cancel_background_sync(start.generation);
+                break;
+            }
+            const auto status = impl->get_background_sync_status(start.generation);
+            switch (status.phase) {
+                case lattice::synchronizer_base::finite_cycle_phase::running: {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) continue;
+                    const auto slice = std::min(
+                        deadline - now,
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::milliseconds(15)));
+                    wake_state->wait_for(slice, [&] {
+                        return attempt_token->load(std::memory_order_acquire);
+                    });
+                    continue;
+                }
+                case lattice::synchronizer_base::finite_cycle_phase::work_complete:
+                    outcome = LATTICE_SYNC_ONCE_COMPLETED;
+                    break;
+                case lattice::synchronizer_base::finite_cycle_phase::cancelled:
+                    outcome = LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED;
+                    break;
+                case lattice::synchronizer_base::finite_cycle_phase::inactive:
+                    outcome = LATTICE_SYNC_ONCE_UNAVAILABLE;
+                    break;
+                case lattice::synchronizer_base::finite_cycle_phase::failed:
+                    cycle_failed = true;
+                    break;
+            }
+            break;
+        }
+
+        const bool settled = impl->suspend_background_sync(start.generation);
+        needs_settlement = false;
+        if (cycle_failed) {
+            *out_result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+            set_error("The finite sync attempt failed before confirming its upload and replay work.");
+            return LATTICE_ERROR_DATABASE;
+        }
+        if (!settled) {
+            *out_result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+            return LATTICE_OK;
+        }
+        if (budget_expired.load(std::memory_order_acquire) ||
+            (ext_cancel && ext_cancel->cancelled.load(std::memory_order_acquire)) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            *out_result = LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED;
+            return LATTICE_OK;
+        }
+        *out_result = outcome;
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" lattice_status_t lattice_sync_once(
+    lattice_db_t* db,
+    double maximum_duration_seconds,
+    lattice_sync_once_result_t* out_result
+) {
+    return lattice_db_sync_once(db, maximum_duration_seconds, nullptr, out_result);
+}
+
+extern "C" lattice_status_t lattice_db_suspend_background_sync(lattice_db_t* db) {
+    if (!db) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
+        const uint64_t generation = impl->current_background_sync_generation();
+        if (generation != 0) {
+            if (!impl->suspend_background_sync(generation)) {
+                set_error("Background sync suspension did not confirm settlement of its generation.");
+                return LATTICE_ERROR_DATABASE;
+            }
+            return LATTICE_OK;
+        }
+        if (!impl->is_closed() && !impl->config().background_sync_managed) {
+            impl->disconnect_sync();
+        }
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" lattice_status_t lattice_db_resume_background_sync(lattice_db_t* db) {
+    if (!db) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
+        if (impl->is_closed()) {
+            set_error("Database is closed");
+            return LATTICE_ERROR_DATABASE;
+        }
+        const uint64_t generation = impl->current_background_sync_generation();
+        if (generation != 0 &&
+            impl->get_background_sync_status(generation).phase !=
+                lattice::synchronizer_base::finite_cycle_phase::inactive) {
+            if (!impl->suspend_background_sync(generation)) {
+                set_error("Active finite background sync cycle could not settle before resume.");
+                return LATTICE_ERROR_DATABASE;
+            }
+        }
+        if (impl->config().background_sync_managed) {
+            const auto started = impl->resume_background_sync({}, /*finite_cycle=*/false);
+            switch (started.admission) {
+                case lattice::lattice_db::background_sync_admission::started:
+                case lattice::lattice_db::background_sync_admission::already_running:
+                case lattice::lattice_db::background_sync_admission::not_owner:
+                    return LATTICE_OK;
+                case lattice::lattice_db::background_sync_admission::closed:
+                    set_error("Database is closed");
+                    return LATTICE_ERROR_DATABASE;
+                case lattice::lattice_db::background_sync_admission::cancelled:
+                    set_error("Background sync resume was cancelled");
+                    return LATTICE_ERROR_DATABASE;
+                case lattice::lattice_db::background_sync_admission::unsupported:
+                    set_error("Managed background sync is unsupported for this configuration");
+                    return LATTICE_ERROR_INVALID_ARGUMENT;
+            }
+        }
+        impl->connect_sync();
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" bool lattice_db_cancel_background_sync(lattice_db_t* db) {
+    if (!db) return false;
+    try {
+        auto* impl = bridge_ref(reinterpret_cast<lattice_db_internal*>(db)).get();
+        const uint64_t generation = impl->current_background_sync_generation();
+        return generation != 0 && impl->cancel_background_sync(generation);
+    } catch (...) {
+        return false;
     }
 }

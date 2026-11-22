@@ -33,6 +33,7 @@ typedef struct lattice_object lattice_object_t;
 typedef struct lattice_results lattice_results_t;
 typedef struct lattice_link_list lattice_link_list_t;
 typedef struct lattice_union_value lattice_union_value_t;
+typedef struct lattice_sync_cancellation lattice_sync_cancellation_t;
 
 // =============================================================================
 // Versioning & Introspection
@@ -41,7 +42,7 @@ typedef struct lattice_union_value lattice_union_value_t;
 // The C ABI compatibility version is independent of the LatticeCore package version.
 // The surface becomes additive-only at 1.0 (see docs/CAPI-STABILITY.md).
 #define LATTICE_CAPI_VERSION_MAJOR 1
-#define LATTICE_CAPI_VERSION_MINOR 1
+#define LATTICE_CAPI_VERSION_MINOR 2
 #define LATTICE_CAPI_VERSION_PATCH 0
 
 // Single-integer encoding: MAJOR*1000000 + MINOR*1000 + PATCH (sqlite-style).
@@ -50,7 +51,7 @@ typedef struct lattice_union_value lattice_union_value_t;
      LATTICE_CAPI_VERSION_MINOR * 1000 + \
      LATTICE_CAPI_VERSION_PATCH)
 
-#define LATTICE_CAPI_VERSION_STRING "1.1.0"
+#define LATTICE_CAPI_VERSION_STRING "1.2.0"
 
 // Runtime version of the linked library (compare against LATTICE_CAPI_VERSION
 // to detect header/library skew).
@@ -884,6 +885,11 @@ typedef struct {
     const char* pinned_server_certificate_sha256; // lowercase 64-hex SHA-256 of leaf DER, NULL = none
     int32_t create_if_missing;                   // tri-state: 1 = true, 0 = false, -1 = keep default (1)
     int32_t read_only;                           // tri-state: 1 = read-only, 0 = writable, -1 = keep default (0)
+
+    // --- appended in 3.1.3 / CAPI 1.2.0 (older callers' struct_size stops before here) ---
+
+    int32_t background_sync_managed;             // tri-state: 1 = managed (starts suspended), 0 = unmanaged, -1 = keep default (0)
+    int32_t sync_autostart;                      // tri-state: 1 = autostart WSS on open, 0 = deferred until resume/connect, -1 = keep default (1)
 } lattice_sync_options_t;
 
 // Fill defaults: struct_size = sizeof(lattice_sync_options_t), every knob at
@@ -1197,6 +1203,60 @@ LATTICE_EXPORT lattice_union_value_t* lattice_object_get_union(lattice_object_t*
 LATTICE_EXPORT lattice_status_t lattice_object_set_union(lattice_object_t* obj, const char* field,
                                                          const lattice_union_value_t* uv);
 LATTICE_EXPORT lattice_status_t lattice_object_clear_union(lattice_object_t* obj, const char* field);
+
+// =============================================================================
+// Managed Background Sync Lifecycle & Finite Sync (3.1.3 / CAPI 1.2.0)
+// =============================================================================
+
+// Outcome of one bounded finite sync attempt (`lattice_db_sync_once`).
+typedef enum {
+    LATTICE_SYNC_ONCE_COMPLETED = 0,         // Upload prefix + initial server catch-up replay confirmed
+    LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED = 1,  // Deadline expired or cancelled before confirmation (partial work may commit)
+    LATTICE_SYNC_ONCE_ALREADY_RUNNING = 2,   // An active continuous or finite sync session already owns sync
+    LATTICE_SYNC_ONCE_UNAVAILABLE = 3,       // Store closed or sync ownership currently held elsewhere
+} lattice_sync_once_result_t;
+
+// Create/cancel/release a thread-safe cancellation token for `lattice_db_sync_once`.
+// Cancelling a token interrupts setup or an in-flight finite cycle immediately and
+// still waits for native transport/SQLite settlement before `lattice_db_sync_once` returns.
+LATTICE_EXPORT lattice_sync_cancellation_t* lattice_sync_cancellation_create(void);
+LATTICE_EXPORT void lattice_sync_cancellation_cancel(lattice_sync_cancellation_t* token);
+LATTICE_EXPORT bool lattice_sync_cancellation_is_cancelled(const lattice_sync_cancellation_t* token);
+LATTICE_EXPORT void lattice_sync_cancellation_release(lattice_sync_cancellation_t* token);
+
+// Returns true when `db` was opened with `background_sync_managed = 1`.
+LATTICE_EXPORT bool lattice_db_is_background_sync_managed(lattice_db_t* db);
+
+// Returns the currently active native background sync generation (0 when suspended or unmanaged).
+LATTICE_EXPORT uint64_t lattice_db_current_background_sync_generation(lattice_db_t* db);
+
+// Perform one bounded finite sync cycle (`maximum_duration_seconds` > 0 and finite).
+// `cancellation` may be NULL when external cancellation is not needed.
+// Always settles any owned private WSS transport and SQLite resources before returning.
+LATTICE_EXPORT lattice_status_t lattice_db_sync_once(
+    lattice_db_t* db,
+    double maximum_duration_seconds,
+    lattice_sync_cancellation_t* cancellation,
+    lattice_sync_once_result_t* out_result
+);
+
+// Shorthand for `lattice_db_sync_once(db, maximum_duration_seconds, NULL, out_result)`.
+LATTICE_EXPORT lattice_status_t lattice_sync_once(
+    lattice_db_t* db,
+    double maximum_duration_seconds,
+    lattice_sync_once_result_t* out_result
+);
+
+// Suspend background/foreground WebSocket sync on `db`, settling any active managed
+// generation and releasing sync file locks while preserving the open primary database handle.
+LATTICE_EXPORT lattice_status_t lattice_db_suspend_background_sync(lattice_db_t* db);
+
+// Resume continuous foreground WebSocket sync (and local managed maintenance) on `db`.
+// If a finite `sync_once` cycle is currently active on `db`, settles it first before taking over.
+LATTICE_EXPORT lattice_status_t lattice_db_resume_background_sync(lattice_db_t* db);
+
+// Request cancellation of the currently active background sync generation on `db` (returns true if active).
+LATTICE_EXPORT bool lattice_db_cancel_background_sync(lattice_db_t* db);
 
 #ifdef __cplusplus
 }

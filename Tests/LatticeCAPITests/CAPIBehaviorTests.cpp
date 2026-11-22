@@ -25,10 +25,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -1840,4 +1844,362 @@ TEST(CAPISchemaV2, NoHistoryStreamingAndSyncNullGuard) {
     lattice_db_release(reader);
     lattice_db_close(writer);
     lattice_db_release(writer);
+}
+
+// ============================================================================
+// CAPI 1.2.0 (3.1.3): Managed Background Sync & Finite `sync_once`
+// ============================================================================
+
+namespace {
+
+struct MockCapiWsRelay {
+    struct ClientSlot {
+        MockCapiWsRelay* relay = nullptr;
+        lattice_websocket_client_t* client = nullptr;
+        std::atomic<lattice_websocket_state_t> state{LATTICE_WS_CLOSED};
+        std::atomic<bool> destroyed{false};
+    };
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> tasks;
+    bool stopping = false;
+    std::thread dispatcher;
+
+    bool send_catch_up_complete = true;
+    bool auto_ack_uploads = true;
+    std::vector<std::string> replay_frames;
+    std::vector<std::string> uploaded_frames;
+    std::vector<std::shared_ptr<ClientSlot>> slots;
+    lattice_network_factory_t* factory = nullptr;
+
+    MockCapiWsRelay() {
+        dispatcher = std::thread([this]() {
+            while (true) {
+                std::function<void()> fn;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [this] { return stopping || !tasks.empty(); });
+                    if (stopping && tasks.empty()) return;
+                    fn = std::move(tasks.front());
+                    tasks.pop_front();
+                }
+                fn();
+            }
+        });
+        factory = lattice_network_factory_create(this, &create_ws_cb, nullptr);
+        lattice_set_network_factory(factory);
+    }
+
+    ~MockCapiWsRelay() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        cv.notify_all();
+        if (dispatcher.joinable()) dispatcher.join();
+        lattice_set_network_factory(nullptr);
+        if (factory) lattice_network_factory_release(factory);
+    }
+
+    void post(std::function<void()> fn) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping) return;
+            tasks.push_back(std::move(fn));
+        }
+        cv.notify_one();
+    }
+
+    static lattice_websocket_client_t* create_ws_cb(void* user_data) {
+        auto* self = static_cast<MockCapiWsRelay*>(user_data);
+        auto slot = std::make_shared<ClientSlot>();
+        slot->relay = self;
+        {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            self->slots.push_back(slot);
+        }
+        auto* client = lattice_websocket_client_create(
+            slot.get(),
+            &ws_connect_cb,
+            &ws_disconnect_cb,
+            &ws_state_cb,
+            &ws_send_cb);
+        slot->client = client;
+        lattice_websocket_client_set_on_destroy(client, slot.get(), &ws_destroy_cb);
+        return client;
+    }
+
+    static void ws_destroy_cb(void* user_data) {
+        auto* slot = static_cast<ClientSlot*>(user_data);
+        slot->destroyed.store(true, std::memory_order_release);
+        slot->state.store(LATTICE_WS_CLOSED, std::memory_order_release);
+    }
+
+    static void ws_connect_cb(void* user_data, const char* /*url*/, const char* /*headers_json*/) {
+        auto* slot = static_cast<ClientSlot*>(user_data);
+        slot->state.store(LATTICE_WS_CONNECTING, std::memory_order_release);
+        std::vector<std::string> frames;
+        bool emit_marker = true;
+        {
+            std::lock_guard<std::mutex> lock(slot->relay->mutex);
+            frames = slot->relay->replay_frames;
+            emit_marker = slot->relay->send_catch_up_complete;
+        }
+        slot->relay->post([slot, frames = std::move(frames), emit_marker]() {
+            if (slot->destroyed.load(std::memory_order_acquire)) return;
+            slot->state.store(LATTICE_WS_OPEN, std::memory_order_release);
+            lattice_websocket_client_trigger_on_open(slot->client);
+            for (const auto& frame : frames) {
+                if (slot->destroyed.load(std::memory_order_acquire)) return;
+                lattice_websocket_client_trigger_on_message(
+                    slot->client,
+                    LATTICE_WS_MSG_TEXT,
+                    reinterpret_cast<const uint8_t*>(frame.data()),
+                    frame.size());
+            }
+            if (emit_marker && !slot->destroyed.load(std::memory_order_acquire)) {
+                const std::string marker = R"({"catchUpComplete":true})";
+                lattice_websocket_client_trigger_on_message(
+                    slot->client,
+                    LATTICE_WS_MSG_TEXT,
+                    reinterpret_cast<const uint8_t*>(marker.data()),
+                    marker.size());
+            }
+        });
+    }
+
+    static void ws_disconnect_cb(void* user_data) {
+        auto* slot = static_cast<ClientSlot*>(user_data);
+        slot->state.store(LATTICE_WS_CLOSED, std::memory_order_release);
+    }
+
+    static lattice_websocket_state_t ws_state_cb(void* user_data) {
+        auto* slot = static_cast<ClientSlot*>(user_data);
+        return slot->state.load(std::memory_order_acquire);
+    }
+
+    static void ws_send_cb(void* user_data, lattice_websocket_msg_type_t /*type*/,
+                           const uint8_t* data, size_t data_size) {
+        auto* slot = static_cast<ClientSlot*>(user_data);
+        std::string payload(reinterpret_cast<const char*>(data), data_size);
+        bool ack_uploads = true;
+        {
+            std::lock_guard<std::mutex> lock(slot->relay->mutex);
+            slot->relay->uploaded_frames.push_back(payload);
+            ack_uploads = slot->relay->auto_ack_uploads;
+        }
+        if (!ack_uploads) return;
+        try {
+            auto parsed = nlohmann::json::parse(payload);
+            if (parsed.contains("auditLog") && parsed["auditLog"].is_array()) {
+                nlohmann::json ids = nlohmann::json::array();
+                for (const auto& item : parsed["auditLog"]) {
+                    if (item.contains("globalId") && item["globalId"].is_string()) {
+                        ids.push_back(item["globalId"]);
+                    }
+                }
+                if (!ids.empty()) {
+                    const std::string ids_str = ids.dump();
+                    char* ack_raw = lattice_create_ack_message(ids_str.c_str());
+                    if (ack_raw) {
+                        std::string ack_frame(ack_raw);
+                        lattice_string_free(ack_raw);
+                        slot->relay->post([slot, ack_frame = std::move(ack_frame)]() {
+                            if (slot->destroyed.load(std::memory_order_acquire)) return;
+                            lattice_websocket_client_trigger_on_message(
+                                slot->client,
+                                LATTICE_WS_MSG_TEXT,
+                                reinterpret_cast<const uint8_t*>(ack_frame.data()),
+                                ack_frame.size());
+                        });
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+};
+
+}  // namespace
+
+TEST(CAPIBackgroundSync, V120FeatureStringAndVersion) {
+    EXPECT_TRUE(lattice_capi_has_feature("background_sync"));
+    EXPECT_GE(lattice_capi_version(), 1002000u);
+    EXPECT_STREQ(lattice_capi_version_string(), "1.2.0");
+}
+
+TEST(CAPIBackgroundSync, ManagedFiniteSyncOnceRoundTripAndSettlement) {
+    MockCapiWsRelay relay;
+    PersonSchema schema;
+
+    // Build an initial server catch-up payload from a seed database.
+    TempPath seed_path("capi_bgsync_seed");
+    lattice_db_t* seed = lattice_db_create_with_schemas(seed_path.str().c_str(), &schema.schema, 1);
+    ASSERT_NE(seed, nullptr);
+    lattice_object_t* remote_person = lattice_db_create_object(seed, "Person");
+    lattice_object_set_string(remote_person, "name", "RemotePeerRow");
+    lattice_object_set_int(remote_person, "age", 42);
+    lattice_object_t* managed_remote = lattice_db_add(seed, remote_person);
+    ASSERT_NE(managed_remote, nullptr);
+    lattice_object_release(managed_remote);
+    lattice_object_release(remote_person);
+
+    char* seed_events = lattice_db_events_after(seed, nullptr);
+    ASSERT_NE(seed_events, nullptr);
+    char* replay_msg = lattice_create_sync_message(seed_events);
+    ASSERT_NE(replay_msg, nullptr);
+    relay.replay_frames.emplace_back(replay_msg);
+    lattice_string_free(replay_msg);
+    lattice_string_free(seed_events);
+    lattice_db_close(seed);
+    lattice_db_release(seed);
+
+    // Open a managed background sync database; verify it starts suspended.
+    TempPath client_path("capi_bgsync_client");
+    lattice_sync_options_t opts;
+    lattice_sync_options_init(&opts);
+    opts.background_sync_managed = 1;
+
+    lattice_db_t* db = lattice_db_create_with_sync_options(
+        client_path.str().c_str(), &schema.schema, 1, nullptr,
+        "ws://relay.invalid/sync", "test-token", &opts);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+    EXPECT_TRUE(lattice_db_is_background_sync_managed(db));
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), 0u);
+    EXPECT_FALSE(lattice_db_is_sync_connected(db));
+
+    // Stage a local write while suspended.
+    lattice_object_t* local_person = lattice_db_create_object(db, "Person");
+    lattice_object_set_string(local_person, "name", "LocalOfflineRow");
+    lattice_object_set_int(local_person, "age", 19);
+    lattice_object_t* managed_local = lattice_db_add(db, local_person);
+    ASSERT_NE(managed_local, nullptr);
+    lattice_object_release(managed_local);
+    lattice_object_release(local_person);
+
+    // Run finite sync_once: uploads LocalOfflineRow, replays RemotePeerRow, settles to generation 0.
+    lattice_sync_once_result_t result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+    ASSERT_EQ(lattice_db_sync_once(db, 5.0, nullptr, &result), LATTICE_OK) << lattice_last_error();
+    EXPECT_EQ(result, LATTICE_SYNC_ONCE_COMPLETED);
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), 0u);
+    EXPECT_FALSE(lattice_db_is_sync_connected(db));
+
+    // Both rows exist locally and pending upload queue is drained.
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 2u);
+    EXPECT_EQ(lattice_db_count(db, "Person", "name = 'RemotePeerRow' AND age = 42"), 1u);
+    EXPECT_EQ(lattice_db_count(db, "Person", "name = 'LocalOfflineRow' AND age = 19"), 1u);
+
+    char* pending = lattice_db_get_pending_audit_log(db);
+    ASSERT_NE(pending, nullptr);
+    EXPECT_EQ(nlohmann::json::parse(pending).size(), 0u);
+    lattice_string_free(pending);
+
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+TEST(CAPIBackgroundSync, ResumeSuspendAlreadyRunningAndUnavailableContracts) {
+    MockCapiWsRelay relay;
+    PersonSchema schema;
+    TempPath client_path("capi_bgsync_lifecycle");
+
+    lattice_sync_options_t opts;
+    lattice_sync_options_init(&opts);
+    opts.background_sync_managed = 1;
+
+    lattice_db_t* db = lattice_db_create_with_sync_options(
+        client_path.str().c_str(), &schema.schema, 1, nullptr,
+        "ws://relay.invalid/lifecycle", "test-token", &opts);
+    ASSERT_NE(db, nullptr);
+
+    // Foreground resume acquires a continuous generation; sync_once returns ALREADY_RUNNING without disturbing it.
+    ASSERT_EQ(lattice_db_resume_background_sync(db), LATTICE_OK);
+    const uint64_t fg_gen = lattice_db_current_background_sync_generation(db);
+    EXPECT_GT(fg_gen, 0u);
+
+    lattice_sync_once_result_t result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+    ASSERT_EQ(lattice_sync_once(db, 5.0, &result), LATTICE_OK);
+    EXPECT_EQ(result, LATTICE_SYNC_ONCE_ALREADY_RUNNING);
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), fg_gen);
+
+    // Suspend settles generation back to 0, permitting finite sync_once again.
+    ASSERT_EQ(lattice_db_suspend_background_sync(db), LATTICE_OK);
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), 0u);
+
+    ASSERT_EQ(lattice_sync_once(db, 5.0, &result), LATTICE_OK);
+    EXPECT_EQ(result, LATTICE_SYNC_ONCE_COMPLETED);
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), 0u);
+
+    // Invalid durations are rejected with INVALID_ARGUMENT.
+    EXPECT_EQ(lattice_sync_once(db, 0.0, &result), LATTICE_ERROR_INVALID_ARGUMENT);
+    EXPECT_EQ(lattice_sync_once(db, -2.0, &result), LATTICE_ERROR_INVALID_ARGUMENT);
+
+    // Closed database returns UNAVAILABLE.
+    lattice_db_close(db);
+    ASSERT_EQ(lattice_sync_once(db, 5.0, &result), LATTICE_OK);
+    EXPECT_EQ(result, LATTICE_SYNC_ONCE_UNAVAILABLE);
+    lattice_db_release(db);
+
+    // Unsupported in-memory database returns INVALID_ARGUMENT + error message.
+    lattice_db_t* mem = lattice_db_create_in_memory();
+    ASSERT_NE(mem, nullptr);
+    EXPECT_EQ(lattice_sync_once(mem, 5.0, &result), LATTICE_ERROR_INVALID_ARGUMENT);
+    EXPECT_EQ(result, LATTICE_SYNC_ONCE_UNAVAILABLE);
+    EXPECT_NE(lattice_last_error(), nullptr);
+    lattice_db_close(mem);
+    lattice_db_release(mem);
+}
+
+TEST(CAPIBackgroundSync, BudgetExhaustedAndCancellationSettleCleanly) {
+    MockCapiWsRelay relay;
+    relay.send_catch_up_complete = false;  // Keep finite cycle waiting for catch-up completion
+    PersonSchema schema;
+    TempPath client_path("capi_bgsync_cancel");
+
+    lattice_sync_options_t opts;
+    lattice_sync_options_init(&opts);
+    opts.background_sync_managed = 1;
+
+    lattice_db_t* db = lattice_db_create_with_sync_options(
+        client_path.str().c_str(), &schema.schema, 1, nullptr,
+        "ws://relay.invalid/cancel", "test-token", &opts);
+    ASSERT_NE(db, nullptr);
+
+    // Short deadline expires cleanly with BUDGET_EXHAUSTED and settles generation to 0.
+    lattice_sync_once_result_t result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+    ASSERT_EQ(lattice_sync_once(db, 0.08, &result), LATTICE_OK);
+    EXPECT_EQ(result, LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED);
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), 0u);
+
+    // External cancellation token interrupts a long-budget sync_once immediately and settles cleanly.
+    lattice_sync_cancellation_t* cancel_tok = lattice_sync_cancellation_create();
+    ASSERT_NE(cancel_tok, nullptr);
+    EXPECT_FALSE(lattice_sync_cancellation_is_cancelled(cancel_tok));
+
+    lattice_status_t worker_status = LATTICE_ERROR_DATABASE;
+    lattice_sync_once_result_t worker_result = LATTICE_SYNC_ONCE_UNAVAILABLE;
+    std::thread worker([&]() {
+        worker_status = lattice_db_sync_once(db, 15.0, cancel_tok, &worker_result);
+    });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (lattice_db_current_background_sync_generation(db) == 0 &&
+           std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GT(lattice_db_current_background_sync_generation(db), 0u);
+
+    const auto cancelled_at = std::chrono::steady_clock::now();
+    lattice_sync_cancellation_cancel(cancel_tok);
+    EXPECT_TRUE(lattice_sync_cancellation_is_cancelled(cancel_tok));
+    worker.join();
+
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelled_at, std::chrono::seconds(2));
+    EXPECT_EQ(worker_status, LATTICE_OK);
+    EXPECT_EQ(worker_result, LATTICE_SYNC_ONCE_BUDGET_EXHAUSTED);
+    EXPECT_EQ(lattice_db_current_background_sync_generation(db), 0u);
+
+    lattice_sync_cancellation_release(cancel_tok);
+    lattice_db_close(db);
+    lattice_db_release(db);
 }

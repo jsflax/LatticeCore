@@ -1,5 +1,29 @@
 # Changelog
 
+## [3.1.3] - 2026-11-22
+
+### Added
+
+- Additive `LatticeCAPI` `1.2.0` (`LATTICE_CAPI_VERSION = 1002000`, feature
+  `"background_sync"`) managed background sync and finite `sync_once` surface for
+  Kotlin/Native, Android JNI, and C consumers:
+  - Tail fields `background_sync_managed` and `sync_autostart` on size-prefixed
+    `lattice_sync_options_t` (preserving binary compatibility with older callers),
+    plus `lattice_db_is_background_sync_managed` and
+    `lattice_db_current_background_sync_generation`.
+  - Bounded finite sync `lattice_db_sync_once` and `lattice_sync_once` returning
+    `lattice_sync_once_result_t` (`COMPLETED`, `BUDGET_EXHAUSTED`,
+    `ALREADY_RUNNING`, `UNAVAILABLE`) with deterministic private-transport and
+    SQLite settlement before returning.
+  - Thread-safe cancellation tokens (`lattice_sync_cancellation_create`,
+    `lattice_sync_cancellation_cancel`, `lattice_sync_cancellation_is_cancelled`,
+    `lattice_sync_cancellation_release`) and `lattice_db_cancel_background_sync`
+    for immediate background worker / coroutine cancellation.
+  - Foreground/background lifecycle controls `lattice_db_suspend_background_sync`
+    and `lattice_db_resume_background_sync` so applications retain open primary
+    database handles across background suspension without stranding WebSocket
+    sessions or `.sync.lock` descriptors.
+
 ## [3.1.2] - 2026-11-21
 
 ### Added

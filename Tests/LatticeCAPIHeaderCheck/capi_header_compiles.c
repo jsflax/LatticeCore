@@ -49,6 +49,7 @@ int lattice_capi_header_compiles_as_c11(void) {
     lattice_distance_metric_t metric = LATTICE_DISTANCE_L1;
     lattice_websocket_state_t ws_state = LATTICE_WS_CLOSED;
     lattice_websocket_msg_type_t ws_msg = LATTICE_WS_MSG_BINARY;
+    lattice_sync_once_result_t sync_res = LATTICE_SYNC_ONCE_COMPLETED;
 
     lattice_invoke_fn invoke = 0;
     lattice_table_observer_fn table_obs = 0;
@@ -68,12 +69,14 @@ int lattice_capi_header_compiles_as_c11(void) {
     lattice_scheduler_t* sched = 0;
     lattice_websocket_client_t* ws = 0;
     lattice_network_factory_t* factory = 0;
+    lattice_sync_cancellation_t* sync_cancel = 0;
 
     (void)prop; (void)constraint; (void)schema; (void)col; (void)kind;
     (void)ucv; (void)uc; (void)udesc; (void)prop_ext; (void)schema_ext;
     (void)metric; (void)ws_state; (void)ws_msg; (void)db; (void)obj;
     (void)results; (void)list; (void)uval; (void)sched; (void)ws; (void)factory;
     (void)migration_v2; (void)cfg_pin; (void)on_destroy;
+    (void)sync_res; (void)sync_cancel;
 
     int ok = (status == 0)
         && (LATTICE_ERROR_DATABASE == -4)
